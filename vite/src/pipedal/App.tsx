@@ -20,11 +20,13 @@
 import React from 'react';
 
 import { ThemeProvider, createTheme, StyledEngineProvider } from '@mui/material/styles';
+import { type Theme } from '@mui/material/styles';
 import CssBaseline from '@mui/material/CssBaseline';
 
 import VirtualKeyboardHandler from './VirtualKeyboardHandler';
 import AppThemed from "./AppThemed";
 import { isDarkMode } from './DarkMode';
+import { appBarBackgroundImage, hairlineColor } from './ThemeSurfaces';
 import Tone3000AuthComplete from './Tone3000AuthComplete';
 import FontTest from './FontTest';
 
@@ -64,175 +66,268 @@ declare module '@mui/material/Button' {
 
 
 
+// `any`: MUI v6 requires `variants: []` on every styleOverrides entry once any entry
+// sets `variants`, which buys nothing here.
+const sharedComponents = (isDark: boolean): any => ({
+    MuiCssBaseline: {
+        styleOverrides: {
+            html: {
+                WebkitFontSmoothing: 'antialiased',
+                MozOsxFontSmoothing: 'grayscale',
+            },
+            body: {
+                textRendering: 'optimizeLegibility',
+            },
+            img: {
+                outline: `1px solid ${hairlineColor(isDark)}`,
+                outlineOffset: '-1px',
+            },
+        },
+    },
+    MuiAppBar: {
+        styleOverrides: {
+            root: {
+                backgroundImage: appBarBackgroundImage(isDark),
+                backdropFilter: 'blur(10px)',
+                WebkitBackdropFilter: 'blur(10px)',
+                boxShadow: isDark
+                    ? '0 1px 0 0 rgba(255,255,255,0.04), 0 4px 16px rgba(0,0,0,0.35)'
+                    : '0 1px 0 0 rgba(0,0,0,0.04), 0 4px 16px rgba(103,80,164,0.08)',
+                color: 'inherit',
+            },
+        },
+    },
+    MuiDrawer: {
+        styleOverrides: {
+            paper: {
+                backgroundImage: isDark
+                    ? 'linear-gradient(180deg, #221f2c 0%, #1a1822 100%)'
+                    : 'linear-gradient(180deg, #ffffff 0%, #faf8fd 100%)',
+                borderRight: `1px solid ${hairlineColor(isDark)}`,
+                boxShadow: isDark
+                    ? '0 0 40px rgba(0,0,0,0.5)'
+                    : '0 0 40px rgba(103,80,164,0.12)',
+            },
+        },
+    },
+    MuiPaper: {
+        styleOverrides: {
+            root: {
+                backgroundImage: 'none',
+            },
+            rounded: {
+                borderRadius: 12,
+            },
+            elevation1: { boxShadow: isDark ? '0 1px 2px rgba(0,0,0,0.4)' : '0 1px 2px rgba(0,0,0,0.06)' },
+            elevation2: { boxShadow: isDark ? '0 2px 8px rgba(0,0,0,0.4)' : '0 2px 8px rgba(0,0,0,0.08)' },
+            elevation4: { boxShadow: isDark ? '0 4px 16px rgba(0,0,0,0.5)' : '0 4px 16px rgba(0,0,0,0.10)' },
+        },
+    },
+    MuiDialog: {
+        styleOverrides: {
+            paper: {
+                borderRadius: 16,
+                boxShadow: isDark
+                    ? '0 24px 64px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.04)'
+                    : '0 24px 64px rgba(103,80,164,0.18), 0 0 0 1px rgba(0,0,0,0.04)',
+            },
+        },
+    },
+    MuiButton: {
+        styleOverrides: {
+            root: {
+                '& .MuiTouchRipple-root': { borderRadius: 'inherit' },
+                '& .MuiTouchRipple-ripple': { transform: 'scale(1.9)' },
+            },
+            containedPrimary: {
+                borderRadius: '9999px',
+                paddingLeft: '16px', paddingRight: '16px',
+                textTransform: 'none',
+                fontWeight: 600,
+                boxShadow: 'none',
+                '&:hover': {
+                    boxShadow: isDark ? '0 4px 12px rgba(167,112,228,0.35)' : '0 4px 12px rgba(103,80,164,0.25)',
+                },
+            },
+            containedSecondary: {
+                borderRadius: '9999px',
+                paddingLeft: '16px', paddingRight: '16px',
+                textTransform: 'none',
+                fontWeight: 600,
+            },
+        },
+        variants: [
+            {
+                props: { variant: 'dialogPrimary' },
+                style: { color: isDark ? '#FFFFFF' : 'rgb(0,0,0,0.87)' },
+            },
+            {
+                props: { variant: 'dialogSecondary' },
+                style: { color: isDark ? 'rgba(255,255,255,0.7)' : 'rgba(0,0,0,0.6)' },
+            },
+        ],
+    },
+    MuiIconButton: {
+        styleOverrides: {
+            root: {
+                padding: 8,
+                borderRadius: 10,
+                transition: 'background-color 150ms ease-out, color 150ms ease-out, transform 120ms ease-out',
+                '&:active': { transform: 'scale(0.94)' },
+            },
+        },
+    },
+    MuiSwitch: {
+        styleOverrides: {
+            root: {
+                // Thumb centring depends on switchBase.padding + thumb/2 === root.height/2 (by default
+                // 9 + 20/2 === 38/2), so root width/height/padding and switchBase padding must not be
+                // overridden piecemeal here. Non-geometric polish only.
+                '& .MuiSwitch-thumb': {
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+                },
+                '& .MuiSwitch-track': {
+                    borderRadius: 999,
+                    opacity: isDark ? 0.45 : 0.6,
+                },
+            },
+        },
+    },
+    MuiListItemButton: {
+        styleOverrides: {
+            root: ({ theme }: { theme: Theme }) => ({
+                transition: 'background-color 150ms ease-out, color 150ms ease-out',
+                borderRadius: 8,
+                margin: '2px 8px',
+                padding: '8px 12px',
+                '&.Mui-selected': {
+                    backgroundColor: isDark ? 'rgba(167,112,228,0.18)' : 'rgba(103,80,164,0.12)',
+                    '&:hover': {
+                        backgroundColor: isDark ? 'rgba(167,112,228,0.24)' : 'rgba(103,80,164,0.16)',
+                    },
+                },
+                '&:hover': {
+                    backgroundColor: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.04)',
+                },
+            }),
+        },
+    },
+    MuiToolbar: {
+        styleOverrides: {
+            dense: {
+                minHeight: 56,
+                paddingLeft: 8,
+                paddingRight: 8,
+            },
+        },
+    },
+    MuiDivider: {
+        styleOverrides: {
+            root: {
+                borderColor: hairlineColor(isDark),
+                margin: '4px 0',
+            },
+        },
+    },
+    MuiTooltip: {
+        styleOverrides: {
+            tooltip: {
+                backgroundColor: isDark ? 'rgba(40,36,52,0.96)' : 'rgba(40,36,52,0.96)',
+                color: '#FFFFFF',
+                borderRadius: 8,
+                padding: '8px 12px',
+                fontSize: '0.75rem',
+                boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
+            },
+            arrow: {
+                color: 'rgba(40,36,52,0.96)',
+            },
+        },
+    },
+});
+
 const theme = createTheme(
     isDarkMode() ?
         {
             cssVariables: true,
-            components: {
-                // MuiTouchRipple: {
-                //     styleOverrides: {
-                //         root: {
-                //             borderRadius: 'inherit',
-                //             overflow: 'hidden',
-                //         },
-                //         ripple: {
-                //             color: '#F88 !important',
-                //             borderRadius: 'inherit',
-
-                //             '&.MuiTouchRipple-ripplePulsate': {
-                //                 //animation: 'none !important',
-
-                //                 // Make focus ripple fill the entire button
-                //                 '&.MuiTouchRipple-child': {
-                //                     width: '100%',
-                //                     height: '100%',
-                //                     borderRadius: 'inherit',
-                //                     transform: 'scale(1.4)', // Override the default scaling
-                //                 }
-                //             },
-                //             '&.MuiTouchRipple-ripple': {
-                //                 '&:focus': {
-                //                     // Make focus ripple fill the entire button
-                //                     transform: 'scale(1.4)',
-                //                     width: '100%',
-                //                     height: '100%',
-                //                     color: '#F88',
-                //                     borderRadius: 'inherit',
-                //                 },
-                //             },
-                //         },
-                //         child: {
-                //             borderRadius: 'inherit',
-                //         }
-                //     }
-                // },
-                MuiButton: {
-                    styleOverrides: {
-                        root: {
-                            '& .MuiTouchRipple-ripple': {
-                                transform: 'scale(1.9)',
-                            }
-                        },
-                        containedPrimary: {
-                            borderRadius: '9999px',
-                            paddingLeft: "16px", paddingRight: "16px",
-                            textTransform: "none"
-                        },
-                        containedSecondary: {
-                            borderRadius: '9999px',
-                            paddingLeft: "16px", paddingRight: "16px",
-                            textTransform: "none"
-                        }
-
-                    },
-                    variants: [
-                        {
-                            props: { variant: 'dialogPrimary' },
-                            style: {
-                                color: "#FFFFFF"
-                            }
-                        },
-                        {
-                            props: { variant: 'dialogSecondary', },
-                            style: {
-                                color: "rgb(255,255,255,0.7)"
-                            },
-                        },
-                    ],
-                },
+            shape: { borderRadius: 10 },
+            typography: {
+                fontFamily: '"Roboto", "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+                h6: { fontWeight: 600, letterSpacing: '-0.01em' },
+                subtitle1: { fontWeight: 500 },
+                subtitle2: { fontWeight: 500, letterSpacing: '0.01em' },
+                button: { fontWeight: 600, letterSpacing: '0.01em' },
+                caption: { letterSpacing: '0.02em' },
             },
-
+            components: sharedComponents(true),
             palette: {
                 mode: 'dark',
-                primary: {
-                    main: '#A770E4'// #6750A4"   // #5B5690  #60529A  #5C5694
+                primary: { main: '#A770E4' },
+                secondary: { main: '#FF6060' },
+                background: {
+                    default: '#16141d',
+                    paper: '#221f2c',
                 },
-                secondary: {
-                    main: "#FF6060"
+                text: {
+                    primary: 'rgba(255,255,255,0.92)',
+                    secondary: 'rgba(255,255,255,0.60)',
+                    disabled: 'rgba(255,255,255,0.35)',
+                },
+                divider: 'rgba(255,255,255,0.08)',
+                action: {
+                    hover: 'rgba(167,112,228,0.10)',
+                    selected: 'rgba(167,112,228,0.16)',
+                    focus: 'rgba(167,112,228,0.12)',
                 },
                 actionBar: {
                     main: '#130b22ff',
-                    contrastText: '#FFFFFF'
-                }
-
+                    contrastText: '#FFFFFF',
+                },
             },
-            mainBackground: "#222",
-            toolbarColor: '#222'
+            mainBackground: '#16141d',
+            toolbarColor: '#16141d',
         }
         :
         {
             cssVariables: true,
-            components: {
-                /* make the selection state for MuiListItemButtons a smidgen darker (light theme only) */
-                MuiListItemButton: {
-                    styleOverrides: {
-                        root: ({ theme }) => ({
-                            '&.Mui-selected': {
-                                backgroundColor: 'rgba(0, 0, 0, 0.2)', // Adjust for desired darkness
-                                '&:hover': {
-                                    backgroundColor: 'rgba(0, 0, 0, 0.25)', // Slightly darker on hover
-                                },
-                            },
-                        }),
-                    },
-                },
-                MuiButton: {
-                    styleOverrides: {
-                        root: {
-                            '& .MuiTouchRipple-root': {
-                                borderRadius: 'inherit',
-                            },
-                            '& .MuiTouchRipple-ripple': {
-                                transform: 'scale(1.9)!important',
-                            }
-                        },
-                        containedPrimary: {
-                            borderRadius: '9999px',
-                            paddingLeft: "16px", paddingRight: "16px",
-                            textTransform: "none"
-                        },
-                        containedSecondary: {
-                            borderRadius: '9999px',
-                            paddingLeft: "16px", paddingRight: "16px",
-                            textTransform: "none"
-                        }
-
-                    },
-                    variants: [
-                        {
-                            props: { variant: 'dialogPrimary' },
-                            style: {
-                                color: "rgb(0,0,0,0.87)"
-                            }
-                        },
-                        {
-                            props: { variant: 'dialogSecondary', },
-                            style: {
-                                color: "rgb(0,0,0,0.6)"
-                            },
-                        },
-                    ],
-                },
+            shape: { borderRadius: 10 },
+            typography: {
+                fontFamily: '"Roboto", "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+                h6: { fontWeight: 600, letterSpacing: '-0.01em' },
+                subtitle1: { fontWeight: 500 },
+                subtitle2: { fontWeight: 500, letterSpacing: '0.01em' },
+                button: { fontWeight: 600, letterSpacing: '0.01em' },
+                caption: { letterSpacing: '0.02em' },
             },
+            components: sharedComponents(false),
             palette: {
-                primary: {
-                    main: "#6750A4"   // #5B5690  #60529A  #5C5694
+                mode: 'light',
+                primary: { main: '#6750A4' },
+                secondary: { main: '#FF6060' },
+                background: {
+                    default: '#FAFAFA',
+                    paper: '#FFFFFF',
                 },
-                secondary: {
-                    main: "#FF6060"
+                text: {
+                    primary: 'rgba(0,0,0,0.87)',
+                    secondary: 'rgba(0,0,0,0.55)',
+                    disabled: 'rgba(0,0,0,0.30)',
+                },
+                divider: 'rgba(0,0,0,0.08)',
+                action: {
+                    hover: 'rgba(103,80,164,0.08)',
+                    selected: 'rgba(103,80,164,0.12)',
+                    focus: 'rgba(103,80,164,0.10)',
                 },
                 actionBar: {
                     main: '#130b22ff',
-                    contrastText: '#FFFFFF'
-                }
-
-
-
+                    contrastText: '#FFFFFF',
+                },
             },
-            mainBackground: "#FFFFFF",
-            toolbarColor: '#FFFFFF'
-
-
+            // Must equal palette.background.default: panels fill with mainBackground while the
+            // page behind them uses background.default, so any difference shows as banding.
+            mainBackground: '#FAFAFA',
+            toolbarColor: '#FAFAFA',
         }
 );
 

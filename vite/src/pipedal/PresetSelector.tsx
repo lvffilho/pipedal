@@ -39,7 +39,6 @@ import ImportPresetFromBankDialog from './ImportPresetFromBankDialog';
 
 import Select from '@mui/material/Select';
 import UploadPresetDialog from './UploadPresetDialog';
-import { isDarkMode } from './DarkMode';
 import ResizeResponsiveComponent from './ResizeResponsiveComponent';
 
 interface PresetSelectorProps extends WithStyles<typeof styles> {
@@ -69,22 +68,25 @@ interface PresetSelectorState {
 }
 
 
-const selectColor = isDarkMode() ? "#888" : "#FFFFFF";
+const selectColor = 'currentColor';
 
 const styles = (theme: Theme) => createStyles({
-    select: { // fu fu fu.Overrides for white selector on dark background.
+    select: {
         '&:before': {
             borderColor: selectColor,
+            opacity: 0.4,
         },
         '&:after': {
             borderColor: selectColor,
         },
         '&:hover:not(.Mui-disabled):before': {
             borderColor: selectColor,
+            opacity: 0.7,
         }
     },
     icon: {
         fill: selectColor,
+        opacity: 0.7,
     },
 });
 
@@ -353,17 +355,17 @@ const PresetSelector =
                     }}>
                         <div style={{ flex: "0 0 auto" }}>
                             <IconButtonEx tooltip="Save current preset"
-                                style={{ flex: "0 0 auto", color: "#FFFFFF" }}
+                                style={{ flex: "0 0 auto" }}
                                 onClick={(e) => { this.handleSave(); }}
                                 size="large">
-                                <SaveIconOutline style={{ opacity: 0.75 }} color="inherit" />
+                                <SaveIconOutline style={{ opacity: 0.9 }} color="inherit" />
                             </IconButtonEx>
                         </div>
 
                         <div style={{ flex: "1 1 auto", minWidth: 60, maxWidth: 300, position: "relative", paddingRight: 12 }} >
                             <Select variant="standard"
                                 className={classes.select}
-                                style={{ width: "100%", position: "relative", top: 0, color: "#FFFFFF" }} disabled={!this.state.enabled}
+                                style={{ width: "100%", position: "relative", top: 0 }} disabled={!this.state.enabled}
                                 onChange={(e, extra) => this.handleChange(e, extra)}
                                 onClose={(e) => this.handleSelectClose(e)}
                                 displayEmpty
@@ -391,11 +393,11 @@ const PresetSelector =
                         <div style={{ flex: "0 0 auto" }}>
                             <IconButtonEx
                                 tooltip="More..."
-                                style={{ flex: "0 0 auto", color: "#FFFFFF" }}
+                                style={{ flex: "0 0 auto" }}
                                 onClick={(e) => this.handlePresetsMenuClick(e)}
                                 size="large"
                             >
-                                <MoreVertIcon style={{ opacity: 0.75 }} color="inherit" />
+                                <MoreVertIcon style={{ opacity: 0.9 }} color="inherit" />
                             </IconButtonEx>
                             <Menu
                                 id="edit-presets-menu"

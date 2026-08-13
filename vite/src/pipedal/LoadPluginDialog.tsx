@@ -50,6 +50,9 @@ import WithStyles, {withTheme} from './WithStyles';
 import { withStyles } from "tss-react/mui";
 import FilterListIcon from '@mui/icons-material/FilterList';
 import FilterListOffIcon from '@mui/icons-material/FilterListOff';
+import Chip from '@mui/material/Chip';
+import ViewListIcon from '@mui/icons-material/ViewList';
+import ViewModuleIcon from '@mui/icons-material/ViewModule';
 
 import { css } from '@emotion/react';
 
@@ -59,6 +62,27 @@ export type OkEventHandler = (pluginUri: string) => void;
 
 const NARROW_DISPLAY_THRESHOLD = 600;
 const FILTER_STORAGE_KEY = "com.twoplay.pipedal.load_dlg.filter";
+const VIEW_MODE_STORAGE_KEY = "com.twoplay.pipedal.load_dlg.view_mode";
+
+export type PluginViewMode = "grid" | "list";
+
+const ALPHABET_RAIL_WIDTH = 26;
+const ALPHABET_LETTERS = "#ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+const ALPHABET_RAIL_PADDING = 2;
+const ALPHABET_RAIL_FONT_SIZE = 11;
+const ALPHABET_RAIL_LINE_HEIGHT = "1.05";
+const ALPHABET_RAIL_ACTIVE_WEIGHT = 600;
+const ALPHABET_RAIL_INACTIVE_WEIGHT = 400;
+
+const PLUGIN_ICON_TILE_SIZE = 34;
+const PLUGIN_ICON_TILE_BORDER_RADIUS = 8;
+const PLUGIN_ICON_SIZE = 22;
+const PLUGIN_ICON_OPACITY = 0.92;
+
+function alphabetKeyOf(name: string): string {
+    const first = name.trim().charAt(0).toUpperCase();
+    return (first >= "A" && first <= "Z") ? first : "#";
+}
 
 
 
@@ -125,6 +149,12 @@ const pluginGridStyles = (theme: Theme) => createStyles({
         paddingLeft: 12, whiteSpace: "nowrap", textOverflow: "ellipsis"
 
     }),
+    listRow: css({
+        display: "flex", flexFlow: "row nowrap", alignItems: "center",
+        flex: "1 1 auto", width: "100%", minWidth: 0,
+        paddingLeft: 12, paddingRight: 8,
+        height: "100%",
+    }),
     favoriteDecoration: css({
         flex: "0 0 auto"
     }),
@@ -140,6 +170,13 @@ const pluginGridStyles = (theme: Theme) => createStyles({
     iconBorder: css({
         flex: "0 0 auto",
         paddingTop: "4px"
+    }),
+    iconTile: css({
+        width: PLUGIN_ICON_TILE_SIZE, height: PLUGIN_ICON_TILE_SIZE,
+        borderRadius: PLUGIN_ICON_TILE_BORDER_RADIUS,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        background: theme.palette.action.hover,
+        border: `1px solid ${theme.palette.divider}`,
     }),
     label: css({
         width: "100%"
@@ -178,6 +215,7 @@ type PluginGridState = {
     grid_cell_width: number,
     grid_cell_columns: number,
     minimumItemWidth: number,
+    viewMode: PluginViewMode,
     favoritesList: FavoritesList,
     uiPlugins: UiPlugin[]
     //gridItems: UiPlugin[];
@@ -203,6 +241,8 @@ export const LoadPluginDialog =
                 if (persistedFilter) {
                     filterType_ = persistedFilter as PluginType;
                 }
+                const persistedViewMode = window.localStorage.getItem(VIEW_MODE_STORAGE_KEY);
+                const viewMode_: PluginViewMode = persistedViewMode === "list" ? "list" : "grid";
 
                 this.state = {
                     selected_uri: this.props.uri,
@@ -214,6 +254,7 @@ export const LoadPluginDialog =
                     grid_cell_width: this.getCellWidth(document.documentElement.clientWidth),
                     grid_cell_columns: this.getCellColumns(document.documentElement.clientWidth),
                     minimumItemWidth: props.minimumItemWidth ? props.minimumItemWidth : 220,
+                    viewMode: viewMode_,
                     favoritesList: this.model.favorites.get(),
                     uiPlugins: this.model.ui_plugins.get()
 
@@ -345,14 +386,23 @@ export const LoadPluginDialog =
             }
 
             onFilterChange(e: any) {
-                let filterValue = e.target.value as PluginType;
+                this.setFilterType(e.target.value as PluginType);
+            }
 
+            setFilterType(filterValue: PluginType): void {
                 window.localStorage.setItem(FILTER_STORAGE_KEY, filterValue as string);
 
                 this.requestScrollTo();
                 this.setState({
                     filterType: filterValue,
                 });
+            }
+
+            setViewMode(viewMode: PluginViewMode): void {
+                if (this.state.viewMode === viewMode) return;
+                window.localStorage.setItem(VIEW_MODE_STORAGE_KEY, viewMode);
+                this.requestScrollTo();
+                this.setState({ viewMode: viewMode });
             }
             onClearFilter(): void {
                 let value = PluginType.Plugin;
@@ -509,6 +559,97 @@ export const LoadPluginDialog =
                 return result;
 
             }
+
+            renderCategoryChips(): ReactNode {
+                const rootClass = this.model.plugin_classes.get();
+                const topLevel = rootClass.children;
+                const filterType = this.state.filterType;
+                const isAll = filterType === PluginType.Plugin;
+
+                const chipFor = (key: string, label: string, selected: boolean, value: PluginType) => (
+                    <Chip
+                        key={key}
+                        label={label}
+                        size="small"
+                        color={selected ? "primary" : "default"}
+                        variant={selected ? "filled" : "outlined"}
+                        onClick={() => { this.setFilterType(value); }}
+                        style={{ flex: "0 0 auto", fontWeight: selected ? 600 : 400 }}
+                    />
+                );
+
+                return (
+                    <div style={{
+                        flex: "0 0 auto",
+                        display: "flex", flexFlow: "row nowrap", alignItems: "center", gap: 6,
+                        overflowX: "auto", overflowY: "hidden",
+                        paddingLeft: 16, paddingRight: 16, paddingBottom: 8,
+                        scrollbarWidth: "none",
+                    }}>
+                        {chipFor("all", "All", isAll, PluginType.Plugin)}
+                        {topLevel.map((child: PluginClass) => {
+                            const selected = !isAll && (
+                                child.plugin_type === filterType
+                                || rootClass.is_type_of(child.plugin_type, filterType)
+                            );
+                            return chipFor(child.plugin_type as string, child.display_name, selected, child.plugin_type);
+                        })}
+                    </div>
+                );
+            }
+
+            // Resolves letters against the displayed array rather than computing offsets: favourites
+            // are score-boosted to the top by getFilteredPlugins, so it is not one sorted run.
+            buildAlphabetIndex(gridItems: UiPlugin[], columnCount: number): Map<string, number> {
+                const map = new Map<string, number>();
+                for (let i = 0; i < gridItems.length; ++i) {
+                    const key = alphabetKeyOf(gridItems[i].name);
+                    if (!map.has(key)) {
+                        map.set(key, Math.floor(i / columnCount));
+                    }
+                }
+                return map;
+            }
+
+            renderAlphabetRail(gridItems: UiPlugin[], columnCount: number): ReactNode {
+                const index = this.buildAlphabetIndex(gridItems, columnCount);
+                return (
+                    <div style={{
+                        flex: "0 0 auto", width: ALPHABET_RAIL_WIDTH,
+                        display: "flex", flexFlow: "column nowrap",
+                        alignItems: "stretch", justifyContent: "space-evenly",
+                        paddingTop: ALPHABET_RAIL_PADDING, paddingBottom: ALPHABET_RAIL_PADDING,
+                        userSelect: "none",
+                    }}>
+                        {ALPHABET_LETTERS.map((letter) => {
+                            const row = index.get(letter);
+                            const enabled = row !== undefined;
+                            return (
+                                <div
+                                    key={letter}
+                                    onClick={enabled ? () => { this.scrollToRow(row as number); } : undefined}
+                                    style={{
+                                        cursor: enabled ? "pointer" : "default",
+                                        textAlign: "center",
+                                        fontSize: ALPHABET_RAIL_FONT_SIZE,
+                                        lineHeight: ALPHABET_RAIL_LINE_HEIGHT,
+                                        fontWeight: enabled ? ALPHABET_RAIL_ACTIVE_WEIGHT : ALPHABET_RAIL_INACTIVE_WEIGHT,
+                                        color: enabled
+                                            ? this.props.theme.palette.text.secondary
+                                            : this.props.theme.palette.text.disabled,
+                                    }}
+                                >
+                                    {letter}
+                                </div>
+                            );
+                        })}
+                    </div>
+                );
+            }
+
+            scrollToRow(rowIndex: number): void {
+                this.gridRef?.scrollToItem({ rowIndex: rowIndex, align: "start" });
+            }
             getFilteredPlugins(plugins: UiPlugin[], searchString: string | null, filterType: PluginType | null, favoritesList: FavoritesList | null): UiPlugin[] {
                 try {
                     if (searchString === null) {
@@ -523,7 +664,7 @@ export const LoadPluginDialog =
 
                     let results: { score: number; plugin: UiPlugin }[] = [];
                     let searchFilter = new SearchFilter(searchString);
-                    let rootClass = this.model.plugin_classes.get();
+                    const rootClass = this.model.plugin_classes.get();
 
                     for (let i = 0; i < plugins.length; ++i) {
                         let plugin = plugins[i];
@@ -575,8 +716,10 @@ export const LoadPluginDialog =
             }
 
             private cachedGridItems: UiPlugin[] = []; // retained for the scrollTo callback.
+            private gridRef: FixedSizeGrid | null = null;
 
             handleScrollToCallback(element: FixedSizeGrid): void {
+                this.gridRef = element ?? null;
                 if (element) {
                     if (this.scrollToRequested) {
                         this.scrollToRequested = false;
@@ -643,6 +786,7 @@ export const LoadPluginDialog =
                 let value = gridItems[item];
 
                 const classes = withStyles.getClasses(this.props);
+                const isListView = this.state.viewMode === "list";
                 let isFavorite: boolean = this.state.favoritesList[value.uri] ?? false;
                 let pluginType = value.plugin_type;
                 if (value.uri === "http://two-play.com/plugins/toob-nam") {
@@ -657,30 +801,48 @@ export const LoadPluginDialog =
                     >
                         <ButtonBase className={classes.buttonBase} >
                             <SelectHoverBackground selected={value.uri === this.state.selected_uri} showHover={true} />
-                            <div className={classes.content}>
-                                <div className={classes.iconBorder} >
-                                    <PluginIcon pluginType={pluginType} size={24} opacity={0.6} />
+                            <div className={classes.content} style={isListView ? { alignItems: "center" } : undefined}>
+                                <div className={classes.iconBorder} style={isListView ? { paddingTop: 0 } : undefined}>
+                                    <div className={classes.iconTile}>
+                                        <PluginIcon pluginType={pluginType} size={PLUGIN_ICON_SIZE} opacity={PLUGIN_ICON_OPACITY} />
+                                    </div>
                                 </div>
-                                <div className={classes.content2}>
-                                    <div className={classes.label} style={{ display: "flex", flexFlow: "row nowrap", alignItems: "center" }} >
-
-                                        <Typography color="textPrimary" noWrap sx={{ display: "block", flex: "0 1 auto", }} >
+                                {isListView ? (
+                                    <div className={classes.listRow}>
+                                        <Typography color="textPrimary" noWrap sx={{ flex: "1 1 auto", minWidth: 0, fontWeight: 500 }} >
                                             {value.name}
                                         </Typography>
                                         {
                                             isFavorite && (
-                                                <div style={{ flex: "0 0 auto" }}>
-                                                    <StarIcon sx={{ color: "#C80", fontSize: 16, marginRight: "2px" }} />
-                                                </div>
+                                                <StarIcon sx={{ flex: "0 0 auto", color: "#C80", fontSize: 16, marginLeft: "4px" }} />
                                             )
                                         }
-
+                                        <Typography color="textSecondary" noWrap variant="body2" sx={{ flex: "0 0 auto", marginLeft: 2, textAlign: "right" }}>
+                                            {value.plugin_display_type}{this.stereo_indicator(value)}
+                                            {value.author_name !== "" ? "  ·  " + value.author_name : ""}
+                                        </Typography>
                                     </div>
-                                    <Typography color="textSecondary" noWrap>
-                                        {value.plugin_display_type} {this.stereo_indicator(value)}
+                                ) : (
+                                    <div className={classes.content2}>
+                                        <div className={classes.label} style={{ display: "flex", flexFlow: "row nowrap", alignItems: "center" }} >
 
-                                    </Typography>
-                                </div>
+                                            <Typography color="textPrimary" noWrap sx={{ display: "block", flex: "0 1 auto", fontWeight: 500 }} >
+                                                {value.name}
+                                            </Typography>
+                                            {
+                                                isFavorite && (
+                                                    <div style={{ flex: "0 0 auto", display: "flex", alignItems: "center" }}>
+                                                        <StarIcon sx={{ color: "#C80", fontSize: 16, marginLeft: "4px", marginRight: "2px" }} />
+                                                    </div>
+                                                )
+                                            }
+
+                                        </div>
+                                        <Typography color="textSecondary" noWrap variant="body2">
+                                            {value.plugin_display_type}{this.stereo_indicator(value)}
+                                        </Typography>
+                                    </div>
+                                )}
                                 <div className={classes.favoriteDecoration}>
 
                                 </div>
@@ -710,9 +872,18 @@ export const LoadPluginDialog =
                 if (this.state.client_width < 500) {
                     showSearchIcon = this.state.search_collapsed
                 }
-                let gridColumnCount = this.state.grid_cell_columns;
+                const isListView = this.state.viewMode === "list";
+                const gridColumnCount = isListView ? 1 : this.state.grid_cell_columns;
                 this.gridColumnCount = gridColumnCount;
+                // A search sorts by match score, not alphabetically, so the rail would jump to
+                // arbitrary rows.
+                const showAlphabetRail = this.state.search_string === "";
                 let isFavorite = this.state.favoritesList[this.state.selected_uri ?? ""];
+                // Not computed inside the AutoSizer callback: that has not run on the first pass, and the
+                // A-Z rail needs the same array.
+                const gridItems = this.getFilteredPlugins(
+                    this.state.uiPlugins, this.state.search_string, this.state.filterType, this.state.favoritesList);
+                this.cachedGridItems = gridItems;
                 return (
                     <React.Fragment>
                         <DialogEx tag="plugins"
@@ -790,6 +961,17 @@ export const LoadPluginDialog =
                                             />
                                         </div>
                                         <div style={{ flex: "0 0 auto" }} >
+                                            <IconButtonEx
+                                                tooltip={isListView ? "Grid view" : "List view"}
+                                                onClick={() => { this.setViewMode(isListView ? "grid" : "list"); }}>
+                                                {isListView ? (
+                                                    <ViewModuleIcon fontSize='small' style={{ opacity: 0.75 }} />
+                                                ) : (
+                                                    <ViewListIcon fontSize='small' style={{ opacity: 0.75 }} />
+                                                )}
+                                            </IconButtonEx>
+                                        </div>
+                                        <div style={{ flex: "0 0 auto" }} >
                                             <IconButtonEx tooltip="Clear Filter" onClick={() => { this.onClearFilter(); }}>
                                                 {this.state.filterType === PluginType.Plugin ? (
                                                     <FilterListIcon fontSize='small' style={{ opacity: 0.75 }} />
@@ -811,11 +993,14 @@ export const LoadPluginDialog =
                                         </div>
                                     </div>
                                 </DialogTitle>
+                                {this.renderCategoryChips()}
                                 <DialogContent dividers style={{
                                     height: "100px",
                                     padding: 8,
                                     flex: "1 1 100px",
+                                    display: "flex", flexFlow: "row nowrap",
                                 }} >
+                                    <div style={{ flex: "1 1 auto", minWidth: 0, height: "100%", position: "relative" }}>
                                     <AutoSizer>
                                         {(arg: any) => {
                                             if ((!arg.width) || (!arg.height)) {
@@ -823,9 +1008,6 @@ export const LoadPluginDialog =
                                             }
                                             let width = arg.width ?? 1;
                                             let height = arg.height ?? 1;
-                                            let gridItems = this.getFilteredPlugins(
-                                                this.state.uiPlugins, this.state.search_string, this.state.filterType, this.state.favoritesList);
-                                            this.cachedGridItems = gridItems;
 
                                             let scrollRef = (grid: FixedSizeGrid) => { this.handleScrollToCallback(grid); }
 
@@ -863,6 +1045,8 @@ export const LoadPluginDialog =
                                         }
                                         }
                                     </AutoSizer>
+                                    </div>
+                                    {showAlphabetRail && this.renderAlphabetRail(gridItems, gridColumnCount)}
                                 </DialogContent>
                                 {(this.state.client_width >= NARROW_DISPLAY_THRESHOLD) ? (
                                     <DialogActions style={{ flex: "0 0 auto" }} >
