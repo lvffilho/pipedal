@@ -12,15 +12,19 @@
     <link rel="apple-touch-icon" href="/logo192.png" />
     <link rel="manifest" href="/manifest.json" />
     <link rel="stylesheet" href="/css/modGui.css" />
+    <!-- These two are the pre-React body colours -- they paint before the MUI theme
+         loads and show through the loading/error scrims. They must track palette
+         background.default in App.tsx (light #FAFAFA, dark #16141d); the old #D0D0D0/#333 were
+         from the previous palette and flashed a mismatched grey on every start. -->
     <style>
         BODY {
-            background: #D0D0D0;
+            background: #FAFAFA;
         }
     </style>
 
     <style id="bgStyle">
         BODY {
-            background: #333; 
+            background: #16141d;
             overscroll-behavior: none;
         }
     </style>

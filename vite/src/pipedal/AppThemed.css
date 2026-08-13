@@ -58,3 +58,24 @@ img {
     user-select: none;
 }
 
+@keyframes ppLedPulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.55; }
+}
+
+@keyframes ppSignalFlow {
+    to { stroke-dashoffset: -16; }
+}
+.ppSignalFlow {
+    stroke-dasharray: 4 4;
+    animation: ppSignalFlow 1.2s linear infinite;
+}
+
+/* The dashes stay, so an enabled path still reads differently from a bypassed one; only the
+   movement stops. The LED has its own rule, beside its emotion style in PedalboardView. */
+@media (prefers-reduced-motion: reduce) {
+    .ppSignalFlow {
+        animation: none;
+    }
+}
+

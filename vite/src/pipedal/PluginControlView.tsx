@@ -34,6 +34,7 @@ import { midiChannelBindingControlFeatureEnabled } from './MidiChannelBinding';
 
 import { withStyles } from "tss-react/mui";
 import { PiPedalModel, PiPedalModelFactory } from './PiPedalModel';
+import { ContentAlignment, contentAlignmentProperty, getContentAlignment } from './ContentAlignment';
 import { UiPlugin, UiControl, UiFileProperty, UiFrequencyPlot, ScalePoint } from './Lv2Plugin';
 import {
     Pedalboard, PedalboardItem, ControlValue
@@ -62,6 +63,9 @@ export const StandardItemSize = { width: 80, height: 110 };
 
 
 const LANDSCAPE_HEIGHT_BREAK = 500;
+
+const END_SPACER_SIZE = 40;
+const CENTERED_JUSTIFY_CONTENT = "center";
 
 
 export interface ICustomizationHost {
@@ -378,7 +382,8 @@ type PluginControlViewState = {
     dialogFileValue: string,
     modGuiContentReady: boolean,
     showModGuiZoomed: boolean,
-    sidechainDialogOpen: boolean
+    sidechainDialogOpen: boolean,
+    contentAlignment: ContentAlignment
 };
 
 
@@ -401,12 +406,14 @@ const PluginControlView =
                     dialogFileValue: "",
                     modGuiContentReady: false,
                     showModGuiZoomed: false,
-                    sidechainDialogOpen: false
+                    sidechainDialogOpen: false,
+                    contentAlignment: getContentAlignment()
 
                 }
                 this.onPedalboardChanged = this.onPedalboardChanged.bind(this);
                 this.onControlValueChanged = this.onControlValueChanged.bind(this);
                 this.onPreviewChange = this.onPreviewChange.bind(this);
+                this.onContentAlignmentChanged = this.onContentAlignmentChanged.bind(this);
             }
             // unmonitorPort: (handle: MonitorPortHandle) => void;
             // onValueChanged: (instanceId: number, symbol: string, value: number) => void;
@@ -437,12 +444,18 @@ const PluginControlView =
             }
 
 
+            onContentAlignmentChanged(value: ContentAlignment) {
+                this.setState({ contentAlignment: value });
+            }
+
             componentDidMount() {
                 super.componentDidMount();
                 this.model.pedalboard.addOnChangedHandler(this.onPedalboardChanged);
+                contentAlignmentProperty.addOnChangedHandler(this.onContentAlignmentChanged);
             }
             componentWillUnmount() {
                 this.model.pedalboard.removeOnChangedHandler(this.onPedalboardChanged);
+                contentAlignmentProperty.removeOnChangedHandler(this.onContentAlignmentChanged);
                 super.componentWillUnmount();
             }
 
@@ -1005,6 +1018,18 @@ const PluginControlView =
                     gridClass = classes.noScrollGrid;
                     scrollClass = classes.frameScrollNone;
                 }
+                // The wrapping grid fills the width, so justify-content centres it. The landscape grid is
+                // fit-content in a scroller, so auto margins: they collapse once it outgrows the viewport.
+                const centerContent = this.state.contentAlignment === ContentAlignment.Center
+                    && !this.fullScreen();
+                let gridAlignmentStyle: React.CSSProperties = {};
+                if (centerContent) {
+                    if (this.state.landscapeGrid) {
+                        gridAlignmentStyle = { marginLeft: "auto", marginRight: "auto" };
+                    } else {
+                        gridAlignmentStyle = { justifyContent: CENTERED_JUSTIFY_CONTENT };
+                    }
+                }
                 let controlNodes: ControlNodes;
 
                 controlNodes = this.getStandardControlNodes(plugin, controlValues);
@@ -1025,13 +1050,14 @@ const PluginControlView =
                 }
                 return (
                     <div className={scrollClass}>
-                        <div className={gridClass}  >
+                        <div className={gridClass} style={gridAlignmentStyle} >
                             {
                                 nodes
                             }
-                            {/* Extra space to allow scrolling right to the end in lascape especially */}
-                            {!this.fullScreen() && (
-                                <div style={{ flex: "0 0 40px", width: 40, height: 40 }} />
+                            {/* Extra space to allow scrolling right to the end in lascape especially. Omitted for a
+                                centred wrapping grid, which does not scroll and would sit off-centre by half its width. */}
+                            {!this.fullScreen() && !(centerContent && !this.state.landscapeGrid) && (
+                                <div style={{ flex: `0 0 ${END_SPACER_SIZE}px`, width: END_SPACER_SIZE, height: END_SPACER_SIZE }} />
                             )}
                             {
                                 (!this.state.landscapeGrid) && (!this.fullScreen()) && (

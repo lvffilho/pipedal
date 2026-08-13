@@ -18,7 +18,7 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 import React, { Component } from 'react';
-import WithStyles from './WithStyles';
+import WithStyles, { withTheme } from './WithStyles';
 import { withStyles } from "tss-react/mui";
 import {createStyles} from './WithStyles';
 
@@ -40,9 +40,10 @@ const drawerStyles = (theme: Theme) => {
 
     drawer_header: {
         color: theme.palette.primary.main,
-        background: (isDarkMode()? theme.palette.background.default: 'white'),
-
-    }
+        background: (isDarkMode()? 'linear-gradient(180deg, rgba(167,112,228,0.10) 0%, rgba(167,112,228,0) 100%)' : 'linear-gradient(180deg, rgba(103,80,164,0.08) 0%, rgba(103,80,164,0) 100%)'),
+        borderBottom: `1px solid ${isDarkMode() ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}`,
+        padding: '8px 4px',
+    },
 })};
 
 type Anchor = 'top' | 'left' | 'bottom' | 'right';
@@ -57,13 +58,13 @@ interface DrawerProps extends WithStyles<typeof drawerStyles> {
     is_open: boolean;
     onClose?: CloseEventHandler;
     children?: React.ReactNode;
-
+    theme: Theme;
 }
 type DrawerState = {
     is_open: boolean;
 }
 
-export const TemporaryDrawer = withStyles(
+export const TemporaryDrawer = withTheme(withStyles(
     class extends Component<DrawerProps, DrawerState>
     {
         constructor(props: DrawerProps) {
@@ -86,7 +87,7 @@ export const TemporaryDrawer = withStyles(
 
         render() {
             const classes  = withStyles.getClasses(this.props);
-
+            const theme = this.props.theme;
 
             return (
                 <div>
@@ -98,13 +99,16 @@ export const TemporaryDrawer = withStyles(
                                 onClick={() => { this.fireClose(); }}
                                 onKeyDown={() => { this.fireClose(); }}
                             >
-                                <div style={{ display: "flex", flexFlow: "row nowrap", justifyContent: "flex-start", alignItems: "center", width: "100%"}}>
+                                <div className={classes.drawer_header} style={{ display: "flex", flexFlow: "row nowrap", justifyContent: "flex-start", alignItems: "center", width: "100%", gap: 4}}>
 
                                     <IconButtonEx tooltip="Back"
-                                         style={{ flex: "0 0 auto" }} >
-                                        <ArrowBackIcon style={{ fill: '#666' }} />
+                                         style={{ flex: "0 0 auto", color: theme.palette.text.secondary }} >
+                                        <ArrowBackIcon />
                                     </IconButtonEx>
-                                    <img src="img/Pi-Logo-3.png" alt="" style={{height: 36}} />
+                                    <div style={{ flex: "1 1 auto", display: "flex", justifyContent: "center", minWidth: 0 }}>
+                                        <img src="img/Pi-Logo-3.png" alt="PiPedal" style={{height: 32, maxWidth: "100%", objectFit: "contain", filter: isDarkMode() ? 'drop-shadow(0 0 8px rgba(167,112,228,0.35))' : 'none'}} />
+                                    </div>
+                                    <div style={{ flex: "0 0 40px" }} />
                                 </div>
                                 {this.props.children}
                             </div>
@@ -115,4 +119,4 @@ export const TemporaryDrawer = withStyles(
         }
     },
     drawerStyles
-);
+));

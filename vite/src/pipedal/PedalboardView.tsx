@@ -38,6 +38,7 @@ import Rect from './Rect';
 import { PiPedalStateError } from './PiPedalError';
 import Utility from './Utility';
 import { isDarkMode } from './DarkMode';
+import { ContentAlignment, contentAlignmentProperty, getContentAlignment } from './ContentAlignment';
 import {
     Pedalboard, PedalboardItem, PedalboardSplitItem, SplitType
 } from './Pedalboard';
@@ -53,8 +54,8 @@ const END_CONTROL = Pedalboard.END_CONTROL_ID;
 const START_PEDALBOARD_ITEM_URI = Pedalboard.START_PEDALBOARD_ITEM_URI;
 const END_PEDALBOARD_ITEM_URI = Pedalboard.END_PEDALBOARD_ITEM_URI;
 
-const ENABLED_CONNECTOR_COLOR = isDarkMode() ? "#CCC" : "#666";
-const DISABLED_CONNECTOR_COLOR = isDarkMode() ? "#666" : "#CCC";
+const ENABLED_CONNECTOR_COLOR = isDarkMode() ? "rgba(220,220,235,0.85)" : "rgba(80,70,95,0.70)";
+const DISABLED_CONNECTOR_COLOR = isDarkMode() ? "rgba(120,120,140,0.45)" : "rgba(170,170,185,0.60)";
 
 
 
@@ -63,6 +64,15 @@ const CELL_HEIGHT: number = 64;
 const FRAME_SIZE: number = 36;
 
 const STROKE_WIDTH = 3;
+
+const PEDAL_FRAME_BORDER_RADIUS = 10;
+
+const ACTIVE_LED_SIZE = 5;
+const ACTIVE_LED_INSET = 4;
+
+const COLOR_STRIP_HEIGHT = 3;
+const COLOR_STRIP_OPACITY = 0.85;
+const COLOR_STRIP_BORDER_RADIUS = PEDAL_FRAME_BORDER_RADIUS - 1;
 const STEREO_STROKE_WIDTH = 6;
 
 
@@ -159,7 +169,9 @@ const pedalboardStyles = (theme: Theme) => createStyles({
         width: FRAME_SIZE,
         height: FRAME_SIZE,
         padding: 0,
-        borderRadius: 8
+        borderRadius: 12,
+        transition: 'transform 180ms ease-out',
+        '&:active': { transform: 'scale(0.95)' },
     }),
 
     iconFrame: css({
@@ -168,16 +180,22 @@ const pedalboardStyles = (theme: Theme) => createStyles({
         alignItems: "center",
         justifyContent: "center",
         position: "relative",
-        background: theme.palette.background.paper,
+        background: isDarkMode()
+            ? `linear-gradient(180deg, ${theme.palette.background.paper} 0%, ${theme.palette.background.default} 100%)`
+            : `linear-gradient(180deg, ${theme.palette.background.paper} 0%, ${theme.palette.background.default} 100%)`,
 
         width: FRAME_SIZE,
         height: FRAME_SIZE,
-        borderColor: "#777",
-        borderWidth: 2,
+        borderColor: theme.palette.divider,
+        borderWidth: 1,
         borderStyle: "solid",
         overflow: "hidden",
         padding: 0,
-        borderRadius: 8
+        borderRadius: PEDAL_FRAME_BORDER_RADIUS,
+        boxShadow: isDarkMode()
+            ? '0 2px 4px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.06)'
+            : '0 1px 3px rgba(0,0,0,0.10), inset 0 1px 0 rgba(255,255,255,0.65)',
+        transition: 'box-shadow 200ms ease-out, border-color 200ms ease-out',
     }),
     selectedIconFrame: css({
 
@@ -185,15 +203,20 @@ const pedalboardStyles = (theme: Theme) => createStyles({
         alignItems: "center",
         justifyContent: "center",
         position: "relative",
-        background: theme.palette.background.paper,
+        background: isDarkMode()
+            ? `linear-gradient(180deg, ${theme.palette.background.paper} 0%, ${theme.palette.background.default} 100%)`
+            : `linear-gradient(180deg, ${theme.palette.background.paper} 0%, ${theme.palette.background.default} 100%)`,
         width: FRAME_SIZE,
         height: FRAME_SIZE,
         borderColor: theme.palette.primary.main,
-        borderWidth: "2.0px",
+        borderWidth: "1px",
         borderStyle: "solid",
         overflow: "hidden",
-        borderRadius: 8,
-        boxShadow: "0 0 6px 0px " + theme.palette.primary.main + "C0"
+        borderRadius: PEDAL_FRAME_BORDER_RADIUS,
+        boxShadow: isDarkMode()
+            ? `0 0 0 1px ${theme.palette.primary.main}, 0 0 14px ${theme.palette.primary.main}66, 0 2px 6px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.06)`
+            : `0 0 0 1px ${theme.palette.primary.main}, 0 0 14px ${theme.palette.primary.main}40, 0 2px 6px rgba(0,0,0,0.10), inset 0 1px 0 rgba(255,255,255,0.65)`,
+        transition: 'box-shadow 200ms ease-out, border-color 200ms ease-out',
     }),
     borderlessIconFrame: css({
 
@@ -204,9 +227,45 @@ const pedalboardStyles = (theme: Theme) => createStyles({
         background: "transparent",
         width: FRAME_SIZE,
         height: FRAME_SIZE,
-        border: "0px #666 solid",
-        borderRadius: 8,
+        border: "0px solid transparent",
+        borderRadius: PEDAL_FRAME_BORDER_RADIUS,
         overflow: "hidden",
+    }),
+
+    emptyIconFrame: css({
+
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        position: "relative",
+        background: 'transparent',
+        width: FRAME_SIZE,
+        height: FRAME_SIZE,
+        borderColor: isDarkMode() ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.10)',
+        borderWidth: 1,
+        borderStyle: "dashed",
+        overflow: "hidden",
+        padding: 0,
+        borderRadius: PEDAL_FRAME_BORDER_RADIUS,
+        transition: 'border-color 200ms ease-out, background-color 200ms ease-out',
+    }),
+
+    activeLed: css({
+        position: 'absolute',
+        top: ACTIVE_LED_INSET,
+        right: ACTIVE_LED_INSET,
+        width: ACTIVE_LED_SIZE,
+        height: ACTIVE_LED_SIZE,
+        borderRadius: '50%',
+        background: theme.palette.primary.main,
+        boxShadow: `0 0 4px ${theme.palette.primary.main}, 0 0 1px ${theme.palette.primary.main}`,
+        zIndex: 2,
+        pointerEvents: 'none',
+        animation: 'ppLedPulse 2.4s ease-in-out infinite',
+        // Paired with the .ppSignalFlow rule in AppThemed.css.
+        '@media (prefers-reduced-motion: reduce)': {
+            animation: 'none',
+        },
     }),
 
     pedalIcon: css({
@@ -252,6 +311,7 @@ interface LayoutSize {
 
 type PedalboardState = {
     pedalboard?: Pedalboard;
+    contentAlignment: ContentAlignment;
 };
 
 const EMPTY_PEDALS: PedalLayout[] = [];
@@ -449,8 +509,10 @@ const PedalboardView =
                     if (!props.selectedId) props.selectedId = -1;
                     this.state = {
                         pedalboard: this.model.pedalboard.get(),
+                        contentAlignment: getContentAlignment(),
                     };
                     this.onPedalboardChanged = this.onPedalboardChanged.bind(this);
+                    this.onContentAlignmentChanged = this.onContentAlignmentChanged.bind(this);
                     this.frameRef = React.createRef();
                     this.scrollRef = React.createRef();
                     this.handleTouchStart = this.handleTouchStart.bind(this);
@@ -628,14 +690,20 @@ const PedalboardView =
                     });
                 }
 
+                onContentAlignmentChanged(value: ContentAlignment) {
+                    this.setState({ contentAlignment: value });
+                }
+
                 componentDidMount() {
                     this.scrollRef.current!.addEventListener("touchstart", this.handleTouchStart, { passive: false });
                     this.model.pedalboard.addOnChangedHandler(this.onPedalboardChanged);
+                    contentAlignmentProperty.addOnChangedHandler(this.onContentAlignmentChanged);
 
                 }
                 componentWillUnmount() {
                     this.scrollRef.current!.removeEventListener("touchstart", this.handleTouchStart);
                     this.model.pedalboard.removeOnChangedHandler(this.onPedalboardChanged);
+                    contentAlignmentProperty.removeOnChangedHandler(this.onContentAlignmentChanged);
                 }
 
                 offsetLayout_(layoutItems: PedalLayout[], offset: number): void {
@@ -854,14 +922,16 @@ const PedalboardView =
 
                     if (numberOfOutputs === 2) {
                         output.push((
-                            <path key={this.renderKey++} d={svgPath} stroke={color} strokeWidth={SVG_STEREO_STROKE_WIDTH} />
+                            <path key={this.renderKey++} d={svgPath} stroke={color} strokeWidth={SVG_STEREO_STROKE_WIDTH}
+                                className={enabled ? 'ppSignalFlow' : undefined} />
                         ));
                         output.push((
                             <path key={this.renderKey++} d={svgPath} stroke={stereoCenterColor} strokeWidth={SVG_STROKE_WIDTH} />
                         ));
                     } else if (numberOfOutputs === 1) {
                         output.push((
-                            <path key={this.renderKey++} d={svgPath} stroke={color} strokeWidth={SVG_STROKE_WIDTH} />
+                            <path key={this.renderKey++} d={svgPath} stroke={color} strokeWidth={SVG_STROKE_WIDTH}
+                                className={enabled ? 'ppSignalFlow' : undefined} />
                         ));
                     } else {
                         output.push((
@@ -1077,18 +1147,22 @@ const PedalboardView =
                 )
                     : ReactNode {
                     const classes = withStyles.getClasses(this.props);
+                    const isEmpty = iconType === PluginType.None;
                     let frameStyle = classes.iconFrame;
                     if (!hasBorder) {
                         frameStyle = classes.borderlessIconFrame;
-                    } else {
-                        if (instanceId === this.props.selectedId) {
-                            frameStyle = classes.selectedIconFrame;
-                        }
+                    } else if (isEmpty) {
+                        frameStyle = classes.emptyIconFrame;
+                    } else if (instanceId === this.props.selectedId) {
+                        frameStyle = classes.selectedIconFrame;
                     }
+                    const showLed = hasBorder && !isEmpty && enabled && !pluginNotFound;
+                    const stripColor = (hasBorder && !isEmpty) ? getIconColor(iconColor) : undefined;
+                    const isAmp = iconType === PluginType.AmplifierPlugin;
 
                     return (
                         <div style={{ width: "100%", height: "100%" }}>
-                            <ButtonBase className={classes.pedalButton} 
+                            <ButtonBase className={classes.pedalButton}
                                 onClick={(e) => { this.onItemClick(e, instanceId); }}
                                 onDoubleClick={(e: SyntheticEvent) => { this.onItemDoubleClick(e, instanceId); }}
                                 onContextMenu={(e: SyntheticEvent) => { this.onItemLongClick(e, instanceId); }}
@@ -1099,6 +1173,29 @@ const PedalboardView =
                                         clipChildren={false}
                                     >
                                     </SelectHoverBackground>
+                                    {showLed && <span className={classes.activeLed} />}
+                                    {stripColor && (
+                                        <div style={{
+                                            position: 'absolute', top: 0, left: 0, right: 0,
+                                            height: COLOR_STRIP_HEIGHT,
+                                            background: stripColor,
+                                            opacity: COLOR_STRIP_OPACITY,
+                                            borderTopLeftRadius: COLOR_STRIP_BORDER_RADIUS,
+                                            borderTopRightRadius: COLOR_STRIP_BORDER_RADIUS,
+                                            zIndex: 1,
+                                            pointerEvents: 'none',
+                                        }} />
+                                    )}
+                                    {isAmp && (
+                                        <div style={{
+                                            position: 'absolute', inset: 0,
+                                            background: isDarkMode()
+                                                ? 'repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0px, rgba(255,255,255,0.025) 1px, rgba(255,255,255,0.055) 1px, rgba(255,255,255,0.055) 2px)'
+                                                : 'repeating-linear-gradient(90deg, rgba(0,0,0,0.025) 0px, rgba(0,0,0,0.025) 1px, rgba(0,0,0,0.05) 1px, rgba(0,0,0,0.05) 2px)',
+                                            pointerEvents: 'none',
+                                            zIndex: 0,
+                                        }} />
+                                    )}
                                 </div>
                                 <Draggable draggable={draggable && (this.props.enableStructureEditing)} getScrollContainer={() => this.getScrollContainer()}
                                     onDragEnd={(x, y) => { this.onDragEnd(instanceId, x, y) }}
@@ -1146,7 +1243,7 @@ const PedalboardView =
                         <div key="connectors" style={{ width: layoutSize.width, height: layoutSize.height, overflow: "hidden" }}>
                             <svg width={layoutSize.width} height={layoutSize.height}
                                 xmlns="http://www.w3.org/2000/svg" viewBox={"0 0 " + layoutSize.width + " " + layoutSize.height}>
-                                <g fill="none">
+                                <g fill="none" strokeLinecap="round" strokeLinejoin="round">
                                     {
                                         outputs
                                     }
@@ -1387,12 +1484,18 @@ const PedalboardView =
 
                     this.currentLayout = layoutChain; // save for mouse processing &c.
 
+                    const centerContent = this.state.contentAlignment === ContentAlignment.Center;
+
                     return (
                         <div className={classes.scrollContainer} ref={this.scrollRef}
                         >
                             <div className={classes.container} ref={this.frameRef}
                                 style={{
                                     width: layoutSize.width, height: layoutSize.height,
+                                    // Auto margins, not justify-content on the scroll parent: they collapse to zero once the
+                                    // chain outgrows the viewport, which keeps the overflowing left edge reachable.
+                                    marginLeft: centerContent ? "auto" : undefined,
+                                    marginRight: centerContent ? "auto" : undefined,
                                 }} >
                                 {this.renderChain(layoutChain, layoutSize)}
                             </div>

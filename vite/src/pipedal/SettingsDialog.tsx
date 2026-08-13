@@ -29,6 +29,7 @@ import Typography from '@mui/material/Typography';
 import { isDarkMode } from './DarkMode';
 import { PiPedalModel, PiPedalModelFactory, State } from './PiPedalModel';
 import { ColorTheme } from './DarkMode';
+import { ContentAlignment, getContentAlignment, setContentAlignment } from './ContentAlignment';
 import ButtonBase from "@mui/material/ButtonBase";
 import AppBar from '@mui/material/AppBar';
 import Button from '@mui/material/Button';
@@ -76,6 +77,7 @@ interface SettingsDialogProps extends WithStyles<typeof styles> {
 interface SettingsDialogState {
     showStatusMonitor: boolean;
     showStatusMonitorDialog: boolean;
+    contentAlignment: ContentAlignment;
     jackConfiguration: JackConfiguration;
     jackSettings: JackChannelSelection | null;
     channelRouterSettings: ChannelRouterSettings | null;
@@ -169,6 +171,8 @@ const styles = (theme: Theme) => createStyles({
 });
 
 
+const SETTING_ROW_MAX_WIDTH = 400;
+
 const Transition = React.forwardRef(function Transition(
     props: SlideProps, ref: React.Ref<unknown>
 ) {
@@ -192,6 +196,7 @@ const SettingsDialog = withStyles(
             this.state = {
                 showStatusMonitor: this.model.showStatusMonitor.get(),
                 showStatusMonitorDialog: false,
+                contentAlignment: getContentAlignment(),
 
                 jackServerSettings: this.model.jackServerSettings.get(),
                 channelRouterSettings: this.model.channelRouterSettings.get(),
@@ -254,6 +259,11 @@ const SettingsDialog = withStyles(
 
         handleShowStatusMonitorChanged(): void {
             this.setState({ showStatusMonitor: this.model.showStatusMonitor.get() });
+        }
+        handleContentAlignmentChanged(centered: boolean): void {
+            const value = centered ? ContentAlignment.Center : ContentAlignment.Start;
+            setContentAlignment(value);
+            this.setState({ contentAlignment: value });
         }
         handleConnectionStateChanged(): void {
             if (this.model.state.get() === State.Ready) {
@@ -907,6 +917,37 @@ const SettingsDialog = withStyles(
                                                             checked={this.state.showStatusMonitor}
                                                             onChange={
                                                                 (e) => { this.model.setShowStatusMonitor(e.target.checked); }
+                                                            }
+                                                        />
+                                                    </div>
+
+                                                </div>
+                                            </div>
+                                        </ButtonBase>
+                                        <ButtonBase
+                                            className={classes.setting}
+                                            onClick={() => {
+                                                this.handleContentAlignmentChanged(
+                                                    this.state.contentAlignment !== ContentAlignment.Center);
+                                            }}  >
+                                            <SelectHoverBackground selected={false} showHover={true} />
+                                            <div style={{ width: "100%" }}>
+                                                <div style={{
+                                                    width: "100%", display: "flex", flexDirection: "row", flexWrap: "nowrap",
+                                                    alignItems: "center", maxWidth: SETTING_ROW_MAX_WIDTH
+                                                }}>
+                                                    <div style={{ flex: "1 1 auto" }}>
+                                                        <Typography className={classes.primaryItem} display="block" variant="body2" color="textPrimary" noWrap>
+                                                            Center pedals and controls.</Typography>
+                                                        <Typography className={classes.secondaryItem} display="block" variant="caption" color="textSecondary" noWrap>
+                                                            When off, they are aligned to the left edge.</Typography>
+                                                    </div>
+
+                                                    <div style={{ flex: "0 0 auto" }}>
+                                                        <Switch
+                                                            checked={this.state.contentAlignment === ContentAlignment.Center}
+                                                            onChange={
+                                                                (e) => { this.handleContentAlignmentChanged(e.target.checked); }
                                                             }
                                                         />
                                                     </div>

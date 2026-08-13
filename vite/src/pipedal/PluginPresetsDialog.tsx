@@ -21,6 +21,8 @@ import React, { SyntheticEvent,Component } from 'react';
 import IconButtonEx from './IconButtonEx';
 import Typography from '@mui/material/Typography';
 import { PiPedalModel, PiPedalModelFactory  } from './PiPedalModel';
+import { isDarkMode } from './DarkMode';
+import { dialogActionBarBackgroundImage } from './ThemeSurfaces';
 import Button from "@mui/material/Button";
 import ButtonBase from "@mui/material/ButtonBase";
 import DialogEx from './DialogEx';
@@ -95,7 +97,8 @@ const styles = (theme: Theme) => createStyles({
     dialogActionBar: css({
         position: 'relative',
         top: 0, left: 0,
-        background: "black"
+        backgroundImage: dialogActionBarBackgroundImage(isDarkMode()),
+        color: '#FFFFFF',
     }),
     dialogTitle: css({
         marginLeft: theme.spacing(2),

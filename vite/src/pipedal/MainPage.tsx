@@ -51,13 +51,8 @@ import PluginPresetSelector from './PluginPresetSelector';
 import OldDeleteIcon from "./svg/old_delete_outline_24dp.svg?react";
 import MidiIcon from "./svg/ic_midi.svg?react";
 import { isDarkMode } from './DarkMode';
-import Snapshot0Icon from "./svg/snapshot_0.svg?react";
-import Snapshot1Icon from "./svg/snapshot_1.svg?react";
-import Snapshot2Icon from "./svg/snapshot_2.svg?react";
-import Snapshot3Icon from "./svg/snapshot_3.svg?react";
-import Snapshot4Icon from "./svg/snapshot_4.svg?react";
-import Snapshot5Icon from "./svg/snapshot_5.svg?react";
-import Snapshot6Icon from "./svg/snapshot_6.svg?react";
+import { TOOLBAR_ICON_OPACITY } from './ThemeSurfaces';
+import PhotoCameraIcon from '@mui/icons-material/PhotoCamera';
 import ModUiIcon from './svg/mod_ui.svg?react';
 import PipedalUiIcon from './svg/pp_ui.svg?react';
 
@@ -72,6 +67,17 @@ const SHOW_ICON_THRESHHOLD = 475;
 const DISPLAY_AUTHOR_THRESHHOLD = 750;
 const DISPLAY_AUTHOR_SPLIT_THRESHOLD = 500;
 const HORIZONTAL_CONTROL_SCROLL_HEIGHT_BREAK = 500;
+
+const TOOLBAR_ICON_SIZE = 24;
+const SNAPSHOT_ICON_FONT_SIZE = 22;
+const SNAPSHOT_BADGE_SIZE = 13;
+const SNAPSHOT_BADGE_BOTTOM = -3;
+const SNAPSHOT_BADGE_RIGHT = -6;
+const SNAPSHOT_BADGE_PADDING = '0 3px';
+const SNAPSHOT_BADGE_FONT_SIZE = 9;
+const SNAPSHOT_BADGE_FONT_WEIGHT = 700;
+const SNAPSHOT_BADGE_TEXT_COLOR = '#FFF';
+const SNAPSHOT_BADGE_OUTLINE_WIDTH = 1.5;
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 // const HORIZONTAL_LAYOUT_MQ = "@media (max-height: " + HORIZONTAL_CONTROL_SCROLL_HEIGHT_BREAK + "px)";
@@ -91,24 +97,27 @@ const styles = ({ palette }: Theme) => {
             flex: "1 1 1px", overflow: "auto"
         }),
         separator: css({
-            width: "100%", height: "1px", background: "#888", opacity: "0.5",
+            width: "100%", height: "1px",
+            background: palette.divider,
             flex: "0 0 1px"
         }),
 
         controlToolBar: css({
             flex: "0 0 auto", width: "100%", height: 48
         }),
+        // These three panels share one continuous surface: tinting them individually bands the
+        // page into mismatched greys. `separator` already divides the zones.
         splitControlBar: css({
-            flex: "0 0 64px", width: "100%", paddingLeft: 24, paddingRight: 16, paddingBottom: 16
+            flex: "0 0 64px", width: "100%", paddingLeft: 24, paddingRight: 16, paddingBottom: 16,
         }),
         controlContent: css({
-            flex: "1 1 auto", width: "100%", overflowY: "hidden", minHeight: 185
+            flex: "1 1 auto", width: "100%", overflowY: "hidden", minHeight: 185,
         }),
         controlContentSmall: css({
             flex: "0 0 162px", width: "100%", height: 162, overflowY: "hidden",
         }),
-        title: css({ fontSize: "1.1rem", fontWeight: 700, marginRight: 8, textOverflow: "ellipsis", whiteSpace: "nowrap", opacity: 0.75 }),
-        author: css({ fontWeight: 500, fontSize: "0.8rem", marginRight: 8, textOverflow: "ellipsis", whiteSpace: "nowrap", opacity: 0.75 })
+        title: css({ fontSize: "1.05rem", fontWeight: 700, marginRight: 8, textOverflow: "ellipsis", whiteSpace: "nowrap", letterSpacing: '-0.01em', color: palette.text.primary }),
+        author: css({ fontWeight: 500, fontSize: "0.78rem", marginRight: 8, textOverflow: "ellipsis", whiteSpace: "nowrap", color: palette.text.secondary })
     }
 };
 
@@ -564,9 +573,9 @@ export const MainPage =
                                             size="large">
                                             {(!this.state.showModUi || !canShowModUi) ?
                                                 (
-                                                    <ModUiIcon style={{ height: 24, width: 24, fill: this.props.theme.palette.text.primary, opacity: 0.6 }} />
+                                                    <ModUiIcon style={{ height: TOOLBAR_ICON_SIZE, width: TOOLBAR_ICON_SIZE, fill: this.props.theme.palette.text.primary, opacity: TOOLBAR_ICON_OPACITY }} />
                                                 ) : (
-                                                    <PipedalUiIcon style={{ height: 24, width: 24, fill: this.props.theme.palette.text.primary, opacity: 0.6 }} />
+                                                    <PipedalUiIcon style={{ height: TOOLBAR_ICON_SIZE, width: TOOLBAR_ICON_SIZE, fill: this.props.theme.palette.text.primary, opacity: TOOLBAR_ICON_OPACITY }} />
                                                 )
                                             }
                                         </IconButtonEx>
@@ -579,24 +588,34 @@ export const MainPage =
                     }
                 }
 
-                snapshotIcon(theme: Theme, snapshotNumber: number) {
-                    switch (snapshotNumber + 1) {
-                        case 0:
-                        default:
-                            return (<Snapshot0Icon style={{ height: 24, width: 24, fill: theme.palette.text.primary, opacity: 0.6 }} />);
-                        case 1:
-                            return (<Snapshot1Icon style={{ height: 24, width: 24, fill: theme.palette.text.primary, opacity: 0.6 }} />);
-                        case 2:
-                            return (<Snapshot2Icon style={{ height: 24, width: 24, fill: theme.palette.text.primary, opacity: 0.6 }} />);
-                        case 3:
-                            return (<Snapshot3Icon style={{ height: 24, width: 24, fill: theme.palette.text.primary, opacity: 0.6 }} />);
-                        case 4:
-                            return (<Snapshot4Icon style={{ height: 24, width: 24, fill: theme.palette.text.primary, opacity: 0.6 }} />);
-                        case 5:
-                            return (<Snapshot5Icon style={{ height: 24, width: 24, fill: theme.palette.text.primary, opacity: 0.6 }} />);
-                        case 6:
-                            return (<Snapshot6Icon style={{ height: 24, width: 24, fill: theme.palette.text.primary, opacity: 0.6 }} />);
-                    }
+                snapshotButton(theme: Theme, snapshotNumber: number) {
+                    const hasSnapshot = snapshotNumber >= 0;
+                    return (
+                        <div style={{
+                            position: 'relative', display: 'inline-flex',
+                            alignItems: 'center', justifyContent: 'center',
+                            width: TOOLBAR_ICON_SIZE, height: TOOLBAR_ICON_SIZE
+                        }}>
+                            <PhotoCameraIcon style={{ fontSize: SNAPSHOT_ICON_FONT_SIZE, color: theme.palette.text.primary, opacity: TOOLBAR_ICON_OPACITY }} />
+                            {hasSnapshot && (
+                                <span style={{
+                                    position: 'absolute',
+                                    bottom: SNAPSHOT_BADGE_BOTTOM, right: SNAPSHOT_BADGE_RIGHT,
+                                    minWidth: SNAPSHOT_BADGE_SIZE, height: SNAPSHOT_BADGE_SIZE,
+                                    borderRadius: SNAPSHOT_BADGE_SIZE / 2,
+                                    padding: SNAPSHOT_BADGE_PADDING,
+                                    background: theme.palette.primary.main,
+                                    color: SNAPSHOT_BADGE_TEXT_COLOR,
+                                    fontSize: SNAPSHOT_BADGE_FONT_SIZE,
+                                    fontWeight: SNAPSHOT_BADGE_FONT_WEIGHT,
+                                    lineHeight: `${SNAPSHOT_BADGE_SIZE}px`,
+                                    textAlign: 'center',
+                                    boxShadow: `0 0 0 ${SNAPSHOT_BADGE_OUTLINE_WIDTH}px ${theme.palette.background.default}`,
+                                    fontFamily: 'inherit',
+                                }}>{snapshotNumber + 1}</span>
+                            )}
+                        </div>
+                    );
                 }
 
                 canShowModUi(pedalboardItem: PedalboardItem): boolean {
@@ -678,7 +697,7 @@ export const MainPage =
                                 }} >
                                     <div style={{ flex: "0 0 auto", width: this.state.splitControlBar ? undefined : 60 }} >
                                         <div style={{ display: bypassVisible ? "block" : "none", width: this.state.splitControlBar ? undefined : 60 }} >
-                                            <ToolTipEx title="Bypass"
+                                            <ToolTipEx title={bypassChecked ? "Active (click to bypass)" : "Bypassed (click to activate)"}
                                             >
                                                 <Switch color="secondary" checked={bypassChecked} onChange={this.handleEnableCurrentItemChanged} />
                                             </ToolTipEx>
@@ -700,7 +719,7 @@ export const MainPage =
 
                                             <div style={{ flex: "0 0 auto", display: (canInsert || canAppend) ? "block" : "none" }}>
                                                 <IconButtonEx tooltip="Add pedal slot" onClick={(e) => { this.onAddClick(e) }} size="large">
-                                                    <AddIcon style={{ height: 24, width: 24, fill: this.props.theme.palette.text.primary, opacity: 0.6 }} />
+                                                    <AddIcon style={{ height: TOOLBAR_ICON_SIZE, width: TOOLBAR_ICON_SIZE, fill: this.props.theme.palette.text.primary, opacity: TOOLBAR_ICON_OPACITY }} />
                                                 </IconButtonEx>
                                                 <Menu
                                                     id="add-menu"
@@ -721,7 +740,7 @@ export const MainPage =
                                                 <IconButtonEx tooltip="Delete pedal"
                                                     onClick={() => { this.onDeletePedal(pedalboardItem?.instanceId ?? -1) }}
                                                     size="large">
-                                                    <OldDeleteIcon style={{ height: 24, width: 24, fill: this.props.theme.palette.text.primary, opacity: 0.6 }} />
+                                                    <OldDeleteIcon style={{ height: TOOLBAR_ICON_SIZE, width: TOOLBAR_ICON_SIZE, fill: this.props.theme.palette.text.primary, opacity: TOOLBAR_ICON_OPACITY }} />
                                                 </IconButtonEx>
                                             </div>
                                             <div style={{ flex: "0 0 auto" }}>
@@ -735,24 +754,25 @@ export const MainPage =
                                                     startIcon={<InputIcon />}
                                                     style={{
                                                         textTransform: "none",
-                                                        background: (isDarkMode() ? "#6750A4" : undefined)
+                                                        padding: this.state.canDisplayPluginIcon ? undefined : '6px 10px',
+                                                        minWidth: 0,
                                                     }}
                                                 >
-                                                    Load
+                                                    {this.state.canDisplayPluginIcon ? "Load" : ""}
                                                 </ButtonEx>
                                             </div>
                                             <div style={{ flex: "0 0 auto" }}>
                                                 <IconButtonEx tooltip="MIDI bindings"
                                                     onClick={(e) => { this.handleMidiConfiguration(instanceId); }}
                                                     size="large">
-                                                    <MidiIcon style={{ height: 24, width: 24, fill: this.props.theme.palette.text.primary, opacity: 0.6 }} />
+                                                    <MidiIcon style={{ height: TOOLBAR_ICON_SIZE, width: TOOLBAR_ICON_SIZE, fill: this.props.theme.palette.text.primary, opacity: TOOLBAR_ICON_OPACITY }} />
                                                 </IconButtonEx>
                                             </div>
                                             <div style={{ flex: "0 0 auto" }}>
                                                 <IconButtonEx tooltip="Snapshots"
                                                     onClick={(e) => { this.setState({ snapshotDialogOpen: true }); }}
                                                     size="large">
-                                                    {this.snapshotIcon(this.props.theme, this.state.selectedSnapshot)}
+                                                    {this.snapshotButton(this.props.theme, this.state.selectedSnapshot)}
                                                 </IconButtonEx>
                                             </div>
                                         </div>

@@ -22,6 +22,8 @@ import IconButtonEx from './IconButtonEx';
 import Typography from '@mui/material/Typography';
 import { PiPedalModel, PiPedalModelFactory } from './PiPedalModel';
 import { BankIndexEntry, BankIndex } from './Banks';
+import { isDarkMode } from './DarkMode';
+import { dialogActionBarBackgroundImage } from './ThemeSurfaces';
 import Button from "@mui/material/Button";
 import ButtonBase from "@mui/material/ButtonBase";
 import Slide, { SlideProps } from '@mui/material/Slide';
@@ -94,7 +96,8 @@ const styles = (theme: Theme) => createStyles({
     dialogActionBar: css({
         position: 'relative',
         top: 0, left: 0,
-        background: "black"
+        backgroundImage: dialogActionBarBackgroundImage(isDarkMode()),
+        color: '#FFFFFF',
     }),
     dialogTitle: css({
         marginLeft: theme.spacing(2),
