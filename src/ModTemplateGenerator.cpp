@@ -197,8 +197,44 @@ namespace pipedal
                     {
                         // this is a looping construct.
                         std::string variableName = variableString.substr(1);
+                        std::string startTag = SS("{{#" << variableName << "}}");
                         std::string endTag = SS("{{/" << variableName << "}}");
-                        size_t endTagPos = content.find(endTag, ix);
+
+                        // Match the closing tag at the same nesting depth.
+                        // find(endTag, ix) took the first {{/name}} after the
+                        // opening tag, which is wrong when a section contains
+                        // another section of the same name: the outer section
+                        // got truncated at the inner closing tag, and the rest
+                        // of the template was then misparsed and reported as an
+                        // unmatched tag even though it was balanced. The
+                        // guitaramp-suite ("Hex Chain") modgui templates hit
+                        // this with {{#controls.14}}.
+                        size_t endTagPos = std::string::npos;
+                        {
+                            size_t scan = ix;
+                            int depth = 1;
+                            while (scan < content.length())
+                            {
+                                size_t nextOpen = content.find(startTag, scan);
+                                size_t nextClose = content.find(endTag, scan);
+                                if (nextClose == std::string::npos)
+                                {
+                                    break;
+                                }
+                                if (nextOpen != std::string::npos && nextOpen < nextClose)
+                                {
+                                    ++depth;
+                                    scan = nextOpen + startTag.length();
+                                    continue;
+                                }
+                                if (--depth == 0)
+                                {
+                                    endTagPos = nextClose;
+                                    break;
+                                }
+                                scan = nextClose + endTag.length();
+                            }
+                        }
                         if (endTagPos == std::string::npos)
                         {
                             throw std::runtime_error("Unmatched opening tag for  '" + variableString + "' in template.");
@@ -213,6 +249,21 @@ namespace pipedal
                             splitIndexedArrayVariable(variableName, arrayName, arrayIndex);
 
                             json_variant array = context.getVariable(arrayName);
+                            // as_array() calls require_type(), which throws
+                            // "Content type is not valid." when the variable is
+                            // absent (getVariable returns json_null) or is not
+                            // an array. A section over something the context
+                            // does not provide should render nothing, which is
+                            // what the non-indexed branch below already does and
+                            // what Mustache semantics call for. MOD templates
+                            // reference sections pipedal does not supply, such
+                            // as effect.parameters.0, so throwing here failed
+                            // the whole UI over one unknown section.
+                            if (!array.is_array())
+                            {
+                                ix = endTagPos + endTag.length();
+                                continue;
+                            }
                             auto &arrayValue = *array.as_array();
                             if (arrayIndex >= 0 && arrayIndex < static_cast<int64_t>(arrayValue.size()))
                             {
