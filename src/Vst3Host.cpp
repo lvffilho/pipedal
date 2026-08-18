@@ -30,6 +30,7 @@
 #include <set>
 #include <unordered_set>
 #include <filesystem>
+#include "base/source/fdebug.h" // defines the NEW allocation macro.
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
 #include "public.sdk/source/vst/hosting/plugprovider.h"
@@ -298,6 +299,12 @@ void Vst3Host::Private::UpdateControlInfo(IEditController *controller, Lv2Plugin
 		port.is_bypass(isBypass);
 
 		port.not_on_gui(isReadOnly | notOnGui);
+		// A read-only VST3 parameter is an output (a meter or similar), not
+		// something the host may write. Lv2PluginUiPort::is_input_ defaults to
+		// true, so without this every meter was exposed as an input control:
+		// snapshots then tried to save and restore values into parameters the
+		// plugin will not accept. mda SpecMeter is 35 such parameters.
+		port.is_input(!isReadOnly);
 
 		port.min_value(controller->normalizedParamToPlain(info.id, 0));
 		port.max_value(controller->normalizedParamToPlain(info.id, 1));
