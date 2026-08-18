@@ -114,7 +114,7 @@ endif()
 # of test targets. Deprecated, and non-functional.
 #################################################################
 
-set (ENABLE_VST3 0)
+set (ENABLE_VST3 1)
 
 
 if (ENABLE_VST3)
