@@ -261,6 +261,13 @@ void ModWebInterceptImpl::get_response(
     }
     catch (const std::exception &e)
     {
+        // The body set here is discarded: on_http() sees a non-zero ec and
+        // replaces the response with ServerError(ec.message()), which is just
+        // the generic errno text ("Invalid argument"). The actual reason never
+        // reached the client or the log, so a failing modgui showed up in the
+        // UI as an unactionable "Failed to load template: Internal Server
+        // Error". Log it.
+        Lv2Log::error(SS("ModWebIntercept: " << request_uri.str() << ": " << e.what()));
         res.setBody("Error: " + std::string(e.what()));
         ec = boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
         return;
