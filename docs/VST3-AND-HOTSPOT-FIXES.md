@@ -205,6 +205,56 @@ VST3 deliberately keeps out of component state: `kIsProgramChange`
 "Sustain", "Aftertouch", the mda instrument filter-mod controls). Those are
 transient performance state, not settings.
 
+## 7. Web server: a GET for any missing path aborted the daemon
+
+Found while probing modgui URLs. `WebServerImpl::on_http()`'s static-file
+fallback called `std::filesystem::file_size()` **before** the
+`file.open()` / `NotFound()` check that exists to handle a missing file.
+`file_size()` throws `filesystem_error`, and that block sits outside the
+try/catch guarding the request handlers above it, so the exception escaped
+into websocketpp's handler chain. websocketpp does not catch, so
+`std::terminate()` aborted the process.
+
+```
+Thread "ppdl_web_4" received signal SIGABRT
+abort()  ->  std::terminate()  ->  __cxa_throw()
+  ->  pipedal::WebServerImpl::on_http(std::weak_ptr<void>)
+  ->  websocketpp::connection<CustomPpConfig>::process_handshake_request()
+```
+
+One unauthenticated GET, reachable from the LAN and from the wi-fi hotspot,
+killed the service. `/favicon.ico` from a browser or any crawler was enough.
+Verified fatal for `/naoexiste-xyz123`, `/var/`, `/img/`, `/resources` and
+`/resources/`.
+
+Note it is **SIGABRT, not SIGSEGV**, so it does not appear when grepping the
+journal for `status=11/SEGV` — which is how it went unnoticed here for a
+while.
+
+After the fix those paths return 404 and the process id is unchanged across
+all of them.
+
+## 8. modgui: null dereference without an `ns` parameter
+
+`ModWebInterceptImpl::get_response()` assigned `pluginInfo` only inside
+`if (!ns.empty())`, then called `pluginInfo->modGui()` unconditionally.
+
+This is not a corner case. pipedal passes plugin identity as a query suffix
+injected into templates as `{{_ns}}`. A modgui written against MOD's
+convention references its images, stylesheet and script by plain relative
+path, and the browser resolves those **without** the query string — so
+opening such a plugin crashed the daemon. The `guitaramp-suite` ("Hex
+Chain") bundle is one: its templates use `{{symbol}}`, `{{name}}` and
+`{{uri}}`, never `{{_ns}}`.
+
+Missing `ns` is now a reported error and the plugin falls back to pipedal's
+generic control UI. Rendering third-party MOD-convention artwork would need
+pipedal to rewrite relative resource URLs, which this branch does not
+attempt.
+
+Also fixed an `&&` that should be `||`: an existing directory passed the
+"not exists and not regular file" test and then threw from `file_size()`.
+
 ## Known gaps
 
 - **Patch properties remain no-ops.** `SetPatchProperty`,
