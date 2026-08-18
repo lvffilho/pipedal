@@ -123,14 +123,21 @@ void ModWebInterceptImpl::get_response(
         std::string strVersion = request_uri.query("v");
         (void)strVersion; // this is just cache-busting, so we don't actually use it.
 
-        std::shared_ptr<Lv2PluginInfo> pluginInfo;
-        if (!ns.empty())
+        // pluginInfo used to be left null when 'ns' was absent, and the
+        // modGui() call below dereferenced it unconditionally: any GET to
+        // /resources/... without an ns query parameter segfaulted the daemon.
+        // That is reachable from any client on the network, including the
+        // wi-fi hotspot, and a modgui whose templates reference resources
+        // without pipedal's {{_ns}} suffix triggers it just by loading -- the
+        // browser resolves those relative URLs without the query string.
+        if (ns.empty())
         {
-            pluginInfo = model->GetPluginInfo(ns);
-            if (!pluginInfo)
-            {
-                throw std::runtime_error("Plugin not found.");
-            }
+            throw std::runtime_error("Missing 'ns' query parameter.");
+        }
+        std::shared_ptr<Lv2PluginInfo> pluginInfo = model->GetPluginInfo(ns);
+        if (!pluginInfo)
+        {
+            throw std::runtime_error("Plugin not found: " + ns);
         }
         if (!pluginInfo->modGui())
         {
@@ -229,7 +236,9 @@ void ModWebInterceptImpl::get_response(
             {
                 resourcefile /= request_uri.segment(i);
             }
-            if (!fs::exists(resourcefile) && !fs::is_regular_file(resourcefile))
+            // && was a typo for ||: an existing directory passed this test and
+            // then threw from fs::file_size().
+            if (!fs::exists(resourcefile) || !fs::is_regular_file(resourcefile))
             {
                 ec =  std::make_error_code(std::errc::no_such_file_or_directory);
                 return;
