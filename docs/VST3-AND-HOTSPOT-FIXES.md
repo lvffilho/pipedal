@@ -283,3 +283,46 @@ The last commit on this branch flips `set (ENABLE_VST3 0)` to `1`. Every
 other commit leaves the upstream default alone, so that commit can be
 dropped when submitting upstream while still letting a reviewer turn the
 path on to evaluate it.
+
+## Appendix: what the VST3 path bought in practice
+
+The VST3 work is not theoretical. Two things on the validation machine only
+work because of it.
+
+**Plugins that ship no LV2.** `ArborealAudio/STR-X` declares `FORMATS AU VST3`
+and `FORMATS VST`. Without a VST3 host in pipedal it is simply unusable there.
+
+**CLAP, with no pipedal code at all.** `free-audio/clap-wrapper` is a CLAP host
+packaged as a VST3, so `CLAP -> clap-wrapper -> pipedal's VST3 host` works
+today. Verified end to end: the VST3 cache went 17 -> 18 with
+`/usr/local/lib/vst3/ZamComp.vst3`, and the SDK validator passes it 47/47.
+
+The wrapper resolves its target at scan time by its **own filename**, looking
+for a same-named `.clap` in the standard search paths (`/usr/lib/clap`,
+`~/.clap`). One build therefore serves every plugin — copy the bundle and
+rename it. Confirmed by copying `ZamComp.vst3` to `ZamTube.vst3`, which then
+loaded `ZamTube.clap` (validator reports `name = ZamTube`).
+
+Two build notes, both from a toolchain newer than the wrapper expects:
+
+- `-DCLAP_SDK_ROOT=...` is required; the recursive clone does not fetch it.
+- Against VST3 SDK 3.8.1 it fails with `reference to 'iid' is ambiguous` —
+  the wrapper has not been updated for 3.8.x. `-DCLAP_WRAPPER_DOWNLOAD_
+  DEPENDENCIES=TRUE` pulls the 3.8.0 it was written against and builds clean.
+
+## Appendix: still open
+
+- **Intermittent SEGV on shutdown.** After "Stopping web server", roughly one
+  in three `systemctl stop` calls dumps core (4 of 12 measured in one boot).
+  Nothing is lost at runtime — the process is exiting — but
+  `CrashGuard::LeaveCrashGuardZone()` only removes `crash_guard.data` on a
+  clean exit, so the counter accumulates across restarts. Past 4,
+  `PiPedalModel.cpp:416` deliberately discards the working pedalboard and
+  loads an empty one. An attempt to catch it under gdb caught a clean
+  shutdown instead; not characterised.
+- **Third-party modgui artwork.** The two template bugs are fixed and
+  MOD-convention bundles now render, but pipedal does not rewrite relative
+  resource URLs, so a template that omits `{{_ns}}` on its own asset links
+  still falls back to generic controls for those assets.
+- **`jsonTest` leak.** 27 `json_object`s outstanding. The count is positive,
+  so these are live objects rather than unbalanced copies. Not diagnosed.
