@@ -957,7 +957,31 @@ void HotspotManagerImpl::StartHotspot()
         }
         catch (const std::exception &e)
         {
-            onError(SS("HotspotManager: Activation failed: " << e.what()));
+            // An activation failure is recoverable, so don't route it through
+            // onError().
+            //
+            // StartHotspot() is reached from D-Bus signal handlers
+            // (OnWlanStateChanged, OnEthernetStateChanged,
+            // onAccessPointsChanged), and onError() calls
+            // ReleaseNetworkManager(), which destroys the NetworkManager and
+            // Device proxies. Destroying them while their own dispatch is
+            // still on the stack crashes the daemon. It also latches
+            // State::Error, which makes MaybeStartHotspot() return early
+            // forever, so a transient failure would permanently disable the
+            // hotspot.
+            //
+            // The common trigger is a wi-fi device that NetworkManager does
+            // not (yet) manage: AddAndActivateConnection2 then throws
+            // org.freedesktop.NetworkManager.UnknownConnection ("device is
+            // not available"). Return to Monitoring and let the device and
+            // state-change handlers retry once the device shows up.
+            Lv2Log::error(SS("HotspotManager: Activation failed: " << e.what()));
+            this->activeConnection = nullptr;
+            if (this->state == State::HotspotConnecting || this->state == State::HotspotConnected)
+            {
+                Lv2Log::debug("HotspotManager: state=Monitoring (activation failed; will retry)");
+                SetState(State::Monitoring);
+            }
         }
     }
     else
