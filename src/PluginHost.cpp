@@ -604,16 +604,16 @@ void PluginHost::LoadLilv(const char *lv2Path)
             // copy not move!
             ui_plugins_.push_back(vst3Plugin->pluginInfo_);
         }
-        auto ui_compare = [&collation](
-                              Lv2PluginUiInfo &left,
-                              Lv2PluginUiInfo &right)
+
+        auto collator = Locale::GetInstance()->GetCollator();
+
+        auto ui_compare = [&collator](
+                              const Lv2PluginUiInfo &left,
+                              const Lv2PluginUiInfo &right)
         {
-            const char *pb1 = left.name().c_str();
-            const char *pb2 = right.name().c_str();
-            return collation.compare(
-                       pb1, pb1 + left.name().size(),
-                       pb2, pb2 + right.name().size()) < 0;
+            return collator->Compare(left.name(), right.name()) < 0;
         };
+
         std::sort(this->ui_plugins_.begin(), this->ui_plugins_.end(), ui_compare);
     }
 #endif

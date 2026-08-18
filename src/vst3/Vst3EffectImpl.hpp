@@ -27,6 +27,9 @@
 
 #include "RtInversionGuard.hpp"
 #include "Vst3RtStream.hpp"
+#include "StateInterface.hpp" // Lv2PluginState / Lv2PluginStateEntry
+#include <lv2/atom/atom.h>    // LV2_ATOM__Chunk
+#include <cstring>            // std::strncpy
 
 #pragma once
 
@@ -126,24 +129,124 @@ namespace pipedal
 		{
 			return info.pluginInfo_.audio_outputs();
 		}
-		
-        virtual int GetNumberOfInputAudioBuffers() const { return buffers.inputs.size(); }
-        virtual int GetNumberOfOutputAudioPorts() const {return buffers.outputs.size(); }
+
+		// buffers is a Steinberg::Vst::IAudioClient::Buffers: a plain struct of
+		// float** plus explicit counts, so the counts come from numInputs/numOutputs.
+		virtual int GetNumberOfInputAudioBuffers() const { return buffers.numInputs; }
+		virtual int GetNumberOfOutputAudioBuffers() const { return buffers.numOutputs; }
 
 		virtual float *GetAudioInputBuffer(int index) const { return buffers.inputs[index]; }
 		virtual float *GetAudioOutputBuffer(int index) const { return buffers.outputs[index]; }
 
-		virtual int GetNumberOfInputAudioBuffers() const {
-			return buffers.inputs.size();
-		}
-		virtual int GetNumberOfInputAudioBuffers() const {
-			return buffers.outputs.size();
-		}
-
-
 		virtual void ResetAtomBuffers() {}
 		virtual void RequestParameter(LV2_URID uridUri) {}					// no vst equivalent.
 		virtual void GatherPatchProperties(RealtimePatchPropertyRequest *pRequest) {} // no vst equivalent.
+
+		virtual bool IsLv2Effect() const { return false; }
+
+		virtual uint64_t GetMaxInputControl() const
+		{
+			return (uint64_t)info.pluginInfo_.controls().size();
+		}
+		virtual bool IsInputControl(uint64_t index) const
+		{
+			const auto &controls = info.pluginInfo_.controls();
+			if (index >= controls.size())
+			{
+				return false;
+			}
+			return controls[index].is_input();
+		}
+		virtual float GetDefaultInputControlValue(uint64_t index) const
+		{
+			const auto &controls = info.pluginInfo_.controls();
+			if (index >= controls.size())
+			{
+				return 0;
+			}
+			return controls[index].default_value();
+		}
+
+		virtual void SetPatchProperty(LV2_URID uridUri, size_t size, LV2_Atom *value) {} // no vst equivalent.
+		virtual void RequestPatchProperty(LV2_URID uridUri) {}							// no vst equivalent.
+		virtual void RequestAllPathPatchProperties() {}									// no vst equivalent.
+
+		virtual bool GetRequestStateChangedNotification() const { return requestStateChangedNotification; }
+		virtual void SetRequestStateChangedNotification(bool value) { requestStateChangedNotification = value; }
+
+		// vst3 busses are sized in Prepare(); there is no zero-input special case to set up.
+		virtual void PrepareNoInputEffect(int numberOfInputs, size_t maxBufferSize) {}
+
+		// VST3 has no per-property state model like LV2 patch properties; it
+		// serializes the whole plugin to an opaque IBStream blob. Carry that
+		// blob inside a single Lv2PluginState entry so that presets, snapshots
+		// and banks persist through the same plumbing used for LV2 plugins.
+		static constexpr const char *VST3_STATE_KEY = "http://two-play.com/ns/pipedal#vst3State";
+
+		virtual bool GetLv2State(Lv2PluginState *state)
+		{
+			state->Erase();
+			if (!supportsState)
+			{
+				return false;
+			}
+			std::vector<uint8_t> vst3State;
+			if (!GetState(&vst3State))
+			{
+				return false;
+			}
+			Lv2PluginStateEntry entry;
+			entry.flags_ = 0;
+			entry.atomType_ = LV2_ATOM__Chunk;
+			entry.value_ = std::move(vst3State);
+			state->values_[VST3_STATE_KEY] = std::move(entry);
+			state->isValid_ = true;
+			return true;
+		}
+		virtual void SetLv2State(Lv2PluginState &state)
+		{
+			if (!state.isValid_)
+			{
+				return;
+			}
+			auto i = state.values_.find(VST3_STATE_KEY);
+			if (i == state.values_.end())
+			{
+				return; // state saved by a different effect type; ignore it.
+			}
+			try
+			{
+				SetState(i->second.value_);
+			}
+			catch (const std::exception &e)
+			{
+				// A plugin that cannot read back its own state blob must not
+				// take down preset loading. Some shipping plugins do exactly
+				// that: ZamAutoSat serialises a 1-byte state that its own
+				// deserialiser then rejects. Report it and carry on with
+				// whatever values the plugin already has.
+				SetErrorMessage(e.what());
+			}
+		}
+
+		// Read from the realtime audio thread on every block
+		// (Lv2Pedalboard::Run), so this uses a fixed buffer and no locks, the
+		// same way Lv2Effect does. Never make these allocate.
+		virtual bool HasErrorMessage() const { return hasErrorMessage; }
+		virtual const char *TakeErrorMessage()
+		{
+			hasErrorMessage = false;
+			return errorMessage;
+		}
+		// Takes const char* rather than std::string: callers on the audio
+		// thread must not build a string, and strncpy into the fixed buffer
+		// never allocates. Pre-build any message text off the audio thread.
+		void SetErrorMessage(const char *message)
+		{
+			std::strncpy(errorMessage, message, sizeof(errorMessage) - 1);
+			errorMessage[sizeof(errorMessage) - 1] = '\0';
+			hasErrorMessage = true;
+		}
 
 		virtual void SetAudioInputBuffer(int index, float *buffer)
 		{
@@ -182,6 +285,11 @@ namespace pipedal
 		//--------------------------------------------------------------------
 	private:
 		bool supportsState = false;
+		bool requestStateChangedNotification = false;
+		bool hasErrorMessage = false;
+		char errorMessage[1024] = {0};
+		bool processFailed = false;          // latch, so we report once per episode
+		std::string processFailedMessage;    // built in Load(), off the audio thread
 		IHost *pHost;
 		Module::Ptr module;
 		IPtr<IMidiMapping> midiMapping;
