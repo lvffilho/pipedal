@@ -230,7 +230,12 @@ namespace pipedal
     class json_array : public JsonSerializable
     {
     private:
-        json_array(const json_array &) {} // deleted.
+        // Was 'private: json_array(const json_array&) {} // deleted.' -- private, but
+        // not deleted, and with an empty body. Member functions and friends
+        // could still call it, silently producing an object with no contents
+        // and no matching ++allocation_count_, while ~json_array() always
+        // decrements. Actually delete it so any such copy is a compile error.
+        json_array(const json_array &) = delete;
     public:
         using ptr = std::shared_ptr<json_array>;
 
@@ -284,7 +289,12 @@ namespace pipedal
     class json_object : public JsonSerializable
     {
     private:
-        json_object(const json_object &) {} // deleted.
+        // Was 'private: json_object(const json_object&) {} // deleted.' -- private, but
+        // not deleted, and with an empty body. Member functions and friends
+        // could still call it, silently producing an object with no contents
+        // and no matching ++allocation_count_, while ~json_object() always
+        // decrements. Actually delete it so any such copy is a compile error.
+        json_object(const json_object &) = delete;
     public:
         using ptr = std::shared_ptr<json_object>;
 
