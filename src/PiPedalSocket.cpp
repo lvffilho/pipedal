@@ -2706,6 +2706,12 @@ public:
 public:
     virtual bool wants(const uri &request)
     {
+        // segment(0) throws std::invalid_argument on a URI with no segments,
+        // e.g. a websocket connection to "/". on_open() catches it, but the
+        // result is a misleading "Failed to open session: Invalid segement
+        // number." in the log instead of a plain "not for us".
+        if (request.segment_count() == 0)
+            return false;
         if (request.segment(0) == "pipedal")
             return true;
         return false;

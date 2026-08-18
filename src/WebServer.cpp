@@ -863,11 +863,24 @@ namespace pipedal
             }
             void on_message(connection_hdl hdl, server::message_ptr msg)
             {
-                const std::string& data = msg->get_payload();
-                if (socketHandler)
+                // websocketpp does not catch, so anything escaping a handler
+                // reaches std::terminate() and aborts the daemon. onReceive()
+                // does guard itself today, but that is the only thing standing
+                // between a malformed message and the process dying, and it is
+                // not this function's contract to rely on. Same reasoning as
+                // the static-file path in on_http().
+                try
                 {
-                    std::string_view stringView(data.c_str());
-                    socketHandler->onReceive(stringView);
+                    const std::string& data = msg->get_payload();
+                    if (socketHandler)
+                    {
+                        std::string_view stringView(data.c_str());
+                        socketHandler->onReceive(stringView);
+                    }
+                }
+                catch (const std::exception& e)
+                {
+                    Lv2Log::error(SS("Unhandled error processing websocket message. " << e.what()));
                 }
             }
         };
@@ -1282,13 +1295,27 @@ namespace pipedal
 
         void on_fail(connection_hdl hdl)
         {
-            std::lock_guard<std::recursive_mutex> lock{ m_sessionsMutex };
-            m_connections.erase(hdl);
+            try
+            {
+                std::lock_guard<std::recursive_mutex> lock{ m_sessionsMutex };
+                m_connections.erase(hdl);
+            }
+            catch (const std::exception& e)
+            {
+                Lv2Log::error(SS("Unhandled error in on_fail. " << e.what()));
+            }
         }
         void on_close(connection_hdl hdl)
         {
-            std::lock_guard<std::recursive_mutex> lock{ m_sessionsMutex };
-            m_connections.erase(hdl);
+            try
+            {
+                std::lock_guard<std::recursive_mutex> lock{ m_sessionsMutex };
+                m_connections.erase(hdl);
+            }
+            catch (const std::exception& e)
+            {
+                Lv2Log::error(SS("Unhandled error in on_close. " << e.what()));
+            }
         }
 
         void Run()
