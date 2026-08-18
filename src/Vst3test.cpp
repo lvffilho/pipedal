@@ -24,7 +24,10 @@
 
 #include "PluginHost.hpp"
 #include "vst3/Vst3Host.hpp"
+#include "StateInterface.hpp"
 #include <iostream>
+#include <cmath>
+#include <vector>
 
 using namespace pipedal;
 using namespace std;
@@ -65,6 +68,90 @@ void TestPrograms(const Vst3PluginInfo &info, Vst3Effect *effect)
             }
         }
     }    
+}
+
+
+// Verifies that Vst3EffectImpl::GetLv2State()/SetLv2State() actually round-trip.
+// These used to be no-op stubs, so VST3 presets silently reloaded with default
+// values. Saves state, drives every input control away from its saved value,
+// restores, and checks that the controls came back.
+void TestStateRoundTrip(const Vst3PluginInfo &info, Vst3Effect *plugin)
+{
+    if (!plugin->SupportsState())
+    {
+        cout << "        state: plugin does not support state" << endl;
+        return;
+    }
+    const auto &controls = info.pluginInfo_.controls();
+    if (controls.size() == 0)
+    {
+        return;
+    }
+
+    Lv2PluginState saved;
+    if (!plugin->GetLv2State(&saved) || !saved.isValid_)
+    {
+        cout << "        state: FAILED - GetLv2State() produced nothing" << endl;
+        return;
+    }
+
+    std::vector<float> before;
+    before.reserve(controls.size());
+    for (size_t i = 0; i < controls.size(); ++i)
+    {
+        before.push_back(plugin->GetControlValue((int)i));
+    }
+
+    size_t perturbed = 0;
+    for (size_t i = 0; i < controls.size(); ++i)
+    {
+        const auto &c = controls[i];
+        if (!c.is_input())
+            continue;
+        float mid = (c.min_value() + c.max_value()) / 2;
+        float target = (before[i] <= mid) ? c.max_value() : c.min_value();
+        if (target != before[i])
+        {
+            plugin->SetControl((int)i, target);
+            ++perturbed;
+        }
+    }
+    if (perturbed == 0)
+    {
+        cout << "        state: skipped - no control could be perturbed" << endl;
+        return;
+    }
+
+    plugin->SetLv2State(saved);
+
+    // Compare input controls only. Output controls are meters that reflect the
+    // live signal (mda SpecMeter is 35 of them), so they are not expected to
+    // come back to a saved value.
+    size_t mismatches = 0, compared = 0;
+    for (size_t i = 0; i < controls.size(); ++i)
+    {
+        if (!controls[i].is_input())
+            continue;
+        ++compared;
+        float now = plugin->GetControlValue((int)i);
+        float tolerance = 1e-4f * (1.0f + std::fabs(before[i]));
+        if (std::fabs(now - before[i]) > tolerance)
+        {
+            ++mismatches;
+            cout << "            did not restore: [" << controls[i].symbol() << "] \""
+                 << controls[i].name() << "\" saved=" << before[i] << " now=" << now
+                 << (controls[i].is_bypass() ? " (bypass)" : "") << endl;
+        }
+    }
+    if (mismatches == 0)
+    {
+        cout << "        state round-trip OK (" << perturbed << " perturbed, " << compared << " input controls restored)" << endl;
+    }
+    else
+    {
+        cout << "        state round-trip FAILED: " << mismatches << "/" << compared
+             << " input controls did not restore" << endl;
+    }
 }
 
 void RunVsts()
@@ -126,6 +213,8 @@ void RunVsts()
         }
 
         TestPrograms(*info,plugin.get());
+
+        TestStateRoundTrip(*info, plugin.get());
 
         plugin->Deactivate();
     }
