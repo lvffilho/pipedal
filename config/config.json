@@ -11,7 +11,7 @@
     "local_storage_path": "/var/pipedal",
 
     /* One or more directories containing LV2 plugins, seperated by ':' */
-    "lv2_path": "/usr/lib/lv2:/usr/local/lib/lv2:/usr/modep/lv2",
+    "lv2_path": "/usr/lib/lv2:/usr/local/lib/lv2:/usr/lib/x86_64-linux-gnu/lv2:/usr/local/lib/x86_64-linux-gnu/lv2:/usr/local/lib/lv2-mod-desktop:/usr/modep/lv2",
 
 
     /* whether to lock a process pages into memor. should be true unless running on a very memory constrained system.
