@@ -863,11 +863,24 @@ namespace pipedal
             }
             void on_message(connection_hdl hdl, server::message_ptr msg)
             {
-                const std::string& data = msg->get_payload();
-                if (socketHandler)
+                // websocketpp does not catch, so anything escaping a handler
+                // reaches std::terminate() and aborts the daemon. onReceive()
+                // does guard itself today, but that is the only thing standing
+                // between a malformed message and the process dying, and it is
+                // not this function's contract to rely on. Same reasoning as
+                // the static-file path in on_http().
+                try
                 {
-                    std::string_view stringView(data.c_str());
-                    socketHandler->onReceive(stringView);
+                    const std::string& data = msg->get_payload();
+                    if (socketHandler)
+                    {
+                        std::string_view stringView(data.c_str());
+                        socketHandler->onReceive(stringView);
+                    }
+                }
+                catch (const std::exception& e)
+                {
+                    Lv2Log::error(SS("Unhandled error processing websocket message. " << e.what()));
                 }
             }
         };
@@ -1177,52 +1190,77 @@ namespace pipedal
             }
 
 
-            std::string mimeType = mime_type(filename);
-
-            std::filesystem::path gzName;
-
-            size_t contentLength = 0;
-
-            if (can_use_gzip_encoding(req.get(HttpField::accept_encoding), filename, &gzName))
+            // Everything below used to run outside any try/catch, and
+            // std::filesystem::file_size() throws filesystem_error when the
+            // file is missing -- before the file.open()/NotFound() check that
+            // was meant to handle exactly that. The exception escaped
+            // on_http() into websocketpp's handler chain, which does not
+            // catch, so std::terminate() aborted the process. One GET for any
+            // nonexistent path killed the daemon, unauthenticated, from the
+            // LAN or from the wi-fi hotspot -- a browser asking for
+            // /favicon.ico was enough.
+            //
+            // Test existence before asking for the size, and keep a catch here
+            // as a backstop so nothing thrown while serving a file can take
+            // the daemon down again.
+            try
             {
-                filename = gzName;
+                std::string mimeType = mime_type(filename);
+
+                std::filesystem::path gzName;
+
+                size_t contentLength = 0;
+
+                if (can_use_gzip_encoding(req.get(HttpField::accept_encoding), filename, &gzName))
+                {
+                    filename = gzName;
+                    res.set(HttpField::content_encoding, "gzip");
+                }
+
+                if (!std::filesystem::exists(filename) || !std::filesystem::is_regular_file(filename))
+                {
+                    NotFound(*con, requestUri.str());
+                    return;
+                }
                 contentLength = std::filesystem::file_size(filename);
-                res.set(HttpField::content_encoding, "gzip");
-            } else {
-                contentLength = std::filesystem::file_size(filename);                
-            }
 
-            if (req.method() != HttpVerb::get)
+                if (req.method() != HttpVerb::get)
+                {
+                    ServerError(*con, "Unknown HTTP-Method");
+                    return;
+                }
+
+                file.open(filename.c_str(), std::ios::in);
+                if (!file)
+                {
+                    NotFound(*con, requestUri.str());
+                    return;
+                }
+
+                response.reserve(contentLength);
+
+                response.assign((std::istreambuf_iterator<char>(file)),
+                    std::istreambuf_iterator<char>());
+
+                res.set("Content-Type", mimeType);
+
+                if (mimeType.starts_with("image/") || mimeType.starts_with("font/"))
+                {
+                    res.set(HttpField::cache_control, "public, max-age=864000"); // cache for a ten days.
+                }
+
+                res.set(HttpField::access_control_allow_origin, origin);
+                res.set(HttpField::date, HtmlHelper::timeToHttpDate(time(nullptr)));
+                res.setContentLength(contentLength);
+
+                con->set_body(response);
+                con->set_status(websocketpp::http::status_code::ok);
+            }
+            catch (const std::exception &e)
             {
-                ServerError(*con, "Unknown HTTP-Method");
+                ServerError(*con, SS("Unexpected error. " << e.what()));
                 return;
             }
-
-            file.open(filename.c_str(), std::ios::in);
-            if (!file)
-            {
-                NotFound(*con, requestUri.str());
-                return;
-            }
-
-            response.reserve(contentLength);
-
-            response.assign((std::istreambuf_iterator<char>(file)),
-                std::istreambuf_iterator<char>());
-
-            res.set("Content-Type", mimeType);
-
-            if (mimeType.starts_with("image/") || mimeType.starts_with("font/"))
-            {
-                res.set(HttpField::cache_control, "public, max-age=864000"); // cache for a ten days.
-            }
-
-            res.set(HttpField::access_control_allow_origin, origin);
-            res.set(HttpField::date, HtmlHelper::timeToHttpDate(time(nullptr)));
-            res.setContentLength(contentLength);
-
-            con->set_body(response);
-            con->set_status(websocketpp::http::status_code::ok);
         }
 
         typedef std::set<connection_hdl, std::owner_less<connection_hdl>> con_list;
@@ -1257,13 +1295,27 @@ namespace pipedal
 
         void on_fail(connection_hdl hdl)
         {
-            std::lock_guard<std::recursive_mutex> lock{ m_sessionsMutex };
-            m_connections.erase(hdl);
+            try
+            {
+                std::lock_guard<std::recursive_mutex> lock{ m_sessionsMutex };
+                m_connections.erase(hdl);
+            }
+            catch (const std::exception& e)
+            {
+                Lv2Log::error(SS("Unhandled error in on_fail. " << e.what()));
+            }
         }
         void on_close(connection_hdl hdl)
         {
-            std::lock_guard<std::recursive_mutex> lock{ m_sessionsMutex };
-            m_connections.erase(hdl);
+            try
+            {
+                std::lock_guard<std::recursive_mutex> lock{ m_sessionsMutex };
+                m_connections.erase(hdl);
+            }
+            catch (const std::exception& e)
+            {
+                Lv2Log::error(SS("Unhandled error in on_close. " << e.what()));
+            }
         }
 
         void Run()

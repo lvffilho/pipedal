@@ -631,6 +631,8 @@ if(ENABLE_VST3)
 
         # sdk_common files.
         ${VST3_SRCPATH}/common/commoniids.cpp
+        ${VST3_SRCPATH}/common/commonstringconvert.cpp
+        ${VST3_SRCPATH}/common/commonstringconvert.h
         ${VST3_SRCPATH}/common/openurl.cpp
         ${VST3_SRCPATH}/common/openurl.h
         ${VST3_SRCPATH}/common/systemclipboard.h
@@ -752,25 +754,27 @@ if(ENABLE_VST3)
     )
 
 
-    # add_executable(vst3test Vst3test.cpp
+    add_executable(vst3test Vst3test.cpp
 
-    #     MemDebug.cpp
-    #     MemDebug.hpp
+        MemDebug.cpp
+        MemDebug.hpp
 
-    #     Vst3SdkRepro.cpp
+        Vst3SdkRepro.cpp
 
-    #     ${VST3_FILES}
+        #vst3/Vst3PresetFile.hpp Vst3PresetFile.cpp
+        asan_options.cpp
+    )
 
-    #     #vst3/Vst3PresetFile.hpp Vst3PresetFile.cpp
-    #     asan_options.cpp
-    # )
+    if(TARGET vst3test)
+        target_include_directories(vst3test PRIVATE ${PIPEDAL_INCLUDES})
 
-    target_include_directories(vst3test PRIVATE ${PIPEDAL_INCLUDES})
-
-
-    target_link_libraries(vst3test PRIVATE ${PIPEDAL_LIBS}
-        vst3_lib dl pthread
+        target_link_libraries(vst3test PRIVATE
+            ${PIPEDAL_LIBS}
+            vst3_lib
+            dl
+            pthread
         )
+    endif()
 
 endif(ENABLE_VST3)
 

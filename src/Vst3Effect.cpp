@@ -35,6 +35,7 @@
 
 #include "RingBufferReader.hpp"
 
+#include "base/source/fdebug.h" // defines the NEW allocation macro.
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
 #include "public.sdk/source/vst/hosting/plugprovider.h"
@@ -200,7 +201,7 @@ void Vst3EffectImpl::SetControl(int index, float value)
 	this->controller->setParamNormalized(paramId, normalizedValue);
 
 	{
-		RtInversionGuard inversionGuard; // boost priority to prevent priority inversion.
+		// RtInversionGuard (priority boost) was retired in RtInversionGuard.hpp.
 		std::lock_guard guard{parameterMutex};
 
 		paramTransferrer.addChange(paramId, normalizedValue, 0);
@@ -220,6 +221,8 @@ void Vst3EffectImpl::Load(uint64_t instanceId, const Vst3PluginInfo &info, IHost
 	this->pHost = pHost;
 	this->instanceId = instanceId;
 	this->info = info;
+	// Built here, not on the audio thread: SetErrorMessage() must not allocate.
+	this->processFailedMessage = info.pluginInfo_.name() + ": IAudioProcessor::process() failed.";
 
 	size_t nControls = info.pluginInfo_.controls().size();
 
@@ -325,7 +328,8 @@ void Vst3EffectImpl::Load(uint64_t instanceId, const Vst3PluginInfo &info, IHost
 	if (midiMapping)
 		midiCCMapping = initMidiCtrlerAssignment(component, midiMapping);
 
-	component->setActive(true);
+	// (the component was already activated above; activating twice trips an
+	// assert in stricter plugins, e.g. DPF-based ones.)
 
 	for (size_t i = 0; i < this->lv2ToVstParam.size(); ++i)
 	{
@@ -474,7 +478,20 @@ bool Vst3EffectImpl::process(Buffers &buffers, int64_t continousFrames)
 	preprocess(buffers, continousFrames);
 
 	if (processor->process(processData) != kResultOk)
+	{
+		// Previously this failure was swallowed: the plugin stopped producing
+		// audio and nothing was reported. Surface it through the same
+		// realtime error channel that LV2 effects use. Latched so a
+		// persistently failing plugin reports once per episode instead of on
+		// every audio block.
+		if (!processFailed)
+		{
+			processFailed = true;
+			SetErrorMessage(processFailedMessage.c_str());
+		}
 		return false;
+	}
+	processFailed = false;
 
 	postprocess(buffers);
 
@@ -681,7 +698,7 @@ void Vst3EffectImpl::transferControllerStateToComponent()
 	OPtr<IRtStream> bStream = this->streamPool.AllocateBStream();
 	assert(GetRefCount(bStream.get()) == 1);
 
-	RtInversionGuard inversionGuard; // boost priority to prevent priority inversion.
+	// RtInversionGuard (priority boost) was retired in RtInversionGuard.hpp.
 	std::lock_guard guard{parameterMutex};
 
 	paramTransferrer.removeChanges();
@@ -806,6 +823,12 @@ bool Vst3EffectImpl::GetState(std::vector<uint8_t>*state)
 }
 void Vst3EffectImpl::SetState(const std::vector<uint8_t> state)
 {
+	if (state.empty())
+	{
+		// &state[0] on an empty vector is undefined behaviour. An empty blob
+		// carries nothing to restore, so there is nothing to do.
+		return;
+	}
 	OPtr<IBStream> stream{new MemoryStream((void *)(&state[0]), state.size())};
 
 	if (controller->setComponentState(stream) != kResultOk)
