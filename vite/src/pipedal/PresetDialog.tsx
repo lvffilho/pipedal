@@ -24,6 +24,7 @@ import Icon from '@mui/material/Icon';
 import Divider from '@mui/material/Divider';
 import { css } from '@emotion/react';
 import { isDarkMode } from './DarkMode';
+import { dialogActionBarBackgroundImage } from './ThemeSurfaces';
 import IconButtonEx from './IconButtonEx';
 import Typography from '@mui/material/Typography';
 import { PiPedalModel, PiPedalModelFactory, PresetIndexEntry, PresetIndex } from './PiPedalModel';
@@ -99,8 +100,8 @@ const styles = (theme: Theme) => createStyles({
     dialogActionBar: css({
         position: 'relative',
         top: 0, left: 0,
-        background: theme.palette.actionBar.main,
-        color: theme.palette.actionBar.contrastText
+        backgroundImage: dialogActionBarBackgroundImage(isDarkMode()),
+        color: '#FFFFFF',
     }),
     dialogTitle: css({
         marginLeft: theme.spacing(2),

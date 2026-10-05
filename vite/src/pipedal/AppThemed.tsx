@@ -91,18 +91,19 @@ const appStyles = ((theme: Theme) => (
             colorScheme: (isDarkMode() ? "dark" : "light")
         }),
         menuListItem: css({
-            color: "#FE8!important", //theme.palette.text.primary,
-            fill: "#FE8!important", //theme.palette.text.primary,
+            color: theme.palette.text.primary,
+            fill: theme.palette.text.primary,
         }),
         menuIcon: css({
-            fill: (theme.palette.text.primary + "!important"), //theme.palette.text.primary,
-            opacity: 0.6
+            fill: (theme.palette.text.primary + "!important"),
+            opacity: 0.85,
+            transition: 'opacity 150ms ease-out',
         }),
         toolBar: css({
-            color: "white"
+            color: theme.palette.text.primary,
         }),
         listSubheader: css({
-            backgroundImage: "linear-gradient(255,255,255,0.15),rgba(255,255,255,0.15)"
+            color: theme.palette.text.secondary,
         }),
         loadingContent: css({
             display: "block",
@@ -175,6 +176,13 @@ const appStyles = ((theme: Theme) => (
             textAlign: "start",
             zIndex: 2010
 
+        }),
+        modalScrim: css({
+            position: "absolute",
+            minHeight: "10em",
+            left: 0, top: 0, right: 0, bottom: 0,
+            opacity: 0.8,
+            background: theme.palette.background.default,
         }),
         loadingBox: css({
             display: "flex",
@@ -1110,17 +1118,7 @@ export
                         position: "absolute", top: 0, left: 0, right: 0, bottom: 0
                     }}
                     >
-                        <div style={{
-                            position: "absolute",
-                            minHeight: "10em",
-                            left: "0px",
-                            top: "0px",
-                            right: "0px",
-                            bottom: "0px",
-                            opacity: 0.8,
-                            background:
-                                isDarkMode() ? "#222" : "#EEE",
-                        }} />
+                        <div className={classes.modalScrim} />
                         <div style={{ flex: "2 2 3px", height: 20 }} >&nbsp;</div>
                         <div className={classes.errorMessageBox} style={{ position: "relative" }} >
                             <div style={{ fontSize: "30px", position: "absolute", left: 0, top: 3, color: "#A00" }}>
@@ -1150,18 +1148,7 @@ export
                     aria-describedby="reloading-modal-description"
                 >
                     <div style={{ display: "flex", flexFlow: "column nowrap", alignItems: "center" }}>
-                        <div style={{
-                            position: "absolute",
-                            minHeight: "10em",
-                            left: "0px",
-                            top: "0px",
-                            right: "0px",
-                            bottom: "0px",
-                            opacity: 0.8,
-                            background:
-                                isDarkMode() ? "#222" : "#EEE",
-
-                        }} />
+                        <div className={classes.modalScrim} />
                         <div className={classes.loadingBox}>
                             <div className={classes.loadingBoxItem}>
                                 <CircularProgress color="inherit" className={classes.loadingBoxItem} />
