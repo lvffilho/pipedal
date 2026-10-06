@@ -44,8 +44,12 @@
 #include "ChannelRouterSettings.hpp"
 
 #include "CpuUse.hpp"
+#include "CpuDmaLatency.hpp"
+#include "AudioSampleClamp.hpp"
+#include "AlsaDriverRealtime.hpp"
 
 #include <alsa/asoundlib.h>
+#include <sched.h>
 
 #include "Lv2Log.hpp"
 #include <limits>
@@ -367,9 +371,6 @@ namespace pipedal
         AlsaDriverImpl(AudioDriverHost *driverHost)
             : driverHost(driverHost)
         {
-            midiEventMemoryIndex = 0;
-            midiEventMemory.resize(MIDI_MEMORY_BUFFER_SIZE);
-            midiEvents.resize(MAX_MIDI_EVENT);
         }
         virtual ~AlsaDriverImpl()
         {
@@ -935,10 +936,7 @@ namespace pipedal
                 for (int channel = 0; channel < channels; ++channel)
                 {
                     float v = buffers[channel][frame];
-                    if (v > 1.0f)
-                        v = 1.0f;
-                    else if (v < -1.0f)
-                        v = -1.0f;
+                    v = ClampOutputSample(v);
                     *p++ = (int16_t)(scale * v);
                 }
             }
@@ -955,10 +953,7 @@ namespace pipedal
                 for (int channel = 0; channel < channels; ++channel)
                 {
                     float v = buffers[channel][frame];
-                    if (v > 1.0f)
-                        v = 1.0f;
-                    else if (v < -1.0f)
-                        v = -1.0f;
+                    v = ClampOutputSample(v);
                     *p++ = EndianSwap((int16_t)(scale * v));
                 }
             }
@@ -975,10 +970,7 @@ namespace pipedal
                 for (int channel = 0; channel < channels; ++channel)
                 {
                     float v = buffers[channel][frame];
-                    if (v > 1.0f)
-                        v = 1.0f;
-                    else if (v < -1.0f)
-                        v = -1.0f;
+                    v = ClampOutputSample(v);
                     *p++ = (int32_t)(scale * v);
                 }
             }
@@ -1003,10 +995,7 @@ namespace pipedal
                 for (int channel = 0; channel < channels; ++channel)
                 {
                     float v = buffers[channel][frame];
-                    if (v > 1.0f)
-                        v = 1.0f;
-                    else if (v < -1.0f)
-                        v = -1.0f;
+                    v = ClampOutputSample(v);
                     *p++ = (int32_t)(scale * v);
                 }
             }
@@ -1031,10 +1020,7 @@ namespace pipedal
                 for (int channel = 0; channel < channels; ++channel)
                 {
                     float v = buffers[channel][frame];
-                    if (v > 1.0f)
-                        v = 1.0f;
-                    else if (v < -1.0f)
-                        v = -1.0f;
+                    v = ClampOutputSample(v);
                     *p++ = EndianSwap((int32_t)(scale * v));
                 }
             }
@@ -1051,10 +1037,7 @@ namespace pipedal
                 for (int channel = 0; channel < channels; ++channel)
                 {
                     float v = buffers[channel][frame];
-                    if (v > 1.0f)
-                        v = 1.0f;
-                    else if (v < -1.0f)
-                        v = -1.0f;
+                    v = ClampOutputSample(v);
                     *p++ = EndianSwap((int32_t)(scale * v));
                 }
             }
@@ -1071,10 +1054,7 @@ namespace pipedal
                 for (int channel = 0; channel < channels; ++channel)
                 {
                     float v = buffers[channel][frame];
-                    if (v > 1.0f)
-                        v = 1.0f;
-                    else if (v < -1.0f)
-                        v = -1.0f;
+                    v = ClampOutputSample(v);
                     int32_t iValue = (int32_t)(scale * v);
                     p[0] = (uint8_t)(iValue >> 24);
                     p[1] = (uint8_t)(iValue >> 16);
@@ -1096,10 +1076,7 @@ namespace pipedal
                 for (int channel = 0; channel < channels; ++channel)
                 {
                     float v = buffers[channel][frame];
-                    if (v > 1.0f)
-                        v = 1.0f;
-                    else if (v < -1.0f)
-                        v = -1.0f;
+                    v = ClampOutputSample(v);
                     int32_t iValue = (int32_t)(scale * v);
                     p[0] = (uint8_t)(iValue >> 8);
                     p[1] = (uint8_t)(iValue >> 16);
@@ -1120,7 +1097,7 @@ namespace pipedal
             {
                 for (int channel = 0; channel < channels; ++channel)
                 {
-                    float v = buffers[channel][frame];
+                    float v = SanitizeFloatOutputSample(buffers[channel][frame]);
                     *p++ = v;
                 }
             }
@@ -1135,7 +1112,7 @@ namespace pipedal
             {
                 for (int channel = 0; channel < channels; ++channel)
                 {
-                    float v = buffers[channel][frame];
+                    float v = SanitizeFloatOutputSample(buffers[channel][frame]);
                     EndianSwap(p, v);
                     p++;
                 }
@@ -1194,14 +1171,15 @@ namespace pipedal
             std::lock_guard lock{restartMutex};
             Lv2Log::debug("Restarting ALSA devices.");
 
+            // Failures are not logged here: the exception carries the details, and the
+            // caller logs it once (ServiceRestartRequest retries, so it logs per attempt).
             try
             {
                 AlsaCloseAudio();
             }
             catch (const std::exception &e)
             {
-                Lv2Log::error(SS("Error cleaning up ALSA: " << e.what()));
-                throw std::runtime_error("Unable to restart the audio stream.");
+                throw std::runtime_error(SS("Unable to restart the audio stream. Error cleaning up ALSA: " << e.what()));
             }
             try
             {
@@ -1211,15 +1189,13 @@ namespace pipedal
             }
             catch (const std::exception &e)
             {
-                Lv2Log::error(SS("Error opening ALSA: " << e.what()));
-                throw std::runtime_error("Unable to restart the audio stream.");
+                throw std::runtime_error(SS("Unable to restart the audio stream. Error opening ALSA: " << e.what()));
             }
             int err;
 
             if ((err = snd_pcm_start(captureHandle)) < 0)
             {
-                Lv2Log::error(SS("Unable to restart ALSA capture: " << snd_strerror(err)));
-                throw PiPedalStateException("Unable to restart ALSA capture.");
+                throw PiPedalStateException(SS("Unable to restart ALSA capture: " << snd_strerror(err)));
             }
             TraceBufferPositions(0, '+');
             audioRunning = true;
@@ -1468,6 +1444,7 @@ namespace pipedal
                 }
 
                 SetAlsaParameters(jackServerSettings.GetBufferSize(), jackServerSettings.GetNumberOfBuffers(), jackServerSettings.GetSampleRate());
+                PublishPeriodDuration();
                 capture_and_playback_not_synced = false;
 
                 if (captureHandle && playbackHandle)
@@ -1497,15 +1474,17 @@ namespace pipedal
             }
         }
 
-        void FillOutputBuffer()
+        // Shared body of FillOutputBuffer()/FillOutputBufferRt(). Never throws, never
+        // allocates. Returns true on success; on failure, *what is a static description
+        // and *errorCode the ALSA error (0 if none). Sleeps between retries only if
+        // allowSleep (not on the audio thread).
+        bool FillOutputBuffer_(bool allowSleep, const char **what, int *errorCode) noexcept
         {
-            validate_capture_handle();
-
             memset(rawPlaybackBuffer.data(), 0, rawPlaybackBuffer.size());
             int retry = 0;
             if (this->isDummyDriver)
             {
-                return; // dummy driver is insatiable.
+                return true; // dummy driver is insatiable.
             }
             while (true)
             {
@@ -1514,34 +1493,79 @@ namespace pipedal
                 {
                     if (avail == -EAGAIN)
                     {
-                        return;
+                        return true;
                     }
                     if (++retry >= 5) // kinda sus code. let's make sure we don't spin forever.
                     {
-                        throw std::runtime_error("Timed out trying to fill the audio output buffer.");
+                        *what = "Timed out trying to fill the audio output buffer.";
+                        *errorCode = (int)avail;
+                        return false;
                     }
 
                     int err = snd_pcm_prepare(playbackHandle);
                     if (err < 0)
                     {
-                        throw PiPedalStateException(SS("Audio playback failed. " << snd_strerror(err)));
+                        *what = "Audio playback failed.";
+                        *errorCode = err;
+                        return false;
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    if (allowSleep)
+                    {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
                     continue;
                 }
                 if (avail == 0)
                     break;
 
-                if (avail * playbackFrameSize > this->rawPlaybackBuffer.size())
-                    this->rawPlaybackBuffer.resize(avail * playbackFrameSize);
+                // Write in chunks of the preallocated buffer rather than growing it:
+                // this also runs on the audio thread (xrun resync).
+                snd_pcm_sframes_t maxFrames = (snd_pcm_sframes_t)(this->rawPlaybackBuffer.size() / playbackFrameSize);
+                if (maxFrames == 0)
+                    break;
+                if (avail > maxFrames)
+                    avail = maxFrames;
 
                 ssize_t err = WriteBuffer(playbackHandle, rawPlaybackBuffer.data(), avail);
                 if (err < 0)
                 {
-                    throw PiPedalStateException(SS("Audio playback failed. " << snd_strerror(err)));
+                    *what = "Audio playback failed.";
+                    *errorCode = (int)err;
+                    return false;
                 }
             }
+            return true;
+        }
+
+        // Non-realtime callers (start-up, device restart): throws on failure.
+        void FillOutputBuffer()
+        {
             validate_capture_handle();
+            const char *what = nullptr;
+            int err = 0;
+            if (!FillOutputBuffer_(true, &what, &err))
+            {
+                if (err != 0)
+                {
+                    throw PiPedalStateException(SS(what << " " << snd_strerror(err)));
+                }
+                throw PiPedalStateException(what);
+            }
+            validate_capture_handle();
+        }
+
+        // Audio thread (xrun resync): no exception, no allocation, no sleep. On failure
+        // the reason goes to recoveryError for the service thread to log.
+        bool FillOutputBufferRt(const char *direction) noexcept
+        {
+            const char *what = nullptr;
+            int err = 0;
+            if (!FillOutputBuffer_(false, &what, &err))
+            {
+                recoveryError.Set(err, "Cannot refill playback stream (", direction, " xrun): ", what);
+                return false;
+            }
+            return true;
         }
         // Bring both streams back from an xrun and start them together again.
         //
@@ -1554,16 +1578,16 @@ namespace pipedal
         // the symptom is silence at the interface with the plugin chain still
         // apparently running. Sharing one implementation is what stops the two
         // from drifting apart again.
-        void resync_streams(snd_pcm_t *capture_handle, snd_pcm_t *playback_handle,
+        //
+        // Returns false on failure, with the reason in recoveryError: no logging, no
+        // allocation here, since this runs on the audio thread. Callers count the xrun
+        // in xrunCounter, and the host's service thread logs the counts
+        // (LogRealtimeStatistics). A recovery that fails is logged, with the reason, by
+        // the service thread when it restarts the device (ServiceRestartRequest).
+        bool resync_streams(snd_pcm_t *capture_handle, snd_pcm_t *playback_handle,
                             const char *direction)
         {
             int err;
-
-            // Worth a line in the log. An xrun that recovers cleanly is
-            // unremarkable, but one that does not leaves the interface silent
-            // with no other trace, and without this there is nothing to tell
-            // the two apart after the fact.
-            Lv2Log::info(SS("Recovering from ALSA " << direction << " underrun."));
 
             // Unlink first. While the streams are linked, prepare and start
             // propagate across the whole group, so recovering them one at a
@@ -1576,18 +1600,21 @@ namespace pipedal
 
             if ((err = snd_pcm_prepare(playback_handle)) < 0)
             {
-                throw std::runtime_error(SS("Cannot prepare playback stream: " << snd_strerror(err)));
+                recoveryError.Set(err, "Cannot prepare playback stream (", direction, " xrun)");
+                return false;
             }
             if ((err = snd_pcm_prepare(capture_handle)) < 0)
             {
-                throw std::runtime_error(SS("Cannot prepare capture stream: " << snd_strerror(err)));
+                recoveryError.Set(err, "Cannot prepare capture stream (", direction, " xrun)");
+                return false;
             }
 
             if (relink)
             {
                 if ((err = snd_pcm_link(capture_handle, playback_handle)) < 0)
                 {
-                    throw std::runtime_error(SS("Cannot relink streams: " << snd_strerror(err)));
+                    recoveryError.Set(err, "Cannot relink streams (", direction, " xrun)");
+                    return false;
                 }
             }
 
@@ -1595,82 +1622,366 @@ namespace pipedal
             // the playback buffer, then start capture explicitly. Playback
             // starts itself once its start threshold is reached, but capture
             // never does — without this call it sits in PREPARED forever.
-            FillOutputBuffer();
+            if (!FillOutputBufferRt(direction))
+            {
+                return false;
+            }
             if ((err = snd_pcm_start(capture_handle)) < 0)
             {
-                throw std::runtime_error(SS("Cannot restart capture stream: " << snd_strerror(err)));
+                recoveryError.Set(err, "Cannot restart capture stream (", direction, " xrun)");
+                return false;
             }
+            return true;
         }
 
-        void recover_from_output_underrun(snd_pcm_t *capture_handle, snd_pcm_t *playback_handle, int err, size_t framesRead)
-        {
-            validate_capture_handle();
-            try
-            {
-
-                TraceBufferPositions(framesRead, 'w');
-                if (err == -EPIPE)
-                {
-                    resync_streams(capture_handle, playback_handle, "output");
-                    TraceBufferPositions(framesRead, 'x');
-                }
-                else
-                {
-                    TraceBufferPositions(framesRead, 'z');
-                    Lv2Log::error(SS("Can't recover from ALSA output underrun. (" << snd_strerror(err) << ")"));
-                    throw PiPedalStateException(SS("Can't recover from ALSA output error. (" << snd_strerror(err) << ")"));
-                }
-            }
-            catch (const std::exception &e)
-            {
-                RestartAlsa();
-                audioRunning = true;
-            }
-            validate_capture_handle();
-        }
-        void recover_from_input_underrun(snd_pcm_t *capture_handle, snd_pcm_t *playback_handle, int err, size_t bufferedFrames)
+        // Returns false if the device could not be recovered or restarted: the audio thread
+        // has to stop (the reason is in audioStopReason).
+        bool recover_from_output_underrun(snd_pcm_t *capture_handle, snd_pcm_t *playback_handle, int err, size_t framesRead)
         {
             validate_capture_handle();
 
-            try
+            TraceBufferPositions(framesRead, 'w');
+            xrunCounter.OnOutputXrun();
+            bool recovered = false;
+            if (err == -EPIPE)
             {
-                TraceBufferPositions(bufferedFrames, 'r');
-                if (err == -EPIPE)
-                {
-                    resync_streams(capture_handle, playback_handle, "input");
-                    validate_capture_handle();
-                }
-                else if (err == ESTRPIPE)
-                {
-                    audioRunning = false;
-                    validate_capture_handle();
+                recovered = resync_streams(capture_handle, playback_handle, "output");
+                TraceBufferPositions(framesRead, 'x');
+            }
+            else if (err == -ESTRPIPE)
+            {
+                // Suspended (system suspend/resume). Not recovered in place: snd_pcm_resume()
+                // has to be retried with sleeps, which has no place on the audio thread.
+                // Reopening the device on the service thread recovers it.
+                TraceBufferPositions(framesRead, 'z');
+                recoveryError.Set(err, "ALSA playback stream suspended");
+            }
+            else
+            {
+                TraceBufferPositions(framesRead, 'z');
+                recoveryError.Set(err, "Can't recover from ALSA output error");
+            }
+            if (!recovered && !RestartAfterFailedRecovery())
+            {
+                return false;
+            }
+            if (!terminateAudio()) // see AudioThread(): handles may be in flux while shutting down.
+            {
+                validate_capture_handle();
+            }
+            return true;
+        }
+        // Returns false if the device could not be recovered or restarted (see recover_from_output_underrun).
+        bool recover_from_input_underrun(snd_pcm_t *capture_handle, snd_pcm_t *playback_handle, int err, size_t bufferedFrames)
+        {
+            validate_capture_handle();
 
-                    while ((err = snd_pcm_resume(capture_handle)) == -EAGAIN)
-                    {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
-                    if (err < 0)
-                    {
-                        err = snd_pcm_prepare(capture_handle);
-                        if (err < 0)
-                        {
-                            throw PiPedalStateException(SS("Can't recover from ALSA suspend. (" << snd_strerror(err) << ")"));
-                        }
-                    }
+            TraceBufferPositions(bufferedFrames, 'r');
+            xrunCounter.OnInputXrun();
+            bool recovered = false;
+            if (err == -EPIPE)
+            {
+                recovered = resync_streams(capture_handle, playback_handle, "input");
+                validate_capture_handle();
+            }
+            else if (err == -ESTRPIPE)
+            {
+                // Suspended. See recover_from_output_underrun(): handed to the service thread.
+                recoveryError.Set(err, "ALSA capture stream suspended");
+            }
+            else
+            {
+                recoveryError.Set(err, "Can't recover from ALSA input error");
+            }
+            if (!recovered && !RestartAfterFailedRecovery())
+            {
+                return false;
+            }
+            return true;
+        }
+
+        // Audio thread. In-place xrun recovery failed, so the device has to be closed
+        // and reopened. That means logging, allocation and blocking ALSA calls, none of
+        // which belong on the audio thread, so the restart is handed to the host's
+        // non-realtime service thread (rtsvc, via AudioDriverHost::RequestDriverRestart)
+        // and this thread waits for the outcome, for a bounded time (RESTART_WAIT_LIMIT_MS).
+        // There is no audio to process meanwhile, but host commands keep flowing.
+        //
+        // Returns false if the device is gone for good: the caller leaves the audio loop,
+        // and the reason (a static string: nothing is allocated here) is in audioStopReason.
+        // Also returns true when shutting down; the caller sees terminateAudio() next.
+        //
+        // If the host has no service thread to take the request, fall back to the
+        // previous behaviour: restart on this thread (which is not realtime-safe, and
+        // throws on failure).
+        bool RestartAfterFailedRecovery()
+        {
+            xrunCounter.OnFailedRecovery();
+            deferredRestart.Request();
+            if (!driverHost->RequestDriverRestart())
+            {
+                if (deferredRestart.Withdraw())
+                {
+                    // Counted, and reported by the service thread when it runs (LogRealtimeStatistics), or
+                    // when the driver is closed.
+                    xrunCounter.OnAudioThreadRestart();
+                    RestartAlsa();
                     audioRunning = true;
-                    validate_capture_handle();
+                    return true;
+                }
+                // Claimed anyway (cannot normally happen without the message). Wait for it.
+            }
+            return WaitForDeferredRestart();
+        }
+
+        bool WaitForDeferredRestart()
+        {
+            DeferredRestartResult result = pipedal::WaitForDeferredRestart(
+                deferredRestart,
+                std::chrono::milliseconds(RESTART_WAIT_LIMIT_MS),
+                PeriodDuration(),
+                [this]()
+                { return terminateAudio(); },
+                [this]()
+                {
+                    // Parked, but still at realtime priority: the host's command
+                    // processing is realtime-safe.
+                    this->driverHost->OnProcessCommandsWhileRestarting();
+                });
+            switch (result)
+            {
+            case DeferredRestartResult::Restarted:
+                audioRunning = true;
+                return true;
+            case DeferredRestartResult::Terminated:
+                // Shutting down. If the restart was still running, Close() serialises with
+                // it on restartMutex, and the service thread drops the abandoned request.
+                return true;
+            case DeferredRestartResult::Failed:
+                audioStopReason = "Unable to restart the audio stream.";
+                return false;
+            case DeferredRestartResult::TimedOut:
+            default:
+                audioStopReason = "Timed out waiting for the audio stream to restart.";
+                return false;
+            }
+        }
+        // Why the audio thread stopped abnormally without an exception. Static strings only.
+        const char *audioStopReason = nullptr;
+
+        // Safe from any thread: reads the snapshot published by OpenAudio(), not
+        // bufferSize/sampleRate, which a restart on the service thread rewrites while the
+        // audio thread waits for it (WaitForDeferredRestart).
+        std::chrono::microseconds PeriodDuration() const
+        {
+            return std::chrono::microseconds(periodDurationUs.load(std::memory_order_relaxed));
+        }
+        void PublishPeriodDuration()
+        {
+            periodDurationUs.store(RealtimePeriodDuration(bufferSize, sampleRate).count(), std::memory_order_relaxed);
+        }
+        std::atomic<int64_t> periodDurationUs{RealtimePeriodDuration(0, 0).count()};
+
+    public:
+        // Non-realtime service thread (rtsvc). See RestartAfterFailedRecovery().
+        //
+        // The reopen is retried for a while: after a suspend/resume (laptop lid), a USB
+        // interface typically re-enumerates a few seconds after the process thaws, and a
+        // single attempt would stop audio for good. restartMutex is held per attempt only,
+        // not across the waits, so Close() is never held up for long.
+        virtual void ServiceRestartRequest() override
+        {
+            uint64_t generation;
+            {
+                std::lock_guard lock{restartMutex};
+                if (!deferredRestart.TryBegin())
+                {
+                    return;
+                }
+                // Read only once the request is ours: a value read earlier could predate a
+                // Close()/Open() whose new session made this request, and the loop below
+                // would then return without completing it.
+                generation = closeGeneration.load(std::memory_order_acquire);
+                if (terminateAudio())
+                {
+                    deferredRestart.Complete(false);
+                    return;
+                }
+            }
+            std::string reason = TakeRecoveryError();
+            if (!reason.empty())
+            {
+                Lv2Log::warning(SS("ALSA xrun recovery failed: " << reason << ". Restarting the audio device."));
+            }
+            else
+            {
+                Lv2Log::warning("ALSA xrun recovery failed. Restarting the audio device.");
+            }
+
+            const auto retryInterval = std::chrono::milliseconds(RESTART_RETRY_INTERVAL_MS);
+            for (int attempt = 1; attempt <= RESTART_ATTEMPTS; ++attempt)
+            {
+                {
+                    std::lock_guard lock{restartMutex};
+                    if (closeGeneration.load(std::memory_order_acquire) != generation)
+                    {
+                        // Closed (and perhaps reopened) while we waited. The audio thread that
+                        // asked has gone; don't touch the state a new session may be using.
+                        return;
+                    }
+                    if (deferredRestart.ReleaseAbandoned())
+                    {
+                        Lv2Log::error("ALSA device restart abandoned: the audio thread stopped waiting for it.");
+                        return;
+                    }
+                    if (deferredRestart.Get() != DeferredRestart::State::Running)
+                    {
+                        // Reset by Deactivate()/Close() after joining the audio thread (or a new
+                        // request from a later session): this one is stale.
+                        return;
+                    }
+                    if (terminateAudio())
+                    {
+                        deferredRestart.Complete(false);
+                        return;
+                    }
+                    try
+                    {
+                        RestartAlsa();
+                        if (!deferredRestart.Complete(true))
+                        {
+                            // The audio thread gave up while this attempt ran. The device stays
+                            // open but unused until the driver is closed.
+                            Lv2Log::error("ALSA device restarted, but the audio thread had already stopped waiting for it.");
+                            return;
+                        }
+                        if (attempt > 1)
+                        {
+                            Lv2Log::info(SS("ALSA device restarted (attempt " << attempt << ")."));
+                        }
+                        return;
+                    }
+                    catch (const std::exception &e)
+                    {
+                        Lv2Log::error(SS("ALSA restart attempt " << attempt << "/" << RESTART_ATTEMPTS << " failed. " << e.what()));
+                    }
+                }
+                if (attempt == RESTART_ATTEMPTS)
+                {
+                    break;
+                }
+                // Wait without the lock, in short steps so a shutdown is noticed promptly.
+                auto resumeAt = std::chrono::steady_clock::now() + retryInterval;
+                while (std::chrono::steady_clock::now() < resumeAt)
+                {
+                    if (terminateAudio() || closeGeneration.load(std::memory_order_acquire) != generation ||
+                        deferredRestart.IsAbandoned())
+                    {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+            }
+            std::lock_guard lock{restartMutex};
+            if (closeGeneration.load(std::memory_order_acquire) == generation)
+            {
+                if (deferredRestart.Complete(false))
+                {
+                    Lv2Log::error("Giving up on restarting the ALSA device.");
                 }
                 else
                 {
-                    throw PiPedalStateException(SS("Can't recover from ALSA input error. (" << snd_strerror(err) << ")"));
+                    Lv2Log::error("ALSA device restart abandoned: the audio thread stopped waiting for it.");
                 }
             }
-            catch (const std::exception &e)
-            {
-                RestartAlsa();
-                audioRunning = true;
-            }
         }
+
+        // Service thread: the reason the audio thread last gave up on in-place recovery
+        // (empty if none is pending).
+        std::string TakeRecoveryError()
+        {
+            char text[RealtimeErrorMessage::CAPACITY];
+            int err = 0;
+            if (!recoveryError.Take(text, &err))
+            {
+                return std::string();
+            }
+            std::string result = text;
+            if (err != 0)
+            {
+                result = SS(result << " (" << snd_strerror(err) << ")");
+            }
+            return result;
+        }
+
+        // Non-realtime service thread (rtsvc): log what the audio thread counted.
+        virtual bool LogRealtimeStatistics() override
+        {
+            bool logged = false;
+            // Normally taken (and logged) by ServiceRestartRequest(). Still pending here if
+            // the audio thread had to restart the device itself. Leave it alone while a
+            // deferred restart is requested or running, so the reason is logged together
+            // with its restart. (Residual: the audio thread sets the reason just before it
+            // requests the restart; if we run in that instant, the reason is logged here.)
+            std::string recoveryReason;
+            if (deferredRestart.Get() == DeferredRestart::State::Idle)
+            {
+                recoveryReason = TakeRecoveryError();
+            }
+            if (!recoveryReason.empty())
+            {
+                Lv2Log::warning(SS("ALSA xrun recovery failed: " << recoveryReason << "."));
+                logged = true;
+            }
+            XrunCounts xruns = xrunCounter.Take();
+            if (xruns.Any())
+            {
+                Lv2Log::info(SS(
+                    "ALSA xrun recoveries: " << xruns.input << " input, " << xruns.output << " output"
+                                             << ", " << xruns.failedRecoveries << " requiring a device restart."));
+                if (xruns.audioThreadRestarts != 0)
+                {
+                    Lv2Log::warning(SS("ALSA: " << xruns.audioThreadRestarts
+                                                << " device restart(s) performed on the audio thread (no service thread was running)."));
+                }
+                logged = true;
+            }
+            uint64_t droppedMidiEvents = midiInput.TakeDroppedEvents();
+            if (droppedMidiEvents != 0)
+            {
+                Lv2Log::warning(SS("MIDI input overflow: " << droppedMidiEvents << " event(s) dropped."));
+                logged = true;
+            }
+            if (alsaSequencer)
+            {
+                uint64_t malformedMidiEvents = alsaSequencer->TakeMalformedEventCount();
+                if (malformedMidiEvents != 0)
+                {
+                    Lv2Log::warning(SS("MIDI input: " << malformedMidiEvents << " malformed sequencer event(s) dropped."));
+                    logged = true;
+                }
+            }
+            return logged;
+        }
+
+    private:
+        RealtimeXrunCounter xrunCounter;
+        DeferredRestart deferredRestart;
+        // Why in-place recovery last failed. Set on the audio thread, logged by the service thread.
+        RealtimeErrorMessage recoveryError;
+
+        // ServiceRestartRequest(): up to RESTART_ATTEMPTS reopens, RESTART_RETRY_INTERVAL_MS
+        // apart (about 10 s in all) before the audio thread is told the device is gone.
+        static constexpr int RESTART_ATTEMPTS = 20;
+        static constexpr int RESTART_RETRY_INTERVAL_MS = 500;
+        // How long the audio thread waits for that outcome (WaitForDeferredRestart): the retry
+        // budget, plus generous slack for the reopen attempts themselves (each may take a
+        // while on a re-enumerating USB device) and for rtsvc picking up the request. Past
+        // it, the request is abandoned and the audio thread stops.
+        static constexpr int RESTART_WAIT_SLACK_MS = 20000;
+        static constexpr int RESTART_WAIT_LIMIT_MS = RESTART_ATTEMPTS * RESTART_RETRY_INTERVAL_MS + RESTART_WAIT_SLACK_MS;
+        // Bumped by Close(), so a restart still retrying from a previous session gives up.
+        std::atomic<uint64_t> closeGeneration{0};
 
         void DumpStatus(snd_pcm_t *handle)
         {
@@ -1721,49 +2032,19 @@ namespace pipedal
         }
 
     protected:
+        // Audio thread, once per cycle (after midiInput.Clear(), before the PCM read).
+        // Appends to the cycle's events; never resets them, never grows the buffer.
         void ReadMidiData(uint32_t audioFrame)
         {
-            AlsaMidiMessage message;
-
-            midiEventCount = 0;
-            midiEventMemoryIndex = 0;
-            auto alsaSequener = this->alsaSequencer; // take an addref
-            if (!alsaSequener)
+            // Raw pointer: no refcount traffic on the audio thread. The sequencer is set
+            // before Activate() and released only in Close(), after the audio thread is joined.
+            AlsaSequencer *sequencer = this->alsaSequencer.get();
+            if (!sequencer)
             {
                 return;
             }
-            while (alsaSequencer->ReadMessage(message, 0))
-            {
-                size_t messageSize = message.size;
-                if (messageSize == 0)
-                {
-                    continue;
-                }
-                if (midiEventMemoryIndex + messageSize >= this->midiEventMemory.size())
-                {
-                    continue;
-                }
-                if (midiEventCount >= this->midiEvents.size())
-                {
-                    midiEvents.resize(midiEventCount * 2);
-                }
-                // for now, prevent META event messages from propagating.
-                if (message.data[0] == 0xFF && message.size > 1)
-                {
-                    continue;
-                }
-                MidiEvent *pEvent = midiEvents.data() + midiEventCount++;
-                pEvent->timeStamp = MidiTimestamp(message.realtime_sec, message.realtime_nsec);
-                pEvent->frame = audioFrame;
-                pEvent->size = messageSize;
-                pEvent->buffer = midiEventMemory.data() + midiEventMemoryIndex;
-
-                memcpy(
-                    midiEventMemory.data() + midiEventMemoryIndex,
-                    message.data,
-                    message.size);
-                midiEventMemoryIndex += messageSize;
-            }
+            AlsaMidiMessage message;
+            DrainMidiInput(*sequencer, message, midiInput, audioFrame);
         }
 
     private:
@@ -1789,9 +2070,15 @@ namespace pipedal
         {
             SetThreadName("alsaDriver");
 
+            // Set when a failed xrun recovery could not restart the device. Reported (with
+            // audioStopReason) only after leaving realtime operation: nothing is allocated or
+            // logged on the way out of the loop.
+            bool deviceLost = false;
+
             try
             {
                 SetThreadPriority(SchedulerPriority::RealtimeAudio);
+                EnableFlushToZero();
 
                 bool ok = true;
 
@@ -1807,18 +2094,24 @@ namespace pipedal
 
                 CrashGuardLock crashGuardLock;
 
+                cpuUse.SetPeriod(std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>((double)bufferSize / (double)sampleRate)));
                 cpuUse.SetStartTime(cpuUse.Now());
                 while (true)
                 {
-                    validate_capture_handle();
-                    cpuUse.UpdateCpuUse();
-
+                    // Terminating first: after a wait for a restart that ended in shutdown, an
+                    // abandoned restart may still be replacing the handles on the service thread.
                     if (terminateAudio())
                     {
                         break;
                     }
-                    this->midiEventCount = 0;
-                    this->midiEventMemoryIndex = 0;
+                    validate_capture_handle();
+                    cpuUse.UpdateCpuUse();
+
+                    // MIDI: one read per cycle, before the PCM read. (It used to run on every
+                    // partial-read iteration, each one discarding the events gathered so far.)
+                    this->midiInput.Clear();
+                    ReadMidiData(0);
 
                     // snd_pcm_wait(captureHandle, 1);
                     ssize_t framesToRead = bufferSize;
@@ -1828,8 +2121,6 @@ namespace pipedal
 
                     while (framesToRead != 0)
                     {
-                        ReadMidiData((uint32_t)framesRead);
-
                         ssize_t thisTime = framesToRead;
                         ssize_t nFrames;
                         if ((nFrames = ReadBuffer(
@@ -1838,12 +2129,25 @@ namespace pipedal
                                  framesToRead)) < 0)
                         {
                             this->driverHost->OnUnderrun();
-                            recover_from_input_underrun(captureHandle, playbackHandle, nFrames, framesRead);
+                            if (!recover_from_input_underrun(captureHandle, playbackHandle, nFrames, framesRead))
+                            {
+                                deviceLost = true;
+                            }
                             xrun = true;
                             break;
                         }
                         framesRead += nFrames;
                         framesToRead -= nFrames;
+                    }
+                    if (deviceLost)
+                    {
+                        // Before touching the handles: an abandoned restart may still be
+                        // replacing them on the service thread.
+                        break;
+                    }
+                    if (terminateAudio())
+                    {
+                        break; // Likewise (the restart wait ended in shutdown).
                     }
                     validate_capture_handle();
 
@@ -1889,7 +2193,11 @@ namespace pipedal
                     {
                         this->driverHost->OnUnderrun();
 
-                        recover_from_output_underrun(captureHandle, playbackHandle, err, framesRead);
+                        if (!recover_from_output_underrun(captureHandle, playbackHandle, err, framesRead))
+                        {
+                            deviceLost = true;
+                            break;
+                        }
                         framesRead = 0;
                     }
                     if (isDummyDriver)
@@ -1901,29 +2209,54 @@ namespace pipedal
             }
             catch (const std::exception &e)
             {
+                // Leaving realtime operation for good: demote before logging.
+                DemoteToNonRealtime();
+                // Thrown while parked for a restart (e.g. by the host's command processing):
+                // don't leave the request pending for a thread that will never collect it.
+                // A running restart is abandoned; the service thread drops it.
+                DeferredRestart::State state = deferredRestart.Abandon();
+                if (state == DeferredRestart::State::Succeeded || state == DeferredRestart::State::Failed)
+                {
+                    deferredRestart.Reset();
+                }
                 Lv2Log::error(e.what());
+                Lv2Log::error("ALSA audio thread terminated abnormally.");
+            }
+            if (deviceLost)
+            {
+                DemoteToNonRealtime();
+                Lv2Log::error(audioStopReason ? audioStopReason : "Unable to restart the audio stream.");
                 Lv2Log::error("ALSA audio thread terminated abnormally.");
             }
 
             // if we terminated abnormally, pump messages until we have been terminated.
             if (!terminateAudio())
             {
+                DemoteToNonRealtime();
                 this->driverHost->OnAlsaDriverStopped();
-                // zero out input buffers.
-                for (size_t i = 0; i < this->deviceCaptureBuffers.size(); ++i)
                 {
-                    float *pBuffer = deviceCaptureBuffers[i];
-                    for (size_t j = 0; j < this->bufferSize; ++j)
+                    // An abandoned restart may still be running on the service thread, rewriting
+                    // the buffers and bufferSize: serialise with it (held per attempt only).
+                    std::lock_guard lock{restartMutex};
+                    // zero out input buffers.
+                    for (size_t i = 0; i < this->deviceCaptureBuffers.size(); ++i)
                     {
-                        pBuffer[j] = 0;
+                        float *pBuffer = deviceCaptureBuffers[i];
+                        for (size_t j = 0; j < this->bufferSize; ++j)
+                        {
+                            pBuffer[j] = 0;
+                        }
                     }
                 }
                 try
                 {
+                    // The device is dead: no DSP, just keep host commands flowing until
+                    // Deactivate(). Once per period, at SCHED_OTHER.
+                    const auto period = PeriodDuration();
                     while (!terminateAudio())
                     {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                        this->driverHost->OnProcess(this->bufferSize);
+                        std::this_thread::sleep_for(period);
+                        this->driverHost->OnProcessCommandsOnly();
                     }
                 }
                 catch (const std::exception &e)
@@ -1931,6 +2264,15 @@ namespace pipedal
                 }
             }
             this->driverHost->OnAudioTerminated();
+        }
+
+        // The audio thread after an abnormal stop: nothing realtime left to do.
+        static void DemoteToNonRealtime()
+        {
+            struct sched_param param;
+            memset(&param, 0, sizeof(param));
+            param.sched_priority = 0;
+            sched_setscheduler(0, SCHED_OTHER, &param);
         }
 
         bool alsaActive = false;
@@ -2138,6 +2480,7 @@ namespace pipedal
             AllocateAuxChannels();                
             AddMixOps();
 
+            cpuDmaLatency.Hold();
             audioThread = std::make_unique<std::jthread>([this]()
                                                          { AudioThread(); });
         }
@@ -2149,21 +2492,31 @@ namespace pipedal
                 return;
             }
             activated = false;
+            // Stale restart retries (ServiceRestartRequest) stop at their next check, even if
+            // the driver is re-activated without a Close().
+            closeGeneration.fetch_add(1, std::memory_order_acq_rel);
             terminateAudio(true);
             if (audioThread)
             {
                 this->audioThread = 0; // jthread joins.
             }
+            {
+                // The audio thread is joined: a restart it abandoned, or a result it never
+                // collected, must not reach the next one. Under restartMutex, so a service
+                // thread mid-attempt finishes first and then sees the new generation.
+                std::lock_guard lock{restartMutex};
+                deferredRestart.Reset();
+            }
             Lv2Log::debug("Audio thread joined.");
+            cpuDmaLatency.Release();
         }
+        CpuDmaLatency cpuDmaLatency;
 
         static constexpr size_t MIDI_MEMORY_BUFFER_SIZE = 32 * 1024;
         static constexpr size_t MAX_MIDI_EVENT = 4 * 1024;
 
-        size_t midiEventCount = 0;
-        std::vector<MidiEvent> midiEvents;
-        size_t midiEventMemoryIndex = 0;
-        std::vector<uint8_t> midiEventMemory;
+        // Fixed capacity; overflow is dropped and counted, never grown on the audio thread.
+        RealtimeMidiEventBuffer midiInput{MAX_MIDI_EVENT, MIDI_MEMORY_BUFFER_SIZE};
         AlsaSequencer::ptr alsaSequencer;
 
     public:
@@ -2250,11 +2603,11 @@ namespace pipedal
 
         virtual size_t GetMidiInputEventCount() override
         {
-            return midiEventCount;
+            return midiInput.Count();
         }
         virtual MidiEvent *GetMidiEvents() override
         {
-            return this->midiEvents.data();
+            return this->midiInput.Events();
         }
 
         virtual size_t MainOutputBufferCount() const { return mainPlaybackBuffers.size(); }
@@ -2289,7 +2642,19 @@ namespace pipedal
                 return;
             }
             open = false;
+            closeGeneration.fetch_add(1, std::memory_order_acq_rel);
             Deactivate();
+            {
+                // The audio thread is joined. A restart it abandoned (or a result it never
+                // collected) must not outlive the session: under restartMutex, so a service
+                // thread mid-attempt finishes first, then sees the new generation and leaves
+                // the state alone. Idle also lets LogRealtimeStatistics() report the reason.
+                std::lock_guard lock{restartMutex};
+                deferredRestart.Reset();
+            }
+            // The audio thread has stopped: report what it counted since the service thread last did
+            // (e.g. device restarts it had to perform itself because no service thread was running).
+            LogRealtimeStatistics();
             AlsaCleanup();
             DeleteBuffers();
             this->alsaSequencer = nullptr;

@@ -53,6 +53,43 @@ namespace pipedal
 
         static std::string decode_url_segment(const char *text, bool isQuerySegment = false);
 
+        // True if a decoded URL path segment is safe to append to a filesystem path:
+        // non-empty, not "." or "..", and containing no '/', '\\' or NUL.
+        static bool IsSafePathSegment(const std::string &segment);
+
+        // True if path (symlinks resolved as far as it exists) is root itself or lies inside
+        // root (component-wise, after weak canonicalisation of both).
+        static bool IsPathUnderRoot(
+            const std::filesystem::path &root,
+            const std::filesystem::path &path);
+
+        // As IsPathUnderRoot, but canonicalRoot must already be weakly_canonical (it is not
+        // re-canonicalised, so callers can resolve it once at startup).
+        static bool IsPathUnderCanonicalRoot(
+            const std::filesystem::path &canonicalRoot,
+            const std::filesystem::path &path);
+
+        // True if path's PARENT directory is under root (symlinked directories and ".." cannot
+        // escape), without following a symlink at the final component. Use where file symlinks
+        // inside root (e.g. links into plugin bundles) are legitimate.
+        static bool IsParentDirectoryUnderRoot(
+            const std::filesystem::path &root,
+            const std::filesystem::path &path);
+
+        // As TryResolveUnderRoot, for an already-canonical root.
+        static bool TryResolveUnderCanonicalRoot(
+            const std::filesystem::path &canonicalRoot,
+            const std::vector<std::string> &segments,
+            std::filesystem::path *result);
+
+        // Appends decoded URL segments to root. Returns false (and leaves result unspecified)
+        // if any segment is unsafe, or if the weakly-canonical result is not inside the
+        // canonical root.
+        static bool TryResolveUnderRoot(
+            const std::filesystem::path &root,
+            const std::vector<std::string> &segments,
+            std::filesystem::path *result);
+
         static void utf32_to_utf8_stream(std::ostream &s, uint32_t uc);
 
         static std::string Rfc5987EncodeFileName(const std::string &name);

@@ -4,10 +4,14 @@ export type Demo = 'select' | 'load-tone' | 'load-model' | 'full-api' | 'lan-flo
 
 export enum Gear {
   Amp = 'amp',
-  FullRig = 'full-rig',
+  AmpCab = 'amp-cab',
   Pedal = 'pedal',
   Outboard = 'outboard',
-  Ir = 'ir',
+  Cab = 'cab',
+  Space = 'space',
+  Experimental = 'experimental',
+  FullRig = 'full-rig', // deprecated alias of amp-cab.
+  Ir = 'ir',            // deprecated: impulse responses are format 'ir'.
 }
 
 export enum DeprecatedPlatform {

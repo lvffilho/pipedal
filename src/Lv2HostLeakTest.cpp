@@ -30,13 +30,24 @@
 using namespace pipedal;
 
 
+static const char *LV2_PATH = "/usr/lib/lv2:/usr/local/lib/lv2:/usr/modep/lv2";
+
 TEST_CASE( "PluginHost memory leak", "[lv2host_leak][Build][Dev]" ) {
+
+    // Warm-up load. The first LoadLilv() lazily creates process-lifetime
+    // singletons (the MimeTypes::instance() tables, ModFileTypes' mod
+    // directory list, ...), ~460 allocations that are never freed by design.
+    // Measure a second load instead, which must not leave anything behind.
+    {
+        PluginHost host;
+        host.LoadLilv(LV2_PATH);
+    }
 
     MemStats initialMemory = GetMemStats();
     {
         PluginHost host;
 
-        host.LoadLilv("/usr/lib/lv2:/usr/local/lib/lv2:/usr/modep/lv2");
+        host.LoadLilv(LV2_PATH);
     }
     MemStats finalMemory = GetMemStats();
 

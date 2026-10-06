@@ -111,6 +111,36 @@ static void setCacheControl(HttpResponse &res, const fs::path &path)
         res.set("Cache-Control", "no-cache, no-store, must-revalidate");
     }
 }
+void ModWebIntercept::ServeJavascript(const std::string &javascriptFile, HttpResponse &res, std::error_code &ec)
+{
+    // The path comes from the plugin's (or its ModGUI overlay's) modgui:javascript,
+    // like the stylesheet's; it's never derived from the request.
+    if (javascriptFile.empty())
+    {
+        ec = std::make_error_code(std::errc::no_such_file_or_directory);
+        return;
+    }
+    fs::path path = javascriptFile;
+    std::error_code fsEc;
+    if (!fs::is_regular_file(path, fsEc))
+    {
+        ec = std::make_error_code(std::errc::no_such_file_or_directory);
+        return;
+    }
+    size_t size = fs::file_size(path, fsEc);
+    if (fsEc) // e.g. removed since the check above.
+    {
+        ec = std::make_error_code(std::errc::no_such_file_or_directory);
+        return;
+    }
+    res.setBodyFile(
+        path,
+        false); // delete when done
+    res.set("Content-Type", "text/javascript");
+    res.setContentLength(size);
+    setCacheControl(res, path);
+}
+
 void ModWebInterceptImpl::get_response(
     const uri &request_uri,
     HttpRequest &req,
@@ -172,6 +202,10 @@ void ModWebInterceptImpl::get_response(
                 setCacheControl(res, pluginInfo->modGui()->stylesheet());
 
             }
+            else if (segment == "javascript")
+            {
+                ServeJavascript(pluginInfo->modGui()->javascript(), res, ec);
+            }
 
             else if (segment == "screenshot")
             {
@@ -231,10 +265,16 @@ void ModWebInterceptImpl::get_response(
         else
         {
             // a request for a plugin resource file.
-            fs::path resourcefile = pluginInfo->modGui()->resourceDirectory();
+            fs::path resourcefile;
+            std::vector<std::string> segments;
             for (size_t i = 1; i < request_uri.segment_count(); ++i)
             {
-                resourcefile /= request_uri.segment(i);
+                segments.push_back(request_uri.segment(i));
+            }
+            if (!HtmlHelper::TryResolveUnderRoot(pluginInfo->modGui()->resourceDirectory(), segments, &resourcefile))
+            {
+                ec = std::make_error_code(std::errc::no_such_file_or_directory);
+                return;
             }
             // && was a typo for ||: an existing directory passed this test and
             // then threw from fs::file_size().

@@ -61,6 +61,7 @@ namespace pipedal
         AutoLilvNode mod_gui__knob;
         AutoLilvNode mod_gui__port;
         AutoLilvNode mod_gui__monitoredOutputs;
+        AutoLilvNode rdfs__seeAlso;
     };
 
     class PluginHost;

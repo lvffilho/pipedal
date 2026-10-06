@@ -27,7 +27,11 @@
 #include <string>
 #include <memory>
 #include <functional>
+#include <atomic>
+#include <cstdint>
 #include "json.hpp"
+
+struct snd_seq_event; // snd_seq_event_t, from <alsa/seq_event.h>
 
 namespace pipedal
 {
@@ -292,6 +296,19 @@ namespace pipedal
         uint8_t fixedBuffer[12];
     };
 
+    enum class AlsaSequencerDecodeResult
+    {
+        Message,   // message holds a MIDI (or meta) message.
+        Skip,      // not for us: filtered channel, or a non-MIDI sequencer event.
+        Malformed, // could not be represented (e.g. a SysEx continuation chunk); dropped.
+    };
+
+    // Decode one ALSA sequencer event into message. Never throws: it runs on the
+    // audio thread (AlsaSequencer::ReadMessage with timeout 0). channelSelection < 0
+    // accepts every channel. For large SysEx, message.data points into *event.
+    AlsaSequencerDecodeResult DecodeAlsaSequencerEvent(
+        const struct snd_seq_event *event, int32_t channelSelection, AlsaMidiMessage &message) noexcept;
+
     /*
      * AlsaSequencer - ALSA MIDI sequencer interface with real-time timestamp support
      *
@@ -335,6 +352,10 @@ namespace pipedal
 
         // currently non-functional
         virtual bool GetQueueRealtime(uint64_t *sec, uint32_t *nsec) = 0;
+
+        // Events ReadMessage dropped as malformed since the previous call. For reporting
+        // from a non-realtime thread.
+        virtual uint64_t TakeMalformedEventCount() { return 0; }
 
         virtual void RemoveAllConnections() = 0;
     };

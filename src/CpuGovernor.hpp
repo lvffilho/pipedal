@@ -29,4 +29,26 @@ namespace pipedal {
     void SetCpuGovernor(const std::string &governor);
 
     std::vector<std::string> GetAvailableGovernors();
+    // As above; *fromSysfs is set true only if the list was read from scaling_available_governors
+    // (false when the hard-coded fallback list was returned, or there is no governor).
+    std::vector<std::string> GetAvailableGovernors(bool *fromSysfs);
+
+    // Parses the contents of scaling_available_governors (space-separated).
+    std::vector<std::string> ParseGovernorList(const std::string &text);
+
+    // True if governor is one of the available governors.
+    bool IsValidGovernor(const std::string &governor, const std::vector<std::string> &available);
+
+    // The governor to use at startup: the persisted one if it is available; otherwise the
+    // currently running governor (if that is itself available). Returns persisted unchanged
+    // when no replacement can be determined (no governor list, list not read from sysfs, or
+    // current governor unknown).
+    std::string ResolvePersistedGovernor(
+        const std::string &persisted,
+        const std::vector<std::string> &available,
+        const std::string &current,
+        bool availableFromSysfs);
+
+    // Validates, then sets. Never throws; returns false (after logging) on failure.
+    bool TrySetCpuGovernor(const std::string &governor);
 };

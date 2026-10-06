@@ -31,12 +31,16 @@
 #include "Lv2Log.hpp"
 #include <map>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <cerrno>
+#include <unistd.h>
 #include "PiPedalUI.hpp"
 #include "PluginHost.hpp"
 #include "ss.hpp"
 #include "ofstream_synced.hpp"
 #include "ModFileTypes.hpp"
 #include <set>
+#include <mutex>
 #include <MimeTypes.hpp>
 #include "util.hpp"
 #include "AudioFiles.hpp"
@@ -674,11 +678,149 @@ std::filesystem::path Storage::GetBankFileName(const std::string& name) const
     return this->GetPresetsDirectory() / fileName;
 }
 
+bool Storage::RecoverFileFromBackup(
+    const std::filesystem::path &file,
+    const std::function<bool(const std::filesystem::path &)> &isValid)
+{
+    auto validates = [&isValid](const fs::path &path) {
+        try
+        {
+            std::error_code ec;
+            if (!fs::is_regular_file(path, ec) || fs::file_size(path, ec) == 0)
+            {
+                return false;
+            }
+            return isValid(path);
+        }
+        catch (const std::exception &)
+        {
+            return false;
+        }
+    };
+    if (validates(file))
+    {
+        return true;
+    }
+    for (const char *suffix : {".tmp", ".$$$"})
+    {
+        fs::path candidate = file;
+        candidate += suffix;
+        if (validates(candidate))
+        {
+            Lv2Log::warning("Restoring '%s' from '%s'.", file.c_str(), candidate.c_str());
+            std::error_code ec;
+            // Copy via a private recovery temp file, never through ofstream_synced: its temp
+            // name is "<file>.tmp", which may be the candidate itself, and a failed write
+            // would delete it. The candidate is only removed once the restore is durable.
+            std::string content;
+            {
+                std::ifstream in(candidate, std::ios_base::binary);
+                std::stringstream ss;
+                ss << in.rdbuf();
+                if (!in.good() || ss.fail())
+                {
+                    continue; // couldn't read it after all.
+                }
+                content = ss.str();
+            }
+            if (content.empty())
+            {
+                continue;
+            }
+            // keep the candidate's permissions (it was written by ofstream_synced, which keeps the target's).
+            mode_t mode = 0644;
+            {
+                struct stat st;
+                if (::stat(candidate.c_str(), &st) == 0)
+                {
+                    mode = st.st_mode & 07777;
+                }
+            }
+            // Uniquely named (mkstemp, O_EXCL) in the same directory, so the rename is atomic
+            // and nothing already squatting on a fixed name can be clobbered or block us.
+            fs::path recoverPath;
+            bool written = false;
+            {
+                std::string pathTemplate = file.string() + ".recover.XXXXXX";
+                std::vector<char> buffer(pathTemplate.begin(), pathTemplate.end());
+                buffer.push_back('\0');
+                int fd = ::mkostemp(buffer.data(), O_CLOEXEC);
+                if (fd >= 0)
+                {
+                    recoverPath = buffer.data();
+                    ::fchmod(fd, mode); // mkstemp creates 0600; fchmod isn't subject to umask.
+                    written = true;
+                    const char *p = content.data();
+                    size_t remaining = content.size();
+                    while (remaining > 0)
+                    {
+                        ssize_t n = ::write(fd, p, remaining);
+                        if (n < 0)
+                        {
+                            if (errno == EINTR)
+                                continue;
+                            written = false;
+                            break;
+                        }
+                        p += n;
+                        remaining -= (size_t)n;
+                    }
+                    if (written && ::fsync(fd) != 0)
+                    {
+                        written = false;
+                    }
+                    if (::close(fd) != 0)
+                    {
+                        written = false;
+                    }
+                }
+            }
+            if (written)
+            {
+                fs::rename(recoverPath, file, ec);
+                written = !ec;
+            }
+            if (!written)
+            {
+                if (!recoverPath.empty())
+                {
+                    fs::remove(recoverPath, ec);
+                }
+                continue;
+            }
+            // The restore is only durable once the rename is: keep the candidate if that can't be confirmed.
+            bool durable = false;
+            {
+                fs::path dir = file.parent_path();
+                int fd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                if (fd >= 0)
+                {
+                    durable = ::fsync(fd) == 0;
+                    ::close(fd);
+                }
+            }
+            if (durable)
+            {
+                fs::remove(candidate, ec);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 void Storage::LoadBankIndex()
 {
     try
     {
         auto path = GetIndexFileName();
+        RecoverFileFromBackup(path, [](const fs::path &p) {
+            std::ifstream s(p);
+            json_reader reader(s);
+            BankIndex index;
+            reader.read(&index);
+            return true;
+        });
         std::ifstream s;
         s.open(path);
         json_reader reader(s);
@@ -744,9 +886,15 @@ void Storage::SavePluginPresetIndex()
 void Storage::SaveBankIndex()
 {
     pipedal::ofstream_synced os;
-    os.open(GetIndexFileName(), std::ios_base::trunc);
+    auto path = GetIndexFileName();
+    os.open(path, std::ios_base::trunc);
     json_writer writer(os, true);
     writer.write(this->bankIndex);
+    os.close(); // atomic: temp file, fsync, rename.
+    if (os.fail())
+    {
+        throw PiPedalException(SS("Can't write to " << path));
+    }
 }
 
 void Storage::ReIndex()
@@ -791,11 +939,22 @@ void Storage::CreateBank(const std::string& name)
     this->SaveBankIndex();
 }
 
+// RecoverFileFromBackup validator for bank files: parses as a BankFile (throws otherwise).
+static bool IsValidBankFile(const fs::path &path)
+{
+    std::ifstream s(path);
+    json_reader reader(s);
+    BankFile bank;
+    reader.read(&bank);
+    return true;
+}
+
 void Storage::GetBankFile(int64_t instanceId, BankFile* pBank) const
 {
     auto indexEntry = this->bankIndex.getBankIndexEntry(instanceId);
     auto name = indexEntry.name();
     std::filesystem::path fileName = GetBankFileName(name);
+    RecoverFileFromBackup(fileName, IsValidBankFile);
     std::ifstream is(fileName);
     json_reader reader(is);
     reader.read(pBank);
@@ -805,6 +964,7 @@ void Storage::GetBankFile(int64_t instanceId, BankFile* pBank) const
 void Storage::LoadBankFile(const std::string& name, BankFile* pBank)
 {
     std::filesystem::path fileName = GetBankFileName(name);
+    RecoverFileFromBackup(fileName, IsValidBankFile);
     std::ifstream is(fileName);
     json_reader reader(is);
     reader.read(pBank);
@@ -820,7 +980,8 @@ void Storage::SaveBankFile(const std::string& name, const BankFile& bankFile)
     }
     if (std::filesystem::exists(fileName))
     {
-        std::filesystem::rename(fileName, backupFile);
+        // copy, not rename: the main file must never be absent. The write below is atomic.
+        std::filesystem::copy_file(fileName, backupFile);
     }
     try
     {
@@ -828,6 +989,11 @@ void Storage::SaveBankFile(const std::string& name, const BankFile& bankFile)
         s.open(fileName, std::ios_base::trunc);
         json_writer writer(s, true);
         writer.write(bankFile);
+        s.close();
+        if (s.fail())
+        {
+            throw PiPedalException(SS("Can't write to " << fileName));
+        }
         if (std::filesystem::exists(backupFile))
         {
             std::filesystem::remove(backupFile);
@@ -835,11 +1001,9 @@ void Storage::SaveBankFile(const std::string& name, const BankFile& bankFile)
     }
     catch (const std::exception& e)
     {
-        std::filesystem::remove(fileName);
-        if (std::filesystem::exists(backupFile))
-        {
-            std::filesystem::rename(backupFile, fileName);
-        }
+        // the atomic write left the previous main file intact; discard the backup.
+        std::error_code ec;
+        std::filesystem::remove(backupFile, ec);
         throw;
     }
 }
@@ -1601,6 +1765,15 @@ bool Storage::GetShowStatusMonitor() const
 {
     return this->userSettings.showStatusMonitor_;
 }
+void Storage::SetSuspendBypassedPlugins(bool value)
+{
+    this->userSettings.suspendBypassedPlugins_ = value;
+    SaveUserSettings();
+}
+bool Storage::GetSuspendBypassedPlugins() const
+{
+    return this->userSettings.suspendBypassedPlugins_;
+}
 
 std::string Storage::GetGovernorSettings() const
 {
@@ -1698,10 +1871,18 @@ WifiDirectConfigSettings Storage::GetWifiDirectConfigSettings()
     return this->wifiDirectConfigSettings;
 }
 
+// File scope (not a Storage member) so it also covers writers that hold different
+// Storage references: the autosave timer and the shutdown path both write
+// currentPreset.json and share its ofstream_synced temp name (currentPreset.json.tmp).
+// Serializes SaveCurrentPreset and DiscardCurrentPreset.
+static std::mutex currentPresetWriteMutex;
+
 void Storage::SaveCurrentPreset(const CurrentPreset& currentPreset)
 {
     try
     {
+        // serialize writers (autosave timer vs. shutdown) so they don't share the temp file.
+        std::lock_guard<std::mutex> lock(currentPresetWriteMutex);
         std::filesystem::path path = GetCurrentPresetPath();
 
         pipedal::ofstream_synced f(path);
@@ -1713,6 +1894,13 @@ void Storage::SaveCurrentPreset(const CurrentPreset& currentPreset)
         // called from destructor. Must be nothrow().
     }
 }
+void Storage::DiscardCurrentPreset()
+{
+    std::lock_guard<std::mutex> lock(currentPresetWriteMutex);
+    std::error_code ec;
+    std::filesystem::remove(GetCurrentPresetPath(), ec);
+}
+
 bool Storage::RestoreCurrentPreset(CurrentPreset* pResult)
 {
     std::filesystem::path path = GetCurrentPresetPath();
@@ -3414,6 +3602,7 @@ const ChannelSelection& Storage::GetChannelSelection() const
 JSON_MAP_BEGIN(UserSettings)
 JSON_MAP_REFERENCE(UserSettings, governor)
 JSON_MAP_REFERENCE(UserSettings, showStatusMonitor)
+JSON_MAP_REFERENCE(UserSettings, suspendBypassedPlugins)
 JSON_MAP_END()
 
 JSON_MAP_BEGIN(CurrentPreset)

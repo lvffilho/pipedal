@@ -21,6 +21,7 @@
 #include "PiPedalCommon.hpp"
 #include "AudioHost.hpp"
 #include "util.hpp"
+#include "DeferredMidi.hpp"
 #include <lv2/atom/atom.h>
 #include "SchedulerPriority.hpp"
 #include "AlsaSequencer.hpp"
@@ -35,6 +36,7 @@
 #include <unordered_map>
 #include "PluginHost.hpp"
 #include "PatchPropertyWriter.hpp"
+#include "Lv2Effect.hpp"
 #include "CpuTemperatureMonitor.hpp"
 #include "restrict.hpp"
 
@@ -66,6 +68,7 @@ using namespace pipedal;
 #ifdef __linux__
 #include <sched.h>
 #include <sys/syscall.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -76,6 +79,36 @@ using namespace pipedal;
 const double VU_UPDATE_RATE_S = 1.0 / 30;
 const double OVERRUN_GRACE_PERIOD_S = 15;
 using namespace pipedal;
+
+static constexpr int AUDIO_SERVICE_THREAD_NICE = -5;
+
+// The rtsvc thread services audio-thread responses: notifications, logging, freeing
+// pedalboards, device restarts. None of that is realtime work, and running it at
+// SCHED_RR 85 let it preempt everything but the audio thread on a 2-core machine.
+// Run it SCHED_OTHER, nudged to nice -5 when permitted. An inherited nice value that
+// is already higher (e.g. the process-wide -9 boost) is kept.
+static void SetAudioServiceThreadScheduling()
+{
+#ifdef __linux__
+    struct sched_param param;
+    memset(&param, 0, sizeof(param));
+    param.sched_priority = 0;
+    if (sched_setscheduler(0, SCHED_OTHER, &param) != 0)
+    {
+        Lv2Log::warning(SS("Failed to set SCHED_OTHER for the audio service thread. (" << strerror(errno) << ")"));
+    }
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    errno = 0;
+    int currentNice = getpriority(PRIO_PROCESS, (id_t)tid);
+    if (errno == 0 && currentNice > AUDIO_SERVICE_THREAD_NICE)
+    {
+        if (setpriority(PRIO_PROCESS, (id_t)tid, AUDIO_SERVICE_THREAD_NICE) != 0)
+        {
+            Lv2Log::debug(SS("Audio service thread left at nice " << currentNice << ". (" << strerror(errno) << ")"));
+        }
+    }
+#endif
+}
 
 const int MIDI_LV2_BUFFER_SIZE = 16 * 1024;
 
@@ -260,7 +293,8 @@ namespace pipedal
             {
                 auto &effect = effects[i];
 
-                SnapshotValue *snapshotValue = getSnapshotValue(index, effect->GetInstanceId());
+                // (the pedalboard's instance id: a reused effect only takes it when the pedalboard is swapped in.)
+                SnapshotValue *snapshotValue = getSnapshotValue(index, currentPedalboard->GetInstanceIdAt(i));
                 snapshotValues.push_back(IndexedSnapshotValue(effect, snapshotValue, pluginHost));
             }
         }
@@ -410,8 +444,7 @@ private:
     CpuTemperatureMonitor::ptr cpuTemperatureMonitor;
     static constexpr size_t DEFERRED_MIDI_BUFFER_SIZE = 1024;
 
-    uint8_t deferredMidiMessages[DEFERRED_MIDI_BUFFER_SIZE];
-    size_t deferredMidiMessageCount = 0;
+    DeferredMidiBuffer<DEFERRED_MIDI_BUFFER_SIZE> deferredMidi;
     bool midiProgramChangePending = false;
     bool midiSnapshotRequestPending = false;
     int64_t snapshotRequestId = 0;
@@ -572,19 +605,25 @@ private:
 
     virtual void Close()
     {
+        bool wasActive;
         {
             std::lock_guard guard{mutex};
             if (!isOpen)
                 return;
 
             isOpen = false;
+            // Under the mutex: every host-side sender that checks `active` (sendRealtimeParameterRequest,
+            // SetPedalboard, SetControlValue, LoadSnapshot, the VU/monitor subscriptions, ...) checks
+            // and writes under it, so every request it queues is written before the rings are
+            // drained below, and later ones fail immediately. (The MIDI program/snapshot acks follow
+            // the same rule; they carry nothing to complete or reclaim, so a dropped one is harmless.)
+            wasActive = active;
+            active = false;
         }
 
-        if (active)
+        if (wasActive)
         {
             audioDriver->Deactivate();
-
-            active = false;
         }
 
         audioDriver->Close();
@@ -594,26 +633,176 @@ private:
         // delete any leaked snapshots.
         CleanUpSnapshots();
 
+        // Parameter requests the audio thread will never answer: still queued for the ring, in the
+        // ring, or held by the (stopped) audio thread. Complete them with an error. Other objects
+        // these messages carry are reclaimed below (pedalboards, VU, monitor subscriptions) or by
+        // CleanUpSnapshots().
+        this->hostWriter.ClearPending(
+            [](RingBufferCommand command, const uint8_t *body, size_t size)
+            {
+                if (command == RingBufferCommand::ParameterRequest && size >= sizeof(RealtimePatchPropertyRequest *))
+                {
+                    RealtimePatchPropertyRequest *pRequest = nullptr;
+                    memcpy(&pRequest, body, sizeof(pRequest));
+                    CompleteParameterRequestsWithError(pRequest, "Audio stopped.");
+                }
+            });
+        CompleteParameterRequestsInInputRing("Audio stopped.");
+        CompleteParameterRequestsWithError(this->pParameterRequests, "Audio stopped.");
+        this->pParameterRequests = nullptr;
+        // Requests the audio thread did complete, but whose completion rtsvc never read: still in
+        // the audio->host ring, or waiting for room in it.
+        DrainRealtimeOutputRing(
+            this->hostReader,
+            [this](RealtimePatchPropertyRequest *pRequest)
+            { OnParameterRequestsComplete(pRequest); });
+        this->realtimeWriter.TakeDeferredReleases(
+            [this](RingBufferCommand command, void *pointer)
+            {
+                if (command == RingBufferCommand::ParameterRequestComplete)
+                {
+                    OnParameterRequestsComplete((RealtimePatchPropertyRequest *)pointer);
+                }
+            });
+
         // release any pdealboards owned by the process thread.
         this->activePedalboards.resize(0);
         this->realtimeActivePedalboard = nullptr;
 
-        // clean up any realtime buffers that may have been lost in transit.
-        // TODO: These should be lists, really. There may be multiple items in flight..
-        if (realtimeVuBuffers != nullptr)
+        // Clean up realtime buffers held by the audio thread, waiting in the rings, or whose
+        // release messages were lost. Every one that was sent is still on these lists.
         {
-            delete realtimeVuBuffers;
-            realtimeVuBuffers = nullptr;
+            std::lock_guard guard{mutex};
+            this->vuConfigurationsSent.DeleteAll();
+            this->monitorPortSubscriptionsSent.DeleteAll();
         }
-        if (realtimeMonitorPortSubscriptions != nullptr)
-        {
-            delete realtimeMonitorPortSubscriptions;
-            realtimeMonitorPortSubscriptions = nullptr;
-        }
+        realtimeVuBuffers = nullptr;
+        realtimeMonitorPortSubscriptions = nullptr;
         this->inputRingBuffer.reset();
         this->outputRingBuffer.reset();
 
         audioDriver = nullptr;
+    }
+
+    // Host side: completes a chain of parameter requests (linked through pNext) that the audio
+    // thread has served (a ParameterRequestComplete message).
+    void OnParameterRequestsComplete(RealtimePatchPropertyRequest *pRequest)
+    {
+        std::shared_ptr<Lv2Pedalboard> pedalboard;
+        {
+            std::lock_guard guard(mutex);
+            pedalboard = this->currentPedalboard;
+        }
+
+        while (pRequest != nullptr)
+        {
+            auto pNext = pRequest->pNext; // the completion callback may delete the request.
+            if (pRequest->requestType == RealtimePatchPropertyRequest::RequestType::PatchGet)
+            {
+                if (pRequest->errorMessage == nullptr)
+                {
+                    if (pRequest->GetSize() != 0)
+                    {
+                        IEffect *pEffect = pedalboard ? pedalboard->GetEffect(pRequest->instanceId) : nullptr;
+                        if (pEffect == nullptr)
+                        {
+                            pRequest->errorMessage = "Effect no longer available.";
+                        }
+                        else
+                        {
+                            pRequest->jsonResponse = AtomToJson((LV2_Atom *)pRequest->GetBuffer());
+                        }
+                    }
+                    else
+                    {
+                        pRequest->errorMessage = "Plugin did not respond.";
+                    }
+                }
+            }
+            if (pRequest->onPatchRequestComplete)
+            {
+                pRequest->onPatchRequestComplete(pRequest);
+            }
+            pRequest = pNext;
+        }
+    }
+
+    // Completes a chain of parameter requests (linked through pNext, as the audio thread links
+    // them; a request from the host side is a chain of one) that will never reach the audio thread.
+    static void CompleteParameterRequestsWithError(RealtimePatchPropertyRequest *pRequest, const char *errorMessage)
+    {
+        while (pRequest != nullptr)
+        {
+            auto pNext = pRequest->pNext; // the completion callback may delete the request.
+            if (pRequest->errorMessage == nullptr)
+            {
+                pRequest->errorMessage = errorMessage;
+            }
+            if (pRequest->onPatchRequestComplete)
+            {
+                pRequest->onPatchRequestComplete(pRequest);
+            }
+            pRequest = pNext;
+        }
+    }
+
+    // Close() only, after the audio thread has stopped (so this thread may act as the ring's
+    // reader): drains the host->audio ring, completing parameter requests found there. Body sizes
+    // match ProcessInputCommands(); the ring is reset afterwards anyway.
+    void CompleteParameterRequestsInInputRing(const char *errorMessage)
+    {
+        while (realtimeReader.readSpace() > sizeof(RingBufferCommand))
+        {
+            RingBufferCommand command;
+            realtimeReader.read(&command);
+            size_t bodySize = 0;
+            switch (command)
+            {
+            case RingBufferCommand::ParameterRequest:
+            {
+                RealtimePatchPropertyRequest *pRequest = nullptr;
+                realtimeReader.readComplete(&pRequest);
+                CompleteParameterRequestsWithError(pRequest, errorMessage);
+                continue;
+            }
+            case RingBufferCommand::SetValue:
+                bodySize = sizeof(SetControlValueBody);
+                break;
+            case RingBufferCommand::SetInputVolume:
+            case RingBufferCommand::SetOutputVolume:
+                bodySize = sizeof(SetVolumeBody);
+                break;
+            case RingBufferCommand::SetSuspendBypassedPlugins:
+                bodySize = sizeof(SetSuspendBypassedPluginsBody);
+                break;
+            case RingBufferCommand::AckVuUpdate:
+                bodySize = sizeof(bool);
+                break;
+            case RingBufferCommand::AckMonitorPortUpdate:
+            case RingBufferCommand::AckMidiProgramChange:
+            case RingBufferCommand::AckMidiSnapshotRequest:
+                bodySize = sizeof(int64_t);
+                break;
+            case RingBufferCommand::SetBypass:
+                bodySize = sizeof(SetBypassBody);
+                break;
+            case RingBufferCommand::SetMonitorPortSubscription:
+            case RingBufferCommand::LoadSnapshot:
+            case RingBufferCommand::SetVuSubscriptions:
+            case RingBufferCommand::ReplaceEffect:
+                bodySize = sizeof(void *); // reclaimed by Close() through the host-side lists.
+                break;
+            default:
+                return; // unknown: stop; the ring is reset by Close().
+            }
+            uint8_t body[64];
+            static_assert(sizeof(SetControlValueBody) <= sizeof(body) && sizeof(SetBypassBody) <= sizeof(body));
+            if (realtimeReader.readSpace() < bodySize)
+            {
+                return;
+            }
+            realtimeReader.read(bodySize, body);
+        }
     }
 
     void ZeroBuffer(float *buffer, size_t nframes)
@@ -636,6 +825,12 @@ private:
             }
         }
     }
+    // Host side (guarded by mutex): every VU configuration / monitor port subscription sent to
+    // the audio thread and not yet released. The audio thread releases them in send order, so a
+    // release whose message was lost is reclaimed by the next one, or by Close().
+    InOrderReleaseList<RealtimeVuBuffers> vuConfigurationsSent;
+    InOrderReleaseList<RealtimeMonitorPortSubscriptions> monitorPortSubscriptionsSent;
+
     RealtimeVuBuffers *realtimeVuBuffers = nullptr;
     size_t vuSamplesPerUpdate = 0;
     int64_t realtimeVuSamplesRemaining = 0;
@@ -742,6 +937,10 @@ private:
         }
         reEntered = true;
 
+        // Releases (EffectReplaced, FreeVuSubscriptions, ...) that found the output ring full
+        // in an earlier cycle. Fixed-size, allocation-free.
+        realtimeWriter.RetryReleases();
+
         while (true)
         {
             RingBufferCommand command;
@@ -773,6 +972,16 @@ private:
                 SetVolumeBody body;
                 realtimeReader.readComplete(&body);
                 this->realtimeActivePedalboard->SetOutputVolume(body.value);
+                break;
+            }
+            case RingBufferCommand::SetSuspendBypassedPlugins:
+            {
+                SetSuspendBypassedPluginsBody body;
+                realtimeReader.readComplete(&body);
+                if (this->realtimeActivePedalboard)
+                {
+                    this->realtimeActivePedalboard->SetSuspendBypassedPlugins(body.value);
+                }
                 break;
             }
             case RingBufferCommand::ParameterRequest:
@@ -914,18 +1123,32 @@ private:
         auto &effects = this->realtimeActivePedalboard->GetEffects();
         snapshot->Apply(effects);
     }
+    // Called by PiPedalModel with its mutex held (lock order model -> AudioHost). Check `active` and
+    // write under `mutex`, like the other host-side senders, so the write can't race the ring resets
+    // in Close()/Open(). An ack dropped while stopped is harmless: Open() clears the audio thread's
+    // pending MIDI request state.
     virtual void AckMidiProgramRequest(uint64_t requestId)
     {
+        std::lock_guard guard(mutex);
+        if (!active)
+            return;
         hostWriter.AckMidiProgramRequest(requestId);
     }
     virtual void AckSnapshotRequest(uint64_t snapshotRequestId)
     {
+        std::lock_guard guard(mutex);
+        if (!active)
+            return;
         hostWriter.AckMidiSnapshotRequest(snapshotRequestId);
     }
 
     void OnMidiValueChanged(uint64_t instanceId, int controlIndex, float value)
     {
-        realtimeWriter.MidiValueChanged(instanceId, controlIndex, value);
+        // Audio thread, inside realtimeActivePedalboard->OnMidiMessage(). The source effect lets the
+        // host ignore values from an outgoing pedalboard (see IsMidiValueFromInstalledPedalboard()).
+        // GetEffect() is a short scan, allocation-free.
+        IEffect *sourceEffect = this->realtimeActivePedalboard ? this->realtimeActivePedalboard->GetEffect(instanceId) : nullptr;
+        realtimeWriter.MidiValueChanged(instanceId, controlIndex, value, sourceEffect, this->realtimeActivePedalboard);
     }
     static void fnMidiValueChanged(void *data, uint64_t instanceId, int controlIndex, float value)
     {
@@ -980,7 +1203,7 @@ private:
         uint8_t midiCommand = (uint8_t)(event.buffer[0] & 0xF0);
         if (midiCommand == 0xC0) // midi program change.
         {
-            this->deferredMidiMessageCount = 0; // we can discard previous control changes.
+            this->deferredMidi.Clear(); // we can discard previous control changes.
             midiProgramChangePending = true;
 
             this->realtimeWriter.OnMidiProgramChange(++(this->midiProgramChangeId), selectedBank, event.buffer[1]);
@@ -991,21 +1214,21 @@ private:
         }
         else if (this->nextBankMidiBinding.IsTriggered(event))
         {
-            this->deferredMidiMessageCount = 0; // we can discard previous control changes.
+            this->deferredMidi.Clear(); // we can discard previous control changes.
             midiProgramChangePending = true;
 
             this->realtimeWriter.OnNextMidiBank(++(this->midiProgramChangeId), 1);
         }
         else if (this->prevBankMidiBinding.IsTriggered(event))
         {
-            this->deferredMidiMessageCount = 0; // we can discard previous control changes.
+            this->deferredMidi.Clear(); // we can discard previous control changes.
             midiProgramChangePending = true;
 
             this->realtimeWriter.OnNextMidiBank(++(this->midiProgramChangeId), -1);
         }
         else if (nextPresetMidiBinding.IsTriggered(event))
         {
-            this->deferredMidiMessageCount = 0; // we can discard previous control changes.
+            this->deferredMidi.Clear(); // we can discard previous control changes.
             midiProgramChangePending = true;
 
             midiProgramChangePending = true;
@@ -1013,19 +1236,19 @@ private:
         }
         else if (prevPresetMidiBinding.IsTriggered(event))
         {
-            this->deferredMidiMessageCount = 0; // we can discard previous control changes.
+            this->deferredMidi.Clear(); // we can discard previous control changes.
             midiProgramChangePending = true;
             this->realtimeWriter.OnNextMidiProgram(++(this->midiProgramChangeId), -1);
         }
         else if (nextSnapshotMidiBinding.IsTriggered(event))
         {
-            this->deferredMidiMessageCount = 0; // we can discard previous control changes.
+            this->deferredMidi.Clear(); // we can discard previous control changes.
             midiProgramChangePending = true;
             this->realtimeWriter.OnNextMidiSnapshot(++(this->midiProgramChangeId), 1);
         }
         else if (prevSnapshotMidiBinding.IsTriggered(event))
         {
-            this->deferredMidiMessageCount = 0; // we can discard previous control changes.
+            this->deferredMidi.Clear(); // we can discard previous control changes.
             midiProgramChangePending = true;
             this->realtimeWriter.OnNextMidiSnapshot(++(this->midiProgramChangeId), -1);
         }
@@ -1049,14 +1272,8 @@ private:
         else if (midiProgramChangePending)
         {
             // defer the message for processing after the program change has completed discarding messages that don't fit in our buffer.
-            if (event.size > 0 && event.size < 128 && event.size + 2 + this->deferredMidiMessageCount < DEFERRED_MIDI_BUFFER_SIZE)
-            {
-                this->deferredMidiMessages[deferredMidiMessageCount++] = (uint8_t)event.size;
-                for (size_t i = 0; i < event.size; ++i)
-                {
-                    this->deferredMidiMessages[deferredMidiMessageCount++] = event.buffer[i];
-                }
-            }
+            // discards messages that don't fit in our buffer.
+            this->deferredMidi.Push(event.buffer, event.size);
             return;
         }
         else if (this->snapshot1MidiBinding.IsTriggered(event))
@@ -1098,34 +1315,21 @@ private:
         // write all deferred midi messages.
         if (!midiProgramChangePending && !midiSnapshotRequestPending)
         {
-            for (size_t i = 0; i < deferredMidiMessageCount; /**/)
-            {
-                int8_t deviceIndex = deferredMidiMessages[i++];
-                int8_t messageCount = deferredMidiMessages[i++];
-                event.size = messageCount;
-                event.buffer = deferredMidiMessages + i;
-                event.frame = 0;
-
-                ProcessMidiEvent(eventBufferWriter, iterator, event);
-
-                if (midiProgramChangePending)
+            deferredMidi.Replay(
+                [&](const uint8_t *bytes, size_t size)
                 {
-                    break;
-                }
-                i += messageCount;
+                    event.size = size;
+                    event.buffer = const_cast<uint8_t *>(bytes);
+                    event.frame = 0;
 
-                if (midiSnapshotRequestPending)
-                {
-                    // consume what has been written so far, leaving what follows for future processing.
-                    size_t remaining = deferredMidiMessageCount - i;
-                    for (size_t j = 0; j < remaining; ++i)
-                    {
-                        deferredMidiMessages[j] = deferredMidiMessages[i + j];
-                    }
-                    deferredMidiMessageCount = remaining;
-                    break;
-                }
-            }
+                    ProcessMidiEvent(eventBufferWriter, iterator, event);
+
+                    if (midiProgramChangePending)
+                        return DeferredMidiReplayResult::ProgramChangePending;
+                    if (midiSnapshotRequestPending)
+                        return DeferredMidiReplayResult::SnapshotPending;
+                    return DeferredMidiReplayResult::Continue;
+                });
         }
     }
     bool GetMainDriverBuffers(
@@ -1189,6 +1393,48 @@ private:
         Lv2Log::info("Audio stopped.");
         this->realtimeWriter.AudioTerminatedAbnormally();
     }
+    virtual void OnProcessCommandsOnly() override
+    {
+        // The device is gone; keep the command queue moving without running any DSP.
+        while (!ProcessInputCommands())
+        {
+            // a new pedalboard was installed. keep draining.
+        }
+        if (pParameterRequests != nullptr)
+        {
+            for (auto p = pParameterRequests; p != nullptr; p = p->pNext)
+            {
+                if (p->errorMessage == nullptr)
+                {
+                    p->errorMessage = "Audio stopped.";
+                }
+            }
+            this->realtimeWriter.ParameterRequestComplete(pParameterRequests);
+            pParameterRequests = nullptr;
+        }
+    }
+    virtual void OnProcessCommandsWhileRestarting() override
+    {
+        // Audio thread, parked while rtsvc restarts the device. Apply commands (pedalboard
+        // swaps, control values, subscriptions) as they arrive. Parameter requests stay queued
+        // in pParameterRequests: the next OnProcess() serves them, or OnProcessCommandsOnly()
+        // fails them if the restart fails.
+        while (!ProcessInputCommands())
+        {
+            // a new pedalboard was installed. keep draining.
+        }
+    }
+
+    virtual bool RequestDriverRestart() override
+    {
+        // Audio thread. Non-blocking: one write to the output ring, picked up by rtsvc.
+        if (!serviceThreadRunning.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+        return this->realtimeWriter.AlsaRestartRequested();
+    }
+
     virtual void OnAudioTerminated() override
     {
         this->active = false;
@@ -1372,6 +1618,8 @@ private:
     }
     virtual void OnProcess(size_t nframes)
     {
+        // Wake rtsvc at most once per audio cycle, after everything the cycle writes.
+        RealtimeWakeBatch wakeBatch{this->realtimeWriter};
         try
         {
             float *restrict in, *restrict out;
@@ -1434,6 +1682,10 @@ public:
           atomConverter(pHost->GetMapFeature())
     {
         realtimeAtomBuffer.resize(32 * 1024);
+        // A host message queued behind a full ring: wake rtsvc so it starts retrying at once,
+        // rather than at the end of a (up to 30 s) wait begun while nothing was pending.
+        hostWriter.SetOnPendingStarted([this]()
+                                       { this->outputRingBuffer.kickReader(); });
         lv2_atom_forge_init(&inputWriterForge, pHost->GetMapFeature().GetMap());
 
         cpuTemperatureMonitor = CpuTemperatureMonitor::Get();
@@ -1498,10 +1750,74 @@ public:
     std::vector<uint8_t> realtimeAtomBuffer;
 
     bool terminateThread;
+
+    // True while ThreadProc (rtsvc) is servicing the output ring. The audio thread only
+    // hands restart requests to rtsvc while it is there to take them.
+    std::atomic<bool> serviceThreadRunning{false};
+
+    int realtimeStatisticsMessagesGiven = 0;
+
+    static constexpr std::chrono::milliseconds PENDING_RETRY_INTERVAL{10};
+
+    // rtsvc: report what the audio thread counted but must not log itself.
+    void LogRealtimeStatistics()
+    {
+        if (realtimeStatisticsMessagesGiven >= 60) // limit how much log file clutter we generate.
+        {
+            return;
+        }
+        bool logged = false;
+        uint64_t droppedWrites = realtimeWriter.TakeDroppedWrites();
+        if (droppedWrites != 0)
+        {
+            Lv2Log::error(SS("Audio service ring buffer full: " << droppedWrites << " message(s) from the audio thread dropped."));
+            logged = true;
+        }
+        uint64_t lostReleases = realtimeWriter.TakeLostReleases();
+        if (lostReleases != 0)
+        {
+            Lv2Log::error(SS("Audio service ring buffer full: " << lostReleases << " release message(s) lost (objects are reclaimed by later releases or on close)."));
+            logged = true;
+        }
+        uint64_t droppedHostWrites = hostWriter.TakeDroppedWrites();
+        if (droppedHostWrites != 0)
+        {
+            Lv2Log::error(SS("Audio thread ring buffer full: " << droppedHostWrites << " message(s) to the audio thread dropped."));
+            logged = true;
+        }
+        uint64_t deferredHostWrites = hostWriter.TakeDeferredWrites();
+        if (deferredHostWrites != 0)
+        {
+            Lv2Log::warning(SS("Audio thread ring buffer full: " << deferredHostWrites << " message(s) to the audio thread delayed."));
+            logged = true;
+        }
+        uint64_t droppedPatchProperties = Lv2Effect::TakeDroppedPathPatchProperties();
+        if (droppedPatchProperties != 0)
+        {
+            Lv2Log::warning(SS("Plugin path property updates too large for the reserved buffer: " << droppedPatchProperties << " update(s) dropped."));
+            logged = true;
+        }
+        if (audioDriver)
+        {
+            logged = audioDriver->LogRealtimeStatistics() || logged;
+        }
+        if (logged)
+        {
+            ++realtimeStatisticsMessagesGiven;
+        }
+    }
+
     void ThreadProc()
     {
         SetThreadName("rtsvc");
-        SetThreadPriority(SchedulerPriority::AudioService);
+        SetAudioServiceThreadScheduling();
+
+        struct RunningFlag
+        {
+            std::atomic<bool> &flag;
+            RunningFlag(std::atomic<bool> &flag) : flag(flag) { flag = true; }
+            ~RunningFlag() { flag = false; }
+        } runningFlag{this->serviceThreadRunning};
 
         int underrunMessagesGiven = 0;
         try
@@ -1524,14 +1840,26 @@ public:
                 // wait for an event.
                 // 0 -> ready. -1: timed out. -2: closing.
 
-                auto result = hostReader.wait_until(sizeof(RingBufferCommand), waitTime);
+                // While messages to the audio thread are waiting for ring space, wake up often
+                // enough to retry them: nothing else signals that the audio thread has made room.
+                clock_time wakeTime = waitTime;
+                if (hostWriter.HasPending())
+                {
+                    wakeTime = std::min(waitTime, clock::now() + PENDING_RETRY_INTERVAL);
+                }
+                auto result = hostReader.wait_until(sizeof(RingBufferCommand), wakeTime);
                 if (result == RingBufferStatus::Closed)
                 {
                     return;
                 }
-                else if (result == RingBufferStatus::TimedOut)
+                if (hostWriter.HasPending())
                 {
-                    // timeout.
+                    hostWriter.RetryPending();
+                }
+                // Periodic reporting. Checked on every wake, not only on timeout: while audio
+                // runs, VU traffic keeps the ring busy and the wait never times out.
+                if (clock::now() >= waitTime)
+                {
                     if (underruns != lastUnderrunCount)
                     {
                         if (underrunMessagesGiven < 60) // limit how much log file clutter we generate.
@@ -1541,7 +1869,12 @@ public:
                             ++underrunMessagesGiven;
                         }
                     }
-                    waitTime += waitPeriod;
+                    LogRealtimeStatistics();
+                    waitTime = clock::now() + waitPeriod;
+                }
+                if (result != RingBufferStatus::Ready) // TimedOut, or Kicked (pending host messages retried above).
+                {
+                    continue;
                 }
                 else
                 {
@@ -1571,52 +1904,14 @@ public:
 
                                 if (this->pNotifyCallbacks)
                                 {
-                                    this->pNotifyCallbacks->OnNotifyMidiValueChanged(body.instanceId, body.controlIndex, body.value);
+                                    this->pNotifyCallbacks->OnNotifyMidiValueChanged(body.instanceId, body.controlIndex, body.value, body.sourceEffect, body.sourcePedalboard);
                                 }
                             }
                             else if (command == RingBufferCommand::ParameterRequestComplete)
                             {
                                 RealtimePatchPropertyRequest *pRequest = nullptr;
                                 hostReader.read(&pRequest);
-
-                                std::shared_ptr<Lv2Pedalboard> currentpedalboard;
-
-                                {
-                                    std::lock_guard guard(mutex);
-                                    currentPedalboard = this->currentPedalboard;
-                                }
-
-                                while (pRequest != nullptr)
-                                {
-                                    auto pNext = pRequest->pNext;
-                                    if (pRequest->requestType == RealtimePatchPropertyRequest::RequestType::PatchGet)
-                                    {
-                                        if (pRequest->errorMessage == nullptr)
-                                        {
-                                            if (pRequest->GetSize() != 0)
-                                            {
-                                                IEffect *pEffect = currentPedalboard->GetEffect(pRequest->instanceId);
-                                                if (pEffect == nullptr)
-                                                {
-                                                    pRequest->errorMessage = "Effect no longer available.";
-                                                }
-                                                else
-                                                {
-                                                    pRequest->jsonResponse = AtomToJson((LV2_Atom *)pRequest->GetBuffer());
-                                                }
-                                            }
-                                            else
-                                            {
-                                                pRequest->errorMessage = "Plugin did not respond.";
-                                            }
-                                        }
-                                    }
-                                    if (pRequest->onPatchRequestComplete)
-                                    {
-                                        pRequest->onPatchRequestComplete(pRequest);
-                                    }
-                                    pRequest = pNext;
-                                }
+                                OnParameterRequestsComplete(pRequest);
                             }
                             else if (command == RingBufferCommand::SendMonitorPortUpdate)
                             {
@@ -1654,8 +1949,9 @@ public:
                             }
                             else if (command == RingBufferCommand::AtomOutput)
                             {
-                                uint64_t instanceId;
-                                hostReader.read(&instanceId);
+                                AtomOutputBody header;
+                                hostReader.read(&header);
+                                uint64_t instanceId = header.instanceId;
                                 size_t extraBytes;
                                 hostReader.read(&extraBytes);
                                 if (atomBuffer.size() < extraBytes)
@@ -1664,8 +1960,9 @@ public:
                                 }
                                 hostReader.read(extraBytes, &(atomBuffer[0]));
 
-                                IEffect *pEffect = currentPedalboard->GetEffect(instanceId);
-                                if (pEffect != nullptr && this->pNotifyCallbacks)
+                                // Whether the sender is still bound to instanceId is checked by the
+                                // receiver, against the pedalboard it has installed (OnPatchSetReply).
+                                if (header.sourceEffect != nullptr && this->pNotifyCallbacks)
                                 {
                                     LV2_Atom *atom = (LV2_Atom *)&atomBuffer[0];
                                     if (atom->type == uris.atom_Object)
@@ -1688,7 +1985,7 @@ public:
                                                 LV2_URID propertyUrid = ((LV2_Atom_URID *)property)->body;
                                                 if (this->pNotifyCallbacks)
                                                 {
-                                                    this->pNotifyCallbacks->OnPatchSetReply(instanceId, propertyUrid, value);
+                                                    this->pNotifyCallbacks->OnPatchSetReply(instanceId, header.sourceEffect, propertyUrid, value);
                                                 }
                                             }
                                         }
@@ -1699,13 +1996,15 @@ public:
                             {
                                 RealtimeVuBuffers *config;
                                 hostReader.read(&config);
-                                delete config;
+                                std::lock_guard guard(mutex);
+                                vuConfigurationsSent.Release(config); // and any earlier ones whose release was lost.
                             }
                             else if (command == RingBufferCommand::FreeMonitorPortSubscription)
                             {
                                 RealtimeMonitorPortSubscriptions *pSubscriptions;
                                 hostReader.read(&pSubscriptions);
-                                delete pSubscriptions;
+                                std::lock_guard guard(mutex);
+                                monitorPortSubscriptionsSent.Release(pSubscriptions);
                             }
                             else if (command == RingBufferCommand::EffectReplaced)
                             {
@@ -1724,6 +2023,23 @@ public:
                                 PatchPropertyWriter::Buffer *buffer = nullptr;
                                 hostReader.read(&buffer);
                                 OnPathPropertyReceived(buffer);
+                            }
+                            else if (command == RingBufferCommand::AlsaRestartRequested)
+                            {
+                                int64_t unused;
+                                hostReader.read(&unused);
+                                // The audio thread is parked until this completes. audioDriver is
+                                // valid here: Close() calls audioDriver->Close() *before*
+                                // StopReaderThread(), but only frees the driver object
+                                // (audioDriver = nullptr) after rtsvc has been joined. A request
+                                // serviced after the driver was deactivated/closed is a no-op:
+                                // ServiceRestartRequest() serialises with AlsaCloseAudio() on
+                                // restartMutex, and either finds no claimable request or sees
+                                // terminateAudio and completes it as failed without reopening.
+                                if (audioDriver)
+                                {
+                                    audioDriver->ServiceRestartRequest();
+                                }
                             }
                             else if (command == RingBufferCommand::AudioTerminatedAbnormally)
                             {
@@ -1870,6 +2186,12 @@ public:
         this->realtimeReader.Reset();
         this->realtimeWriter.Reset();
 
+        // The audio thread isn't running yet. Acks of MIDI requests made before a restart may have been lost
+        // with the old ring buffers; don't defer MIDI forever waiting for them.
+        this->deferredMidi.Clear();
+        this->midiProgramChangePending = false;
+        this->midiSnapshotRequestPending = false;
+
         this->channelSelection = channelSelection_;
 
         StartReaderThread();
@@ -1908,6 +2230,7 @@ public:
         {
             pNotifyCallbacks->OnNotifyPathPatchPropertyReceived(
                 buffer->instanceId,
+                buffer->sourceEffect,
                 buffer->patchPropertyUrid,
                 (LV2_Atom *)(buffer->memory.data()));
         }
@@ -1924,7 +2247,10 @@ public:
                 if ((*it).get() == pPedalboard)
                 {
                     // erase it, relinquishing shared_ptr ownership, usually deleting the object.
-                    activePedalboards.erase(it);
+                    // activePedalboards is in the order the pedalboards were sent, and the audio
+                    // thread releases them in that order, so every earlier entry has been released
+                    // too (its EffectReplaced message was lost or is still queued); erase those as well.
+                    activePedalboards.erase(activePedalboards.begin(), it + 1);
                     return;
                 }
             }
@@ -1936,11 +2262,38 @@ public:
         std::lock_guard guard(mutex);
 
         this->currentPedalboard = pedalboard;
+        if (pedalboard)
+        {
+            // not yet visible to the audio thread, so a plain write is safe.
+            pedalboard->SetSuspendBypassedPlugins(this->suspendBypassedPlugins);
+        }
         if (active && pedalboard)
         {
             pedalboard->Activate();
             this->activePedalboards.push_back(pedalboard);
             hostWriter.ReplaceEffect(pedalboard.get());
+        }
+    }
+
+    bool suspendBypassedPlugins = false; // protected by mutex.
+
+    virtual void SetSuspendBypassedPlugins(bool value) override
+    {
+        std::lock_guard guard(mutex);
+        this->suspendBypassedPlugins = value;
+        if (this->currentPedalboard)
+        {
+            if (active)
+            {
+                // the audio thread applies it to the active pedalboard (ring buffer order
+                // guarantees it lands after any pending ReplaceEffect).
+                hostWriter.SetSuspendBypassedPlugins(value);
+            }
+            else
+            {
+                // not running on the audio thread: assign directly.
+                this->currentPedalboard->SetSuspendBypassedPlugins(value);
+            }
         }
     }
 
@@ -2027,11 +2380,6 @@ public:
     }
 
     virtual void SetAlsaSequencerConfiguration(const AlsaSequencerConfiguration &alsaSequencerConfiguration) override;
-
-    void OnNotifyPathPatchPropertyReceived(
-        int64_t instanceId,
-        const std::string &pathPatchPropertyUri,
-        const std::string &jsonAtom) override;
 
     void OnFreeSnapshot(IndexedSnapshot *snapshot)
     {
@@ -2159,6 +2507,8 @@ public:
                     }
                 }
 
+                // Track before sending (both under mutex): the list order must be the send order.
+                this->vuConfigurationsSent.Add(vuConfig);
                 this->hostWriter.SetVuSubscriptions(vuConfig);
             }
         }
@@ -2184,6 +2534,8 @@ public:
     }
     virtual void SetMonitorPortSubscriptions(const std::vector<MonitorPortSubscription> &subscriptions)
     {
+        // mutex keeps monitorPortSubscriptionsSent in send order.
+        std::lock_guard guard(mutex);
         if (!active)
             return;
         if (this->currentPedalboard == nullptr)
@@ -2204,6 +2556,7 @@ public:
                         MakeRealtimeSubscription(subscriptions[i]));
                 }
             }
+            this->monitorPortSubscriptionsSent.Add(pSubscriptions);
             this->hostWriter.SetMonitorPortSubscriptions(pSubscriptions);
         }
     }
@@ -2309,13 +2662,19 @@ public:
 
     virtual void sendRealtimeParameterRequest(RealtimePatchPropertyRequest *pParameterRequest)
     {
-        if (!active)
         {
-            pParameterRequest->errorMessage = "Not active.";
-            pParameterRequest->onPatchRequestComplete(pParameterRequest);
-            return;
+            // Check and write under the mutex: Close() clears `active` under it before draining
+            // the rings, so a request written here is always found (and completed) by Close().
+            std::lock_guard guard(mutex);
+            if (active)
+            {
+                this->hostWriter.ParameterRequest(pParameterRequest);
+                return;
+            }
         }
-        this->hostWriter.ParameterRequest(pParameterRequest);
+        // outside the mutex: the callback may call back into the audio host.
+        pParameterRequest->errorMessage = "Not active.";
+        pParameterRequest->onPatchRequestComplete(pParameterRequest);
     }
 
     virtual JackHostStatus getJackStatus()
@@ -2481,26 +2840,6 @@ AudioHost *AudioHost::CreateInstance(IHost *pHost)
 //     }
 //     return changed;
 // }
-
-void AudioHostImpl::OnNotifyPathPatchPropertyReceived(
-    int64_t instanceId,
-    const std::string &pathPatchPropertyUri,
-    const std::string &jsonAtom)
-{
-    if (this->currentPedalboard)
-    {
-        IEffect *effect = this->currentPedalboard->GetEffect(instanceId);
-        if (!effect)
-        {
-            return;
-        }
-        if (effect->IsLv2Effect())
-        {
-            Lv2Effect *lv2Effect = (Lv2Effect *)effect;
-            lv2Effect->SetPathPatchProperty(pathPatchPropertyUri, jsonAtom);
-        }
-    }
-}
 
 bool AudioHostImpl::UpdatePluginState(PedalboardItem &pedalboardItem)
 {

@@ -29,6 +29,7 @@
 #include <iostream>
 #include <algorithm>
 #include <unistd.h>
+#include <filesystem>
 
 #include "AlsaDriver.hpp"
 #include "ChannelRouterSettings.hpp"
@@ -89,6 +90,13 @@ public:
     {
 
         test::AlsaFormatEncodeDecodeTest(this);
+
+        // The streaming part needs the developer's MOTU M2 audio interface.
+        if (!std::filesystem::exists("/proc/asound/M2"))
+        {
+            WARN("ALSA card hw:M2 (MOTU M2) is not present. Skipping the streaming test.");
+            return;
+        }
 
         JackServerSettings serverSettings("hw:M2","hw:M2", 48000, 32, 3);
 

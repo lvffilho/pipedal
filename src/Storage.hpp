@@ -18,6 +18,7 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #pragma once
+#include <functional>
 #include <filesystem>
 #include <iostream>
 #include "Pedalboard.hpp"
@@ -56,6 +57,9 @@ class UserSettings {
 public:
     std::string governor_ = "performance";
     bool showStatusMonitor_ = true;
+    // Skip running plugins whose bypass crossfade has completed. Off by default:
+    // a resumed plugin's tails/delay lines are stale (see BypassSuspend.hpp).
+    bool suspendBypassedPlugins_ = false;
     DECLARE_JSON_MAP(UserSettings);
 };
 
@@ -136,6 +140,17 @@ private:
     ChannelRouterSettings::ptr LoadChannelRouterSettings();
 
 public:
+    // Ensure `file` holds valid content (as judged by isValid). If it is missing, empty
+    // or invalid, restore it from "<file>.tmp" or the "<file>.$$$" backup, whichever
+    // validates (in that order). Returns true if `file` is valid afterwards.
+    // Empty (or unreadable) candidates are skipped.
+    static bool RecoverFileFromBackup(
+        const std::filesystem::path &file,
+        const std::function<bool(const std::filesystem::path &)> &isValid);
+
+    // Delete the autosaved/shutdown "current preset" file (e.g. after the edit was saved or abandoned).
+    void DiscardCurrentPreset();
+
     Storage();
     void Initialize(PiPedalModel *model);
     void CreateBank(const std::string & name);
@@ -274,6 +289,8 @@ public:
 
     void SetShowStatusMonitor(bool show);
     bool GetShowStatusMonitor() const;
+    void SetSuspendBypassedPlugins(bool value);
+    bool GetSuspendBypassedPlugins() const;
     void SetSystemMidiBindings(const std::vector<MidiBinding>&bindings);
     std::vector<MidiBinding> GetSystemMidiBindings();
     void DeleteSampleFile(const std::filesystem::path &fileName);

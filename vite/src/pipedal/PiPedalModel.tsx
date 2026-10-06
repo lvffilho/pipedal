@@ -26,7 +26,7 @@ import { ObservableProperty } from './ObservableProperty';
 import { Pedalboard, PedalboardItem, ControlValue, Snapshot } from './Pedalboard'
 import PluginClass from './PluginClass';
 import ScreenOrientation from './ScreenOrientation';
-import PiPedalSocket, { PiPedalMessageHeader } from './PiPedalSocket';
+import PiPedalSocket, { PiPedalMessageHeader, isDisconnectedError } from './PiPedalSocket';
 import { Tone3000DownloadHandler } from './Tone3000Downloader';
 import Tone3000DownloadType from './Tone3000DownloadType';
 import { nullCast } from './Utility'
@@ -51,6 +51,7 @@ import { getDefaultModGuiPreference } from './ModGuiHost';
 import ChannelRouterSettings from './ChannelRouterSettings';
 import Tone3000DownloadProgress from './Tone3000DownloadProgress';
 import { Model, Tone } from './t3k/types';
+import { Tone3000AuthStatus, Tone3000AccessTokenReply } from './t3k/tone3000-auth';
 import { ModelSelectionDialogParams } from './ModelSelectionDialog';
 
 
@@ -140,7 +141,7 @@ export class HostVersion {
     constructor(hostVersion: string) {
         this.versionString = hostVersion;
 
-        let pos = hostVersion.indexOf(":");
+        const pos = hostVersion.indexOf(":");
 
         let remainder: string;
         if (pos >= 0) {
@@ -157,7 +158,7 @@ export class HostVersion {
             if (versionString.startsWith('v')) {
                 versionString = versionString.substring(1).trim();
             }
-            let releaseTypePos = versionString.indexOf("-");
+            const releaseTypePos = versionString.indexOf("-");
             if (releaseTypePos >= 0) {
                 this.releaseType = versionString.substring(releaseTypePos + 1).trim();
                 versionString = versionString.substring(0, releaseTypePos).trim();
@@ -379,7 +380,7 @@ export class PresetIndexEntry {
         return this;
     }
     static deserialize_array(input: any): PresetIndexEntry[] {
-        let result: PresetIndexEntry[] = [];
+        const result: PresetIndexEntry[] = [];
         for (let i = 0; i < input.length; ++i) {
             result[i] = new PresetIndexEntry().deserialize(input[i]);
         }
@@ -427,7 +428,7 @@ export class PresetIndex {
         return null;
     }
     getSelectedText(): string {
-        let item = this.getItem(this.selectedInstanceId);
+        const item = this.getItem(this.selectedInstanceId);
         if (item === null) return "";
 
         if (this.presetChanged) {
@@ -437,22 +438,22 @@ export class PresetIndex {
         }
     }
     addItem(instanceId: number, name: string): number {
-        let newItem: PresetIndexEntry = new PresetIndexEntry();
+        const newItem: PresetIndexEntry = new PresetIndexEntry();
         newItem.instanceId = instanceId;
         newItem.name = name;
         this.presets.push(newItem);
         return newItem.instanceId;
     }
     movePreset(from: number, to: number) {
-        let newElements = this.presets;
-        let t = newElements[from];
+        const newElements = this.presets;
+        const t = newElements[from];
         newElements.splice(from, 1);
         newElements.splice(to, 0, t);
 
     }
     deleteItem(instanceId: number): number {
         for (let i = 0; i < this.presets.length; ++i) {
-            let preset = this.presets[i];
+            const preset = this.presets[i];
             if (preset.instanceId === instanceId) {
                 this.presets.splice(i, 1);
                 if (i < this.presets.length) {
@@ -573,6 +574,7 @@ export class PiPedalModel //implements PiPedalModel
     alertMessage: ObservableProperty<string> = new ObservableProperty<string>("");
 
     showStatusMonitor: ObservableProperty<boolean> = new ObservableProperty<boolean>(true);
+    suspendBypassedPlugins: ObservableProperty<boolean> = new ObservableProperty<boolean>(false);
 
     pedalboard: ObservableProperty<Pedalboard> = new ObservableProperty<Pedalboard>(new Pedalboard());
     presetChanged: ObservableProperty<boolean> = new ObservableProperty<boolean>(false);
@@ -612,6 +614,8 @@ export class PiPedalModel //implements PiPedalModel
 
     tone3000Downloading: ObservableProperty<boolean> = new ObservableProperty<boolean>(false);
     tone3000DownloadProgress: ObservableProperty<Tone3000DownloadProgress | null> = new ObservableProperty<Tone3000DownloadProgress | null>(null);
+    // TONE3000 account session held by the server (device-code sign-in).
+    tone3000AuthStatus: ObservableProperty<Tone3000AuthStatus> = new ObservableProperty<Tone3000AuthStatus>(new Tone3000AuthStatus());
 
     uiPluginsByUri: Map<string, UiPlugin> = new Map<string, UiPlugin>();
 
@@ -668,7 +672,7 @@ export class PiPedalModel //implements PiPedalModel
         }
     }
 
-    onSocketReconnecting(retry: number, maxRetries: number): boolean {
+    onSocketReconnecting(retry: number): boolean {
         this.cancelExpectDisconnectTimer();
         if (this.isClosed) return false;
         //if (retry !== 0) {
@@ -702,13 +706,13 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     compareFavorites(left: FavoritesList, right: FavoritesList): boolean {
-        for (let key of Object.keys(left)) {
+        for (const key of Object.keys(left)) {
             if (!right[key]) {
                 return false;
             }
         }
 
-        for (let key of Object.keys(right)) {
+        for (const key of Object.keys(right)) {
             if (!left[key]) {
                 return false;
             }
@@ -733,13 +737,77 @@ export class PiPedalModel //implements PiPedalModel
             "sha256Base64url", intput);
 
     }
+    async t3kRefreshAuthStatus(): Promise<Tone3000AuthStatus> {
+        if (this.webSocket === undefined) {
+            throw new Error("Server disconnected.");
+        }
+        const status = new Tone3000AuthStatus().deserialize(
+            await this.webSocket.request<any>("t3kAuthGetStatus", {}));
+        this.tone3000AuthStatus.set(status);
+        return status;
+    }
+
+    /** Start "Sign in with phone". Progress arrives via tone3000AuthStatus. */
+    async t3kStartDeviceSignIn(): Promise<void> {
+        if (this.webSocket === undefined) {
+            throw new Error("Server disconnected.");
+        }
+        const status = new Tone3000AuthStatus().deserialize(
+            await this.webSocket.request<any>("t3kAuthStartDeviceFlow", {}));
+        this.tone3000AuthStatus.set(status);
+    }
+
+    async t3kCancelDeviceSignIn(): Promise<void> {
+        if (this.webSocket === undefined) {
+            return;
+        }
+        await this.webSocket.request<boolean>("t3kAuthCancelDeviceFlow", {});
+    }
+
+    async t3kSignOut(): Promise<void> {
+        if (this.webSocket === undefined) {
+            throw new Error("Server disconnected.");
+        }
+        await this.webSocket.request<boolean>("t3kAuthSignOut", {});
+    }
+
+    /** A short-lived TONE3000 access token from the server's session (refreshed there as needed). */
+    async t3kGetAccessToken(forceRefresh: boolean = false, rejectedAccessToken: string = ""): Promise<string> {
+        if (this.webSocket === undefined) {
+            throw new Error("Server disconnected.");
+        }
+        // rejectedAccessToken: the token a 401 was received for, so the server doesn't hand it back.
+        const reply = await this.webSocket.request<Tone3000AccessTokenReply>(
+            "t3kAuthGetAccessToken", { forceRefresh: forceRefresh, rejectedAccessToken: rejectedAccessToken });
+        if (!reply.ok) {
+            throw new Error(reply.error || "Not signed in to TONE3000.");
+        }
+        return reply.accessToken;
+    }
+
+    /** Download a tone by id using the server's TONE3000 session (no popup). */
+    downloadTone3000ToneWithServerAuth(toneId: string | number, downloadType: Tone3000DownloadType, downloadPath: string, modelIds?: number[], allModels: boolean = false): Promise<void> {
+        if (this.tone3000DownloadHandler === null) {
+            this.tone3000DownloadHandler = new Tone3000DownloadHandler(this);
+        }
+        return this.tone3000DownloadHandler.downloadToneWithServerAuth(toneId, downloadType, downloadPath, modelIds, allModels);
+    }
+
+    /** TONE3000 catalog requests, proxied by the server (which holds the session). See t3k/tone3000-catalog.ts. */
+    async t3kCatalogRequest<T>(message: string, body: any): Promise<T> {
+        if (this.webSocket === undefined) {
+            throw new Error("Server disconnected.");
+        }
+        return await this.webSocket.request<T>(message, body);
+    }
+
     async pingTone3000Server(): Promise<boolean> {
         if (this.webSocket === undefined) {
             return false;
 
         }
         try {
-            let result = await this.webSocket.request<boolean>("pingTone3000Server", {});
+            const result = await this.webSocket.request<boolean>("pingTone3000Server", {});
             return result;
         } catch (error) {
             console.log("Error pinging TONE3000 Server on PiPedal server: " + getErrorMessage(error));
@@ -760,7 +828,7 @@ export class PiPedalModel //implements PiPedalModel
         }
     }
     private cancelTone3000Download(): void {
-        let downloadProgress = this.tone3000DownloadProgress.get();
+        const downloadProgress = this.tone3000DownloadProgress.get();
         if (downloadProgress !== null) {
             if (this.tone3000DownloadHandler) {
 
@@ -816,13 +884,33 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     private updateEnabledItems(pedalboard: Pedalboard) {
-        for (let item of pedalboard.itemsGenerator()) {
+        for (const item of pedalboard.itemsGenerator()) {
             this.updatePedalboardItemEnabled(item.instanceId, item.isEnabled);
             this.updatePedalboardItemUseModUi(item.instanceId, item.useModUi);
         }
     }
 
+    // Control value changes are applied to the current pedalboard in place and published to
+    // structural observers at most once per animation frame.
+    private pedalboardPublishHandle: number | null = null;
+    private cancelPendingPedalboardPublish() {
+        if (this.pedalboardPublishHandle !== null) {
+            window.cancelAnimationFrame(this.pedalboardPublishHandle);
+            this.pedalboardPublishHandle = null;
+        }
+    }
+    private schedulePedalboardPublish() {
+        if (this.pedalboardPublishHandle !== null) return;
+        this.pedalboardPublishHandle = window.requestAnimationFrame(() => {
+            this.pedalboardPublishHandle = null;
+            const pedalboard = this.pedalboard.get();
+            if (pedalboard) {
+                this.pedalboard.set(pedalboard.clone());
+            }
+        });
+    }
     private setModelPedalboard(pedalboard: Pedalboard) {
+        this.cancelPendingPedalboardPublish(); // this publication supersedes any pending one.
         this.removeInvalidSidechains(pedalboard);
         this.pedalboard.set(pedalboard);
         this.selectedSnapshot.set(pedalboard.selectedSnapshot);
@@ -830,9 +918,9 @@ export class PiPedalModel //implements PiPedalModel
     }
     onSocketMessage(header: PiPedalMessageHeader, body?: any) {
 
-        let message = header.message;
+        const message = header.message;
         if (message === "onControlChanged") {
-            let controlChangedBody = body as ControlChangedBody;
+            const controlChangedBody = body as ControlChangedBody;
             if (body.clientId !== this.clientId) {
                 this.lastControlMessageWasSentbyMe = false;
             }
@@ -848,20 +936,20 @@ export class PiPedalModel //implements PiPedalModel
             );
         }
         else if (message === "onOutputVolumeChanged") {
-            let value = body as number;
+            const value = body as number;
             this._setOutputVolume(value, false);
         }
         else if (message === "onInputVolumeChanged") {
-            let value = body as number;
+            const value = body as number;
             this._setInputVolume(value, false);
         } else if (message === "onLv2StateChanged") {
 
-            let instanceId = body.instanceId as number;
-            let state = body.state as [boolean, any];
+            const instanceId = body.instanceId as number;
+            const state = body.state as [boolean, any];
 
             this.onLv2StateChanged(instanceId, state);
         } else if (message === "onVst3ControlChanged") {
-            let controlChangedBody = body as Vst3ControlChangedBody;
+            const controlChangedBody = body as Vst3ControlChangedBody;
             this._setVst3PedalboardControlValue(
                 controlChangedBody.instanceId,
                 controlChangedBody.symbol,
@@ -871,9 +959,9 @@ export class PiPedalModel //implements PiPedalModel
             );
 
         } else if (message === "onMonitorPortOutput") {
-            let monitorPortOutputBody = body as MonitorPortOutputBody;
+            const monitorPortOutputBody = body as MonitorPortOutputBody;
             for (let i = 0; i < this.monitorPortSubscriptions.length; ++i) {
-                let subscription = this.monitorPortSubscriptions[i];
+                const subscription = this.monitorPortSubscriptions[i];
                 if (subscription.subscriptionHandle === monitorPortOutputBody.subscriptionHandle) {
                     subscription.onUpdated(body.value);
                     break;
@@ -883,23 +971,26 @@ export class PiPedalModel //implements PiPedalModel
                 this.webSocket?.reply(header.replyTo, "onMonitorPortOutput", true);
             }
         } else if (message === "onFavoritesChanged") {
-            let favorites = body as FavoritesList;
+            const favorites = body as FavoritesList;
             if (!this.compareFavorites(favorites, this.favorites.get())) {
                 this.favorites.set(favorites);
             }
         } else if (message === "onShowStatusMonitorChanged") {
-            let value = body as boolean;
+            const value = body as boolean;
             this.showStatusMonitor.set(value);
+        } else if (message === "onSuspendBypassedPluginsChanged") {
+            const value = body as boolean;
+            this.suspendBypassedPlugins.set(value);
         } else if (message === "onChannelRouterSettingsChanged") {
-            let channelRouterSettingChangedBody = body as ChannelRouterSettingsChangedBody;
-            let channelRouterSettings = new ChannelRouterSettings().deserialize(
+            const channelRouterSettingChangedBody = body as ChannelRouterSettingsChangedBody;
+            const channelRouterSettings = new ChannelRouterSettings().deserialize(
                 channelRouterSettingChangedBody.channelRouterSettings);
             this.channelRouterSettings.set(channelRouterSettings);
         } else if (message === "onSnapshotModified") {
-            let { snapshotIndex, modified } = (body as { snapshotIndex: number, modified: boolean });
-            let snapshots = this.pedalboard.get().snapshots;
+            const { snapshotIndex, modified } = (body as { snapshotIndex: number, modified: boolean });
+            const snapshots = this.pedalboard.get().snapshots;
             if (snapshotIndex >= 0 && snapshotIndex < snapshots.length) {
-                let snapshot = snapshots[snapshotIndex]
+                const snapshot = snapshots[snapshotIndex]
                 if (snapshot) {
                     if (snapshot.isModified !== modified) {
                         snapshot.isModified = modified;
@@ -908,25 +999,25 @@ export class PiPedalModel //implements PiPedalModel
                 }
             }
         } else if (message === "onSelectedSnapshotChanged") {
-            let selectedSnapshot = body as number;
+            const selectedSnapshot = body as number;
             this.pedalboard.get().selectedSnapshot = selectedSnapshot;
             this.selectedSnapshot.set(selectedSnapshot);
         } else if (message === "onPresetChanged") {
-            let changed = body as boolean;
+            const changed = body as boolean;
 
             if (this.presets.get().presetChanged !== changed) {
-                let newPresets = this.presets.get().clone(); // deep clone.
+                const newPresets = this.presets.get().clone(); // deep clone.
                 newPresets.presetChanged = changed;
                 this.presets.set(newPresets);
             }
             this.presetChanged.set(changed);
         } else if (message === "onPresetsChanged") {
-            let presetsChangedBody = body as PresetsChangedBody;
-            let presets = new PresetIndex().deserialize(presetsChangedBody.presets);
+            const presetsChangedBody = body as PresetsChangedBody;
+            const presets = new PresetIndex().deserialize(presetsChangedBody.presets);
             this.presets.set(presets);
             this.presetChanged.set(presets.presetChanged);
         } else if (message === "onPluginPresetsChanged") {
-            let pluginUri = body as string;
+            const pluginUri = body as string;
             this.handlePluginPresetsChanged(pluginUri);
         } else if (message === "onJackConfigurationChanged") {
             this.jackConfiguration.set(new JackConfiguration().deserialize(body));
@@ -934,29 +1025,29 @@ export class PiPedalModel //implements PiPedalModel
             this.alsaSequencerConfiguration.set(new AlsaSequencerConfiguration().deserialize(body));
 
         } else if (message === "onLoadPluginPreset") {
-            let instanceId = body.instanceId as number;
-            let controlValues = ControlValue.deserializeArray(body.controlValues);
+            const instanceId = body.instanceId as number;
+            const controlValues = ControlValue.deserializeArray(body.controlValues);
             this.handleOnLoadPluginPreset(instanceId, controlValues);
         } else if (message === "onItemEnabledChanged") {
-            let itemEnabledBody = body as PedalboardItemEnableBody;
+            const itemEnabledBody = body as PedalboardItemEnableBody;
             this._setPedalboardItemEnabled(
                 itemEnabledBody.instanceId,
                 itemEnabledBody.enabled,
                 false  // No server notification.
             );
         } else if (message == "onItemUseModUiChanged") {
-            let itemEnabledBody = body as PedalboardItemEnableBody;
+            const itemEnabledBody = body as PedalboardItemEnableBody;
             this._setPedalboardItemUseModUi(
                 itemEnabledBody.instanceId,
                 itemEnabledBody.enabled,
                 false  // No server notification.
             );
         } else if (message === "onPedalboardChanged") {
-            let pedalChangedBody = body as PedalboardChangedBody;
+            const pedalChangedBody = body as PedalboardChangedBody;
             this.setModelPedalboard(new Pedalboard().deserialize(pedalChangedBody.pedalboard));
 
         } else if (message === "onMidiValueChanged") {
-            let controlChangedBody = body as ControlChangedBody;
+            const controlChangedBody = body as ControlChangedBody;
             this._setPedalboardControlValue(
                 controlChangedBody.instanceId,
                 controlChangedBody.symbol,
@@ -968,61 +1059,71 @@ export class PiPedalModel //implements PiPedalModel
             }
 
         } else if (message === "onNotifyMidiListener") {
-            let notifyBody = body as { clientHandle: number, cc0: number, cc1: number, cc2: number };
-            let clientHandle = notifyBody.clientHandle as number;
+            const notifyBody = body as { clientHandle: number, cc0: number, cc1: number, cc2: number };
+            const clientHandle = notifyBody.clientHandle as number;
             this.handleNotifyMidiListener(
                 clientHandle,
                 notifyBody.cc0,
                 notifyBody.cc1,
                 notifyBody.cc2);
         } else if (message === "onNotifyPathPatchPropertyChanged") {
-            let instanceId = body.instanceId as number;
-            let propertyUri = body.propertyUri as string;
-            let atomJsonString = body.atomJson as string;
+            const instanceId = body.instanceId as number;
+            const propertyUri = body.propertyUri as string;
+            const atomJsonString = body.atomJson as string;
             this.handleNotifyPathPatchPropertyChanged(instanceId, propertyUri, atomJsonString);
             if (header.replyTo) {
                 this.webSocket?.reply(header.replyTo, "onNotifyPathPatchPropertyChanged", true);
             }
         } else if (message === "onNotifyPatchProperty") {
-            let clientHandle = body.clientHandle as number;
-            let instanceId = body.instanceId as number;
-            let propertyUri = body.propertyUri as string;
-            let atomJson = body.atomJson as any;
+            const clientHandle = body.clientHandle as number;
+            const instanceId = body.instanceId as number;
+            const propertyUri = body.propertyUri as string;
+            const atomJson = body.atomJson as any;
             this.handleNotifyPatchProperty(clientHandle, instanceId, propertyUri, atomJson);
             if (header.replyTo) {
                 this.webSocket?.reply(header.replyTo, "onNotifyPatchProperty", true);
             }
         } else if (message === "onJackServerSettingsChanged") {
-            let jackServerSettings = new JackServerSettings().deserialize(body);
+            const jackServerSettings = new JackServerSettings().deserialize(body);
             this.jackServerSettings.set(jackServerSettings);
         } else if (message === "onWifiConfigSettingsChanged") {
-            let wifiConfigSettings = new WifiConfigSettings().deserialize(body);
+            const wifiConfigSettings = new WifiConfigSettings().deserialize(body);
             this.wifiConfigSettings.set(wifiConfigSettings);
         } else if (message === "onWifiDirectConfigSettingsChanged") {
-            let wifiDirectConfigSettings = new WifiDirectConfigSettings().deserialize(body);
+            const wifiDirectConfigSettings = new WifiDirectConfigSettings().deserialize(body);
             this.wifiDirectConfigSettings.set(wifiDirectConfigSettings);
         }
         else if (message === "onGovernorSettingsChanged") {
-            let governor = body as string;
-            let newSettings = this.governorSettings.get().clone();
+            const governor = body as string;
+            const newSettings = this.governorSettings.get().clone();
             newSettings.governor = governor;
             this.governorSettings.set(newSettings);
         } else if (message === "onBanksChanged") {
-            let banks = new BankIndex().deserialize(body);
+            const banks = new BankIndex().deserialize(body);
             this.banks.set(banks);
-        } else if (message === "onVuUpdate") {
-            let vuUpdate = body as VuUpdateInfo;
-            let item = this.vuSubscriptions[vuUpdate.instanceId];
-            if (item) {
-                for (let i = 0; i < item.subscribers.length; ++i) {
-                    item.subscribers[i].callback(vuUpdate);
+        } else if (message === "onVuUpdates") {
+            try {
+                const vuUpdates = body as VuUpdateInfo[];
+                for (const vuUpdate of vuUpdates) {
+                    const item = this.vuSubscriptions[vuUpdate.instanceId];
+                    if (item) {
+                        for (let i = 0; i < item.subscribers.length; ++i) {
+                            try {
+                                item.subscribers[i].callback(vuUpdate);
+                            } catch (e) {
+                                console.warn("VU subscriber failed: " + getErrorMessage(e));
+                            }
+                        }
+                    }
+                }
+            } finally {
+                // always ack, or the server stops sending VU updates to this client.
+                if (header.replyTo) {
+                    this.webSocket?.reply(header.replyTo, "onVuUpdates", true);
                 }
             }
-            if (header.replyTo) {
-                this.webSocket?.reply(header.replyTo, "onVuUpdate", true);
-            }
         } else if (message === "onSystemMidiBindingsChanged") {
-            let bindings = MidiBinding.deserialize_array(body);
+            const bindings = MidiBinding.deserialize_array(body);
             this.systemMidiBindings.set(bindings);
         } else if (message === "onErrorMessage") {
             this.showAlert(body as string);
@@ -1030,17 +1131,17 @@ export class PiPedalModel //implements PiPedalModel
         } else if (message === "onLv2PluginsChanging") {
             this.onLv2PluginsChanging();
         } else if (message === "onUpdateStatusChanged") {
-            let updateStatus = new UpdateStatus().deserialize(body);
+            const updateStatus = new UpdateStatus().deserialize(body);
             this.onUpdateStatusChanged(updateStatus);
         } else if (message === "onNetworkChanging") {
             this.onNetworkChanging(body as boolean);
         }
         else if (message === "onHasWifiChanged") {
-            let hasWifi = body as boolean;
+            const hasWifi = body as boolean;
             this.hasWifiDevice.set(hasWifi);
         }
         else if (message === "onTone3000DownloadStarted") {
-            let { handle, title } = body as { handle: number, title: string };
+            const { handle, title } = body as { handle: number, title: string };
             this.onTone3000DownloadStarted(handle, title);
         }
         else if (message === "onTone3000DownloadProgress") {
@@ -1048,11 +1149,14 @@ export class PiPedalModel //implements PiPedalModel
             this.onTone3000DownloadProgress(body);
         }
         else if (message === "onTone3000DownloadComplete") {
-            let resultPath = body as string;
+            const resultPath = body as string;
             this.onTone3000DownloadComplete(resultPath);
         }
+        else if (message === "onT3kAuthStatusChanged") {
+            this.tone3000AuthStatus.set(new Tone3000AuthStatus().deserialize(body));
+        }
         else if (message === "onTone3000DownloadError") {
-            let { handle, errorMessage } = body as { handle: number, errorMessage: string };
+            const { handle, errorMessage } = body as { handle: number, errorMessage: string };
             this.onTone3000DownloadError(handle, errorMessage);
         }
     }
@@ -1068,7 +1172,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     private setPromptForUpdateTimer(when: Date) {
-        let ms = when.getTime() - Date.now();
+        const ms = when.getTime() - Date.now();
         this.updateLaterTimeout = setTimeout(
             () => {
                 this.updateLaterTimeout = undefined;
@@ -1093,22 +1197,22 @@ export class PiPedalModel //implements PiPedalModel
             return;
         }
 
-        let stateEnabled = true; // must be present to accept alerts.  this.state.get() === State.Ready;
+        const stateEnabled = true; // must be present to accept alerts.  this.state.get() === State.Ready;
         let timeEnabled = false;
 
-        let updateLaterTime = this.getUpdateTime();
+        const updateLaterTime = this.getUpdateTime();
         if (updateLaterTime == null) {
             timeEnabled = true;
         } else {
-            let nDate = Date.now();
+            const nDate = Date.now();
 
-            let now: Date = new Date(nDate);
-            let maxDate: Date = new Date(nDate + 86400000 * 2); // sanity check for systems with unstable system clock
+            const now: Date = new Date(nDate);
+            const maxDate: Date = new Date(nDate + 86400000 * 2); // sanity check for systems with unstable system clock
 
             timeEnabled = (updateLaterTime < now || updateLaterTime >= maxDate)
         }
-        let updateStatus = this.updateStatus.get();
-        let statusEnabled = updateStatus.isOnline && updateStatus.isValid && updateStatus.getActiveRelease().updateAvailable;
+        const updateStatus = this.updateStatus.get();
+        const statusEnabled = updateStatus.isOnline && updateStatus.isValid && updateStatus.getActiveRelease().updateAvailable;
 
         let canUpdateNow: boolean = (stateEnabled && timeEnabled && statusEnabled);
         if (updateStatus.updatePolicy === UpdatePolicyT.Disable) {
@@ -1138,7 +1242,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     onUpdateStatusChanged(updateStatus: UpdateStatus): void {
-        let current = this.updateStatus.get();
+        const current = this.updateStatus.get();
         if (!current.equals(updateStatus)) {
             this.updateStatus.set(updateStatus);
             if (current.currentVersion.length !== 0 && current.currentVersion !== updateStatus.currentVersion) {
@@ -1246,6 +1350,8 @@ export class PiPedalModel //implements PiPedalModel
         }
         this.vuSubscriptions = [];
         this.monitorPatchPropertyListeners = [];
+        this.monitorPortSubscriptions = [];
+        this.midiListeners = [];
 
         this.tone3000Downloading.set(false);
         this.tone3000DownloadProgress.set(null);
@@ -1272,17 +1378,44 @@ export class PiPedalModel //implements PiPedalModel
 
         if (this.visibilityState.get() === VisibilityState.Hidden) return;
 
-        // reload state, but not configuration.
-        this.clientId = await this.getWebSocket().request<number>("hello");
+        try {
+            // reload state, but not configuration.
+            this.clientId = await this.getWebSocket().request<number>("hello");
 
-        let newServerVersion = this.serverVersion = await this.getWebSocket().request<PiPedalVersion>("version");
-        if (newServerVersion.serverVersion !== this.serverVersion.serverVersion) {
-            this.reloadPage();
-            return;
+            const newServerVersion = await this.getWebSocket().request<PiPedalVersion>("version");
+            if (this.serverVersion !== undefined && newServerVersion.serverVersion !== this.serverVersion.serverVersion) {
+                this.reloadPage();
+                return;
+            }
+            this.serverVersion = newServerVersion;
+
+            // anything could have changed while we were disconnected.
+            if (await this.loadServerState()) {
+                // replay the latest queued set-value commands (setControl, loadPreset, setSnapshot)
+                // that were issued while disconnected, and reflect them in the local model.
+                this.getWebSocket().flushPendingSends(this.clientId, (message, body) => {
+                    if (message === "setControl" && body) {
+                        try {
+                            this._setPedalboardControlValue(body.instanceId, body.symbol, body.value, false);
+                        } catch (e) {
+                            console.warn("Failed to apply queued control change: " + getErrorMessage(e));
+                        }
+                    }
+                });
+            } else if (this.getWebSocket().isConnected()) {
+                // failed for a reason other than a dropped connection: don't replay commands
+                // against a state we couldn't load.
+                this.getWebSocket().clearPendingSends();
+            }
+        } catch (error) {
+            if (isDisconnectedError(error)) {
+                // connection dropped again; the socket will retry and call us again.
+                console.log("Connection lost while reloading state.");
+                return;
+            }
+            this.getWebSocket().clearPendingSends();
+            this.setError("Failed to reload server state.\n\n" + getErrorMessage(error));
         }
-
-        // anything could have changed while we were disconnected.
-        await this.loadServerState();
     }
     private makeSocketServerUrl(hostName: string, port: number): string {
         return "ws://" + hostName + ":" + port + "/pipedal";
@@ -1301,12 +1434,12 @@ export class PiPedalModel //implements PiPedalModel
 
     async getNextAudioFile(filePath: string): Promise<string> {
         try {
-            let url =
+            const url =
                 this.varServerUrl
                 + "NextAudioFile?path=" + encodeURIComponent(filePath);
 
-            let response = await fetch(url);
-            let json = await response.json();
+            const response = await fetch(url);
+            const json = await response.json();
             return json as string;
         } catch (e) {
             return "";
@@ -1314,12 +1447,12 @@ export class PiPedalModel //implements PiPedalModel
     }
     async getPreviousAudioFile(filePath: string): Promise<string> {
         try {
-            let url =
+            const url =
                 this.varServerUrl
                 + "PreviousAudioFile?path=" + encodeURIComponent(filePath);
 
-            let response = await fetch(url);
-            let json = await response.json();
+            const response = await fetch(url);
+            const json = await response.json();
             return json as string;
         } catch (e) {
             return "";
@@ -1329,12 +1462,12 @@ export class PiPedalModel //implements PiPedalModel
 
     async getAudioFileMetadata(filePath: string): Promise<AudioFileMetadata> {
         try {
-            let url =
+            const url =
                 this.varServerUrl
                 + "AudioMetadata?path=" + encodeURIComponent(filePath);
 
-            let response = await fetch(url);
-            let json = await response.json();
+            const response = await fetch(url);
+            const json = await response.json();
             return new AudioFileMetadata().deserialize(json);
         } catch (e) {
             return new AudioFileMetadata();
@@ -1370,7 +1503,7 @@ export class PiPedalModel //implements PiPedalModel
 
         try {
             const myRequest = new Request(this.varRequest('config.json'));
-            let response: Response = await fetch(myRequest);
+            const response: Response = await fetch(myRequest);
             if (response.status !== 200) {
                 if (response.status === 500) {
 
@@ -1415,8 +1548,8 @@ export class PiPedalModel //implements PiPedalModel
                 }
             }
 
-            let socket_server = this.makeSocketServerUrl(socket_server_address, socket_server_port);
-            let var_server_url = this.makeVarServerUrl("http", socket_server_address, socket_server_port);
+            const socket_server = this.makeSocketServerUrl(socket_server_address, socket_server_port);
+            const var_server_url = this.makeVarServerUrl("http", socket_server_address, socket_server_port);
             this.modResourcesUrl = this.makeModResourceUrl("http", socket_server_address, socket_server_port);
 
             this.socketServerUrl = socket_server;
@@ -1429,6 +1562,7 @@ export class PiPedalModel //implements PiPedalModel
             return false;
         }
 
+        this.webSocket?.dispose();
         this.webSocket = new PiPedalSocket(
             this.socketServerUrl,
             {
@@ -1461,73 +1595,81 @@ export class PiPedalModel //implements PiPedalModel
     }
     async loadServerState(): Promise<boolean> {
         try {
-            this.serverVersion = await this.getWebSocket().request<PiPedalVersion>("version");
+            const ws = this.getWebSocket();
+            // independent requests run concurrently; results are applied below in the original order.
+            const [
+                serverVersion,
+                updateStatus,
+                hasWifi,
+                plugins,
+                pedalboard,
+                pluginClasses,
+                presets,
+                wifiConfigSettings,
+                wifiDirectConfigSettings,
+                governorSettings,
+                showStatusMonitor,
+                suspendBypassedPlugins,
+                jackServerSettings,
+                channelRouterSettings,
+                jackConfiguration,
+                jackSettings,
+                alsaSequencerConfiguration,
+                banks,
+                favorites,
+                systemMidiBindings,
+            ] = await Promise.all([
+                ws.request<PiPedalVersion>("version"),
+                this.getUpdateStatus(),
+                ws.request<boolean>("getHasWifi"),
+                ws.request<any>("plugins"),
+                ws.request<Pedalboard>("currentPedalboard"),
+                ws.request<any>("pluginClasses"),
+                ws.request<PresetIndex>("getPresets"),
+                ws.request<any>("getWifiConfigSettings"),
+                ws.request<any>("getWifiDirectConfigSettings"),
+                ws.request<any>("getGovernorSettings"),
+                ws.request<boolean>("getShowStatusMonitor"),
+                ws.request<boolean>("getSuspendBypassedPlugins"),
+                ws.request<any>("getJackServerSettings"),
+                ws.request<any>("getChannelRouterSettings"),
+                ws.request<JackConfiguration>("getJackConfiguration"),
+                ws.request<any>("getJackSettings"),
+                ws.request<any>("getAlsaSequencerConfiguration"),
+                ws.request<any>("getBankIndex"),
+                ws.request<FavoritesList>("getFavorites"),
+                ws.request<MidiBinding[]>("getSystemMidiBindings"),
+            ]);
 
-            this.updateStatus.set(new UpdateStatus().deserialize(await this.getUpdateStatus()));
+            this.serverVersion = serverVersion;
+            this.updateStatus.set(new UpdateStatus().deserialize(updateStatus));
+            this.hasWifiDevice.set(hasWifi);
 
-            this.hasWifiDevice.set(await this.getWebSocket().request<boolean>("getHasWifi"));
-
-            this.ui_plugins.set(
-                UiPlugin.deserialize_array(await this.getWebSocket().request<any>("plugins"))
-            );
+            this.ui_plugins.set(UiPlugin.deserialize_array(plugins));
             // index ui plugins.
             this.uiPluginsByUri = new Map<string, UiPlugin>();
-            for (let i of this.ui_plugins.get()) {
+            for (const i of this.ui_plugins.get()) {
                 this.uiPluginsByUri.set(i.uri, i);
             }
-            this.setModelPedalboard(
-                new Pedalboard().deserialize(
-                    await this.getWebSocket().request<Pedalboard>("currentPedalboard")
-                )
-            );
-            this.plugin_classes.set(new PluginClass().deserialize(
-                await this.getWebSocket().request<any>("pluginClasses")
-            ));
+            // the pedalboard depends on ui plugins being indexed.
+            this.setModelPedalboard(new Pedalboard().deserialize(pedalboard));
+            this.plugin_classes.set(new PluginClass().deserialize(pluginClasses));
             this.validatePluginClasses(this.plugin_classes.get());
 
-            this.presets.set(
-                new PresetIndex().deserialize(
-                    await this.getWebSocket().request<PresetIndex>("getPresets")
-                )
-            );
-            this.wifiConfigSettings.set(
-                new WifiConfigSettings().deserialize(
-                    await this.getWebSocket().request<any>("getWifiConfigSettings")
-                ));
-            this.wifiDirectConfigSettings.set(
-                new WifiDirectConfigSettings().deserialize(
-                    await this.getWebSocket().request<any>("getWifiDirectConfigSettings")
-                ));
-            this.governorSettings.set(new GovernorSettings().deserialize(
-                await this.getWebSocket().request<any>("getGovernorSettings")
-            ));
-            this.showStatusMonitor.set(
-                await this.getWebSocket().request<boolean>("getShowStatusMonitor")
-            );
-            this.jackServerSettings.set(
-                new JackServerSettings().deserialize(
-                    await this.getWebSocket().request<any>("getJackServerSettings")
-                )
-            );
-            this.channelRouterSettings.set(
-                new ChannelRouterSettings().deserialize(
-                    await this.getWebSocket().request<any>("getChannelRouterSettings")
-                )
-            )
-            this.jackConfiguration.set(new JackConfiguration().deserialize(
-                await this.getWebSocket().request<JackConfiguration>("getJackConfiguration")
-            ));
-            this.jackSettings.set(new JackChannelSelection().deserialize(
-                await this.getWebSocket().request<any>("getJackSettings")
-            ));
-            this.alsaSequencerConfiguration.set(new AlsaSequencerConfiguration().deserialize(
-                await this.getWebSocket().request<any>("getAlsaSequencerConfiguration")
-            ));
-            this.banks.set(new BankIndex().deserialize(await this.getWebSocket().request<any>("getBankIndex")));
-
-            this.favorites.set(await this.getWebSocket().request<FavoritesList>("getFavorites"));
-
-            this.systemMidiBindings.set(MidiBinding.deserialize_array(await this.getWebSocket().request<MidiBinding[]>("getSystemMidiBindings")));
+            this.presets.set(new PresetIndex().deserialize(presets));
+            this.wifiConfigSettings.set(new WifiConfigSettings().deserialize(wifiConfigSettings));
+            this.wifiDirectConfigSettings.set(new WifiDirectConfigSettings().deserialize(wifiDirectConfigSettings));
+            this.governorSettings.set(new GovernorSettings().deserialize(governorSettings));
+            this.showStatusMonitor.set(showStatusMonitor);
+            this.suspendBypassedPlugins.set(suspendBypassedPlugins);
+            this.jackServerSettings.set(new JackServerSettings().deserialize(jackServerSettings));
+            this.channelRouterSettings.set(new ChannelRouterSettings().deserialize(channelRouterSettings));
+            this.jackConfiguration.set(new JackConfiguration().deserialize(jackConfiguration));
+            this.jackSettings.set(new JackChannelSelection().deserialize(jackSettings));
+            this.alsaSequencerConfiguration.set(new AlsaSequencerConfiguration().deserialize(alsaSequencerConfiguration));
+            this.banks.set(new BankIndex().deserialize(banks));
+            this.favorites.set(favorites);
+            this.systemMidiBindings.set(MidiBinding.deserialize_array(systemMidiBindings));
 
             // load at lest once before we allow a reconnect.
             this.getWebSocket().canReconnect = true;
@@ -1536,6 +1678,13 @@ export class PiPedalModel //implements PiPedalModel
             return true;
         }
         catch (error) {
+            if (isDisconnectedError(error) && this.getWebSocket().canReconnect) {
+                // not fatal: the socket reconnects and reloads state.
+                console.log("Connection lost while loading server state.");
+                return false;
+            }
+            // a real failure: queued commands must not replay against state we couldn't load.
+            this.getWebSocket().clearPendingSends();
             this.setError("Failed to fetch server state.\n\n" + getErrorMessage(error));
             return false;
         }
@@ -1545,7 +1694,7 @@ export class PiPedalModel //implements PiPedalModel
     onError(message: string | Error): void {
         let m = message;
         if (message instanceof Error) {
-            let e = message as Error;
+            const e = message as Error;
             if (e.message) {
                 m = e.message as string;
             } else {
@@ -1574,22 +1723,15 @@ export class PiPedalModel //implements PiPedalModel
 
     }
     enterBackgroundState() {
-        // on Android, delay entering background state by 180 seconds,
-        // since background management is more complicated. e.g. screen flips, and system upload dialogs.
-
-        // if (this.isAndroidHosted()) {
-        //     yyyx;
-        //     if (this.backgroundStateTimeout) {
-        //         clearTimeout(this.backgroundStateTimeout);
-        //     }
-        //     this.backgroundStateTimeout = setTimeout(() => {
-        //         this.backgroundStateTimeout = undefined;
-        //         this.enterBackgroundState_();
-        //     }, 180000);
-        // } else {
-        //     this.enterBackgroundState_();
-        // }
-        this.enterBackgroundState_();
+        // Delay the disconnect by 30 seconds, since brief page hides are common
+        // (screen flips, system dialogs, app switching). Cancelled if visible again.
+        if (this.backgroundStateTimeout) {
+            return;
+        }
+        this.backgroundStateTimeout = setTimeout(() => {
+            this.backgroundStateTimeout = undefined;
+            this.enterBackgroundState_();
+        }, 30000);
     }
     enterBackgroundState_() {
         if (this.state.get() !== State.Background) {
@@ -1640,7 +1782,7 @@ export class PiPedalModel //implements PiPedalModel
             .catch((error) => {
                 this.setError("Failed to get server state. \n\n" + error.toString());
             });
-        let t = this.onVisibilityChanged;
+        const t = this.onVisibilityChanged;
 
         (document as any).addEventListener("visibilitychange", (doc: Document, event: Event) => {
             return t(doc, event);
@@ -1649,7 +1791,7 @@ export class PiPedalModel //implements PiPedalModel
 
     getControl(uiPlugin: UiPlugin, portSymbol: string): UiControl | null {
         for (let i = 0; i < uiPlugin.controls.length; ++i) {
-            let control = uiPlugin.controls[i];
+            const control = uiPlugin.controls[i];
             if (control.symbol === portSymbol) {
                 return control;
             }
@@ -1658,20 +1800,20 @@ export class PiPedalModel //implements PiPedalModel
         return null;
     }
     getDefaultValues(uri: string): ControlValue[] {
-        let uiPlugin = this.getUiPlugin(uri);
+        const uiPlugin = this.getUiPlugin(uri);
         if (uiPlugin === null) throw new PiPedalArgumentError("Pedal uri not found.");
-        let result: ControlValue[] = [];
+        const result: ControlValue[] = [];
 
-        let controls = uiPlugin.controls;
+        const controls = uiPlugin.controls;
         for (let i = 0; i < controls.length; ++i) {
-            let control = controls[i];
+            const control = controls[i];
 
-            let uiControl = this.getControl(uiPlugin, control.symbol);
+            const uiControl = this.getControl(uiPlugin, control.symbol);
             if (uiControl === null) {
                 // this is default values, so a mis-match is in fact a problem.
                 throw new PiPedalStateError("ui and pedealboard ports don't match.");
             }
-            let cv = new ControlValue();
+            const cv = new ControlValue();
             cv.key = control.symbol;
             cv.value = control.default_value;
 
@@ -1688,16 +1830,16 @@ export class PiPedalModel //implements PiPedalModel
     handleOnLoadPluginPreset(instanceId: number, controlValues: ControlValue[]) {
         // note that plugins with state are dealt with server-side.
         // if we made it here, we can just load the controls.
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (pedalboard === undefined) throw new PiPedalStateError("Pedalboard not ready.");
-        let newPedalboard = pedalboard.clone();
+        const newPedalboard = pedalboard.clone();
 
-        let item = newPedalboard.tryGetItem(instanceId);
+        const item = newPedalboard.tryGetItem(instanceId);
         if (!item) return;
 
         let changed = false;
         for (let i = 0; i < controlValues.length; ++i) {
-            let controlValue = controlValues[i];
+            const controlValue = controlValues[i];
             changed = item.setControlValue(controlValue.key, controlValue.value) || changed;
         }
         if (changed) {
@@ -1709,7 +1851,7 @@ export class PiPedalModel //implements PiPedalModel
     private _controlValueChangeItems: ControlValueChangeItem[] = [];
 
     addControlValueChangeListener(instanceId: number, onValueChanged: ControlValueChangedHandler): ControlValueChangedHandle {
-        let handle = ++this.nextListenHandle;
+        const handle = ++this.nextListenHandle;
         this._controlValueChangeItems.push({ handle: handle, instanceId: instanceId, onValueChanged: onValueChanged });
         return { _ControlValueChangedHandle: handle };
     }
@@ -1725,9 +1867,9 @@ export class PiPedalModel //implements PiPedalModel
     private stateChangedListeners: StateChangedEntry[] = [];
 
     addLv2StateChangedListener(instanceId: number, onStateChanged: StateChangedHandler): StateChangedHandle {
-        let handle = ++this.nextListenHandle;
+        const handle = ++this.nextListenHandle;
 
-        let item: StateChangedEntry = {
+        const item: StateChangedEntry = {
             handle: handle,
             instanceId: instanceId,
             onStateChanged: onStateChanged
@@ -1736,7 +1878,7 @@ export class PiPedalModel //implements PiPedalModel
         return { _handle: handle };
     }
     removeLv2StateChangedListener(handle: StateChangedHandle): void {
-        let h = handle._handle;
+        const h = handle._handle;
 
         for (let i = 0; i < this.stateChangedListeners.length; ++i) {
             if (this.stateChangedListeners[i].handle === h) {
@@ -1746,9 +1888,9 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     private onLv2StateChanged(instanceId: number, state: [boolean, any]): void {
-        let item = this.pedalboard.get().getItem(instanceId);
+        const item = this.pedalboard.get().getItem(instanceId);
         item.lv2State = state;
-        for (let item of this.stateChangedListeners) {
+        for (const item of this.stateChangedListeners) {
             if (item.instanceId === instanceId) {
                 item.onStateChanged(instanceId);
             }
@@ -1759,8 +1901,8 @@ export class PiPedalModel //implements PiPedalModel
     private _pluginPresetsChangedHandles: PluginPresetsChangedHandle[] = [];
 
     addPluginPresetsChangedListener(onPluginPresetsChanged: PluginPresetsChangedHandler): PluginPresetsChangedHandle {
-        let handle = ++this.nextListenHandle;
-        let t: PluginPresetsChangedHandle = {
+        const handle = ++this.nextListenHandle;
+        const t: PluginPresetsChangedHandle = {
             _id: handle,
             _handler: onPluginPresetsChanged
         };
@@ -1805,21 +1947,21 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     private pruneSnapshotValues(pedalboard: Pedalboard) {
-        let validPluginIds: Set<number> = new Set<number>();
+        const validPluginIds: Set<number> = new Set<number>();
 
-        let it = pedalboard.itemsGenerator();
+        const it = pedalboard.itemsGenerator();
         while (true) {
-            let v = it.next();
+            const v = it.next();
             if (v.done) break;
             validPluginIds.add(v.value.instanceId);
 
         }
 
-        for (let snapshot of pedalboard.snapshots) {
+        for (const snapshot of pedalboard.snapshots) {
             if (snapshot) {
                 let ix = 0;
                 while (ix < snapshot.values.length) {
-                    let value = snapshot.values[ix];
+                    const value = snapshot.values[ix];
                     if (validPluginIds.has(value.instanceId)) {
                         ix++;
                     } else {
@@ -1830,7 +1972,7 @@ export class PiPedalModel //implements PiPedalModel
         }
     }
     setSnapshots(snapshots: (Snapshot | null)[], selectedSnapshot: number) {
-        let pedalboard = this.pedalboard.get().clone();
+        const pedalboard = this.pedalboard.get().clone();
         pedalboard.snapshots = snapshots;
         pedalboard.selectedSnapshot = selectedSnapshot;
         this.pruneSnapshotValues(pedalboard);
@@ -1855,9 +1997,9 @@ export class PiPedalModel //implements PiPedalModel
     private _setInputVolume(volume_db: number, notifyServer: boolean): void {
         let changed: boolean = false;
 
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (pedalboard.input_volume_db !== volume_db) {
-            let newPedalboard = pedalboard.clone();
+            const newPedalboard = pedalboard.clone();
             newPedalboard.input_volume_db = volume_db;
             this.setModelPedalboard(newPedalboard);
             changed = true;
@@ -1868,7 +2010,7 @@ export class PiPedalModel //implements PiPedalModel
             }
 
             for (let i = 0; i < this._controlValueChangeItems.length; ++i) {
-                let item = this._controlValueChangeItems[i];
+                const item = this._controlValueChangeItems[i];
                 if (Pedalboard.START_CONTROL_ID === item.instanceId) {
                     item.onValueChanged("volume_db", volume_db);
                 }
@@ -1883,9 +2025,9 @@ export class PiPedalModel //implements PiPedalModel
     private _setOutputVolume(volume_db: number, notifyServer: boolean): void {
         let changed: boolean = false;
 
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (pedalboard.output_volume_db !== volume_db) {
-            let newPedalboard = pedalboard.clone();
+            const newPedalboard = pedalboard.clone();
             newPedalboard.output_volume_db = volume_db;
             this.setModelPedalboard(newPedalboard);
             changed = true;
@@ -1895,7 +2037,7 @@ export class PiPedalModel //implements PiPedalModel
                 nullCast(this.webSocket).send("setOutputVolume", volume_db);
             }
             for (let i = 0; i < this._controlValueChangeItems.length; ++i) {
-                let item = this._controlValueChangeItems[i];
+                const item = this._controlValueChangeItems[i];
                 if (Pedalboard.END_CONTROL_ID === item.instanceId) {
                     item.onValueChanged("volume_db", volume_db);
                 }
@@ -1906,11 +2048,8 @@ export class PiPedalModel //implements PiPedalModel
     private lastControlMessageWasSentbyMe = false;
 
     private _setPedalboardControlValue(instanceId: number, key: string, value: number, notifyServer: boolean): void {
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (pedalboard === undefined) throw new PiPedalStateError("Pedalboard not ready.");
-
-        let changed: boolean;
-        let newPedalboard = pedalboard.clone();
 
         if (instanceId === Pedalboard.START_CONTROL_ID && key === "volume_db") {
             this._setInputVolume(value, notifyServer);
@@ -1919,16 +2058,18 @@ export class PiPedalModel //implements PiPedalModel
             this._setOutputVolume(value, notifyServer);
             return;
         }
-        let item = newPedalboard.getItem(instanceId);
-        changed = item.setControlValue(key, value);
+        // Update in place: no clone and no layout per message. Structural observers are
+        // notified (with a fresh object) at most once per animation frame.
+        const item = pedalboard.getItem(instanceId);
+        const changed = item.setControlValue(key, value);
         if (changed) {
             if (notifyServer) {
                 this.lastControlMessageWasSentbyMe = true;
                 this._setServerControl("setControl", instanceId, key, value);
             }
-            this.setModelPedalboard(newPedalboard);
+            this.schedulePedalboardPublish();
             for (let i = 0; i < this._controlValueChangeItems.length; ++i) {
-                let item = this._controlValueChangeItems[i];
+                const item = this._controlValueChangeItems[i];
                 if (instanceId === item.instanceId) {
                     item.onValueChanged(key, value);
                 }
@@ -1936,12 +2077,12 @@ export class PiPedalModel //implements PiPedalModel
         }
     }
     private _setVst3PedalboardControlValue(instanceId: number, key: string, value: number, state: string, notifyServer: boolean): void {
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (pedalboard === undefined) throw new PiPedalStateError("Pedalboard not ready.");
-        let newPedalboard = pedalboard.clone();
+        const newPedalboard = pedalboard.clone();
 
-        let item: PedalboardItem = newPedalboard.getItem(instanceId);
-        let changed = item.setControlValue(key, value);
+        const item: PedalboardItem = newPedalboard.getItem(instanceId);
+        const changed = item.setControlValue(key, value);
         item.vstState = state;
 
         if (changed) {
@@ -1950,7 +2091,7 @@ export class PiPedalModel //implements PiPedalModel
                 this._setServerControl("setControl", instanceId, key, value);
             }
             for (let i = 0; i < this._controlValueChangeItems.length; ++i) {
-                let item = this._controlValueChangeItems[i];
+                const item = this._controlValueChangeItems[i];
                 if (instanceId === item.instanceId) {
                     item.onValueChanged(key, value);
                 }
@@ -1966,6 +2107,7 @@ export class PiPedalModel //implements PiPedalModel
 
 
     setPedalboardControl(instanceId: number, key: string, value: number): void {
+        this.flushPendingPreviews();
         this._setPedalboardControlValue(instanceId, key, value, true);
     }
     setPedalboardItemEnabled(instanceId: number, value: boolean): void {
@@ -1978,20 +2120,20 @@ export class PiPedalModel //implements PiPedalModel
 
     getPedalboardItemUseModUi(instanceId: number): boolean {
         if (!this.pedalboard.get().hasItem(instanceId)) return false;
-        let item = this.pedalboard.get().getItem(instanceId);
+        const item = this.pedalboard.get().getItem(instanceId);
         return item.useModUi;
     }
     _setPedalboardItemUseModUi(instanceId: number, useModUi: boolean, notifyServer: boolean): void {
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (pedalboard === undefined) throw new PiPedalStateError("Pedalboard not ready.");
-        let newPedalboard = pedalboard.clone();
-        let item = newPedalboard.getItem(instanceId);
-        let changed = useModUi !== item.useModUi;
+        const newPedalboard = pedalboard.clone();
+        const item = newPedalboard.getItem(instanceId);
+        const changed = useModUi !== item.useModUi;
         if (changed) {
             item.useModUi = useModUi;
             this.setModelPedalboard(newPedalboard);
             if (notifyServer) {
-                let body = {
+                const body = {
                     clientId: this.clientId,
                     instanceId: instanceId,
                     useModUi: useModUi
@@ -2004,22 +2146,22 @@ export class PiPedalModel //implements PiPedalModel
 
     getPedalboardItemEnabled(instanceId: number): boolean {
         if (!this.pedalboard.get().hasItem(instanceId)) return false;
-        let item = this.pedalboard.get().getItem(instanceId);
+        const item = this.pedalboard.get().getItem(instanceId);
         return item.isEnabled;
     }
     private _setPedalboardItemEnabled(instanceId: number, value: boolean, notifyServer: boolean): void {
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (pedalboard === undefined) throw new PiPedalStateError("Pedalboard not ready.");
-        let newPedalboard = pedalboard.clone();
+        const newPedalboard = pedalboard.clone();
 
-        let item: PedalboardItem = newPedalboard.getItem(instanceId);
+        const item: PedalboardItem = newPedalboard.getItem(instanceId);
 
-        let changed = value !== item.isEnabled;
+        const changed = value !== item.isEnabled;
         if (changed) {
             item.isEnabled = value;
-            let pluginInfo: UiPlugin | null = this.getUiPlugin(item.uri);
+            const pluginInfo: UiPlugin | null = this.getUiPlugin(item.uri);
             if (pluginInfo !== null) {
-                for (let uiControl of pluginInfo.controls) {
+                for (const uiControl of pluginInfo.controls) {
                     if (uiControl.is_bypass) {
                         this._setPedalboardControlValue(instanceId, uiControl.symbol, value ? 1.0 : 0.0, false);
                     }
@@ -2027,7 +2169,7 @@ export class PiPedalModel //implements PiPedalModel
             }
             this.setModelPedalboard(newPedalboard);
             if (notifyServer) {
-                let body: PedalboardItemEnableBody = {
+                const body: PedalboardItemEnableBody = {
                     clientId: this.clientId,
                     instanceId: instanceId,
                     enabled: value
@@ -2040,7 +2182,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     updateServerPedalboard(): void {
-        let body: PedalboardChangedBody = {
+        const body: PedalboardChangedBody = {
             clientId: this.clientId,
             pedalboard: this.pedalboard.get()
         };
@@ -2052,23 +2194,27 @@ export class PiPedalModel //implements PiPedalModel
         this.webSocket?.send("setShowStatusMonitor", show);
     }
 
-    loadPedalboardPlugin(itemId: number, selectedUri: string): number {
-        let pedalboard = this.pedalboard.get();
-        if (pedalboard === undefined) throw new PiPedalArgumentError("Can't clone an undefined object.");
-        let newPedalboard = pedalboard.clone();
+    setSuspendBypassedPlugins(value: boolean): void {
+        this.webSocket?.send("setSuspendBypassedPlugins", value);
+    }
 
-        let plugin = this.getUiPlugin(selectedUri);
+    loadPedalboardPlugin(itemId: number, selectedUri: string): number {
+        const pedalboard = this.pedalboard.get();
+        if (pedalboard === undefined) throw new PiPedalArgumentError("Can't clone an undefined object.");
+        const newPedalboard = pedalboard.clone();
+
+        const plugin = this.getUiPlugin(selectedUri);
         if (plugin === null) {
             throw new PiPedalArgumentError("Plugin not found.");
         }
 
-        let it = newPedalboard.itemsGenerator();
+        const it = newPedalboard.itemsGenerator();
         let oldInstanceId = -1;
         let newInstanceId = -1;
         while (true) {
-            let v = it.next();
+            const v = it.next();
             if (v.done) break;
-            let item = v.value;
+            const item = v.value;
             if (item.instanceId === itemId) {
                 oldInstanceId = item.instanceId;
                 item.deserialize(new PedalboardItem()); // skeezy way to re-initialize.
@@ -2082,7 +2228,7 @@ export class PiPedalModel //implements PiPedalModel
                 item.vstState = "";
                 item.pathProperties = {};
                 item.useModUi = getDefaultModGuiPreference(selectedUri);
-                for (let fileProperty of plugin.fileProperties) {
+                for (const fileProperty of plugin.fileProperties) {
                     // stringized json for an atom. see AtomConverter.hpp.
                     //  null -> we've never seen a value.
                     item.pathProperties[fileProperty.patchProperty] = "null";
@@ -2099,8 +2245,15 @@ export class PiPedalModel //implements PiPedalModel
         throw new PiPedalArgumentError("Pedalboard item not found.");
 
     }
+    // Immediate send of a control value. A preview of the same control still waiting for the
+    // next animation frame is older than this value: drop it, or it would be sent afterwards
+    // and overwrite this one (per-control ordering).
     private _setServerControl(message: string, instanceId: number, key: string, value: number) {
-        let body: ControlChangedBody = {
+        this.pendingPreviews.delete(PiPedalModel.previewKey(instanceId, key));
+        this._sendServerControl(message, instanceId, key, value);
+    }
+    private _sendServerControl(message: string, instanceId: number, key: string, value: number) {
+        const body: ControlChangedBody = {
             clientId: this.clientId,
             instanceId: instanceId,
             symbol: key,
@@ -2124,13 +2277,13 @@ export class PiPedalModel //implements PiPedalModel
         }
 
         // Get the control info to check if it's expensive
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (pedalboard) {
-            let item = pedalboard.tryGetItem(instanceId);
+            const item = pedalboard.tryGetItem(instanceId);
             if (item) {
-                let plugin = this.getUiPlugin(item.uri);
+                const plugin = this.getUiPlugin(item.uri);
                 if (plugin) {
-                    let control = plugin.getControl(key);
+                    const control = plugin.getControl(key);
                     if (control && control.is_expensive) {
                         // Don't send preview for expensive controls
                         // The final value will be sent when the control is committed
@@ -2140,16 +2293,46 @@ export class PiPedalModel //implements PiPedalModel
             }
         }
 
-        this._setServerControl("previewControl", instanceId, key, value);
+        this.queuePreviewControl(instanceId, key, value);
+    }
+
+    // Preview sends are coalesced to one per animation frame per (instanceId,key); latest value wins.
+    private pendingPreviews: Map<string, { instanceId: number, key: string, value: number }> = new Map();
+    private previewFlushHandle: number | null = null;
+    private static previewKey(instanceId: number, key: string): string {
+        return instanceId + "\u0000" + key;
+    }
+    private queuePreviewControl(instanceId: number, key: string, value: number) {
+        this.pendingPreviews.set(PiPedalModel.previewKey(instanceId, key), { instanceId: instanceId, key: key, value: value });
+        if (this.previewFlushHandle === null) {
+            this.previewFlushHandle = window.requestAnimationFrame(() => {
+                this.previewFlushHandle = null;
+                this.flushPendingPreviews();
+            });
+        }
+    }
+    // Sends any queued previews now. Called before committing a value so ordering is preserved
+    // and the final value always reaches the server.
+    private flushPendingPreviews() {
+        if (this.previewFlushHandle !== null) {
+            window.cancelAnimationFrame(this.previewFlushHandle);
+            this.previewFlushHandle = null;
+        }
+        if (this.pendingPreviews.size === 0) return;
+        const pending = this.pendingPreviews;
+        this.pendingPreviews = new Map();
+        pending.forEach((p) => {
+            this._sendServerControl("previewControl", p.instanceId, p.key, p.value);
+        });
     }
 
     // returns the next selected instanceId, or null,if no item was deleted.
     deletePedalboardPedal(instanceId: number): number | null {
-        let pedalboard = this.pedalboard.get();
-        let newPedalboard = pedalboard.clone();
+        const pedalboard = this.pedalboard.get();
+        const newPedalboard = pedalboard.clone();
         this.updateVst3State(newPedalboard);
 
-        let result = newPedalboard.deleteItem(instanceId);
+        const result = newPedalboard.deleteItem(instanceId);
         if (result !== null) {
             newPedalboard.selectedPlugin = result;
             this.pruneSnapshotValues(newPedalboard);
@@ -2161,17 +2344,17 @@ export class PiPedalModel //implements PiPedalModel
 
     }
     replacePedalboarditem(instanceId: number, newItem: PedalboardItem): void {
-        let pedalboard = this.pedalboard.get();
-        let newPedalboard = pedalboard.clone();
+        const pedalboard = this.pedalboard.get();
+        const newPedalboard = pedalboard.clone();
 
         this.updateVst3State(newPedalboard);
 
-        let fromItem = newPedalboard.getItem(instanceId);
+        const fromItem = newPedalboard.getItem(instanceId);
         if (fromItem === null) {
             throw new PiPedalArgumentError("fromInstanceId not found.");
         }
 
-        let newInstanceId = newPedalboard.replaceItem(instanceId, newItem.clone());
+        const newInstanceId = newPedalboard.replaceItem(instanceId, newItem.clone());
         newPedalboard.selectedPlugin = newInstanceId;
         this.setModelPedalboard(newPedalboard);
         this.updateServerPedalboard();
@@ -2179,12 +2362,12 @@ export class PiPedalModel //implements PiPedalModel
     }
     movePedalboardItemBefore(fromInstanceId: number, toInstanceId: number): void {
         if (fromInstanceId === toInstanceId) return;
-        let pedalboard = this.pedalboard.get();
-        let newPedalboard = pedalboard.clone();
+        const pedalboard = this.pedalboard.get();
+        const newPedalboard = pedalboard.clone();
 
         this.updateVst3State(newPedalboard);
 
-        let fromItem = newPedalboard.getItem(fromInstanceId);
+        const fromItem = newPedalboard.getItem(fromInstanceId);
         if (fromItem === null) {
             throw new PiPedalArgumentError("fromInstanceId not found.");
         }
@@ -2199,12 +2382,12 @@ export class PiPedalModel //implements PiPedalModel
     }
     movePedalboardItemAfter(fromInstanceId: number, toInstanceId: number): void {
         if (fromInstanceId === toInstanceId) return;
-        let pedalboard = this.pedalboard.get();
-        let newPedalboard = pedalboard.clone();
+        const pedalboard = this.pedalboard.get();
+        const newPedalboard = pedalboard.clone();
 
         this.updateVst3State(newPedalboard);
 
-        let fromItem = newPedalboard.getItem(fromInstanceId);
+        const fromItem = newPedalboard.getItem(fromInstanceId);
         if (fromItem === null) {
             throw new PiPedalArgumentError("fromInstanceId not found.");
         }
@@ -2219,13 +2402,13 @@ export class PiPedalModel //implements PiPedalModel
 
     movePedalboardItemToStart(instanceId: number): void {
 
-        let pedalboard = this.pedalboard.get();
-        let newPedalboard = pedalboard.clone();
+        const pedalboard = this.pedalboard.get();
+        const newPedalboard = pedalboard.clone();
 
         this.updateVst3State(newPedalboard);
 
 
-        let fromItem = newPedalboard.getItem(instanceId);
+        const fromItem = newPedalboard.getItem(instanceId);
         if (fromItem === null) {
             throw new PiPedalArgumentError("fromInstanceId not found.");
         }
@@ -2240,12 +2423,12 @@ export class PiPedalModel //implements PiPedalModel
     }
     movePedalboardItemToEnd(instanceId: number): void {
 
-        let pedalboard = this.pedalboard.get();
-        let newPedalboard = pedalboard.clone();
+        const pedalboard = this.pedalboard.get();
+        const newPedalboard = pedalboard.clone();
         this.updateVst3State(newPedalboard);
 
 
-        let fromItem = newPedalboard.getItem(instanceId);
+        const fromItem = newPedalboard.getItem(instanceId);
         if (fromItem === null) {
             throw new PiPedalArgumentError("fromInstanceId not found.");
         }
@@ -2266,20 +2449,20 @@ export class PiPedalModel //implements PiPedalModel
     movePedalboardItem(fromInstanceId: number, toInstanceId: number): void {
         if (fromInstanceId === toInstanceId) return;
 
-        let pedalboard = this.pedalboard.get();
-        let newPedalboard = pedalboard.clone();
+        const pedalboard = this.pedalboard.get();
+        const newPedalboard = pedalboard.clone();
         this.updateVst3State(newPedalboard);
 
 
-        let fromItem = newPedalboard.getItem(fromInstanceId);
-        let toItem = newPedalboard.getItem(toInstanceId);
+        const fromItem = newPedalboard.getItem(fromInstanceId);
+        const toItem = newPedalboard.getItem(toInstanceId);
         if (fromItem === null) {
             throw new PiPedalArgumentError("fromInstanceId not found.");
         }
         if (toItem === null) {
             throw new PiPedalArgumentError("toInstanceId not found.");
         }
-        let emptyItem = newPedalboard.createEmptyItem();
+        const emptyItem = newPedalboard.createEmptyItem();
         newPedalboard.replaceItem(fromInstanceId, emptyItem);
         newPedalboard.replaceItem(toInstanceId, fromItem);
         newPedalboard.selectedPlugin = fromItem.instanceId;
@@ -2291,7 +2474,7 @@ export class PiPedalModel //implements PiPedalModel
 
     }
     addPedalboardItem(instanceId: number, append: boolean): number {
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (instanceId === Pedalboard.START_CONTROL_ID && append) {
             instanceId = pedalboard.items[0].instanceId;
             append = false;
@@ -2299,15 +2482,15 @@ export class PiPedalModel //implements PiPedalModel
             instanceId = pedalboard.items[pedalboard.items.length - 1].instanceId;
             append = true;
         }
-        let newPedalboard = pedalboard.clone();
+        const newPedalboard = pedalboard.clone();
         this.updateVst3State(newPedalboard);
 
 
-        let item = newPedalboard.getItem(instanceId);
+        const item = newPedalboard.getItem(instanceId);
         if (item === null) {
             throw new PiPedalArgumentError("instanceId not found.");
         }
-        let newItem = newPedalboard.createEmptyItem();
+        const newItem = newPedalboard.createEmptyItem();
         newPedalboard.addItem(newItem, instanceId, append);
         newPedalboard.selectedPlugin = newItem.instanceId;
         this.setModelPedalboard(newPedalboard);
@@ -2315,7 +2498,7 @@ export class PiPedalModel //implements PiPedalModel
         return newItem.instanceId;
     }
     addPedalboardSplitItem(instanceId: number, append: boolean): number {
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
 
         if (instanceId === Pedalboard.START_CONTROL_ID && append) {
             instanceId = pedalboard.items[0].instanceId;
@@ -2326,14 +2509,14 @@ export class PiPedalModel //implements PiPedalModel
         }
 
 
-        let newPedalboard = pedalboard.clone();
+        const newPedalboard = pedalboard.clone();
         this.updateVst3State(newPedalboard);
 
-        let item = newPedalboard.getItem(instanceId);
+        const item = newPedalboard.getItem(instanceId);
         if (item === null) {
             throw new PiPedalArgumentError("instanceId not found.");
         }
-        let newItem = newPedalboard.createEmptySplit();
+        const newItem = newPedalboard.createEmptySplit();
         newPedalboard.addItem(newItem, instanceId, append);
         newPedalboard.selectedPlugin = newItem.instanceId;
 
@@ -2343,12 +2526,12 @@ export class PiPedalModel //implements PiPedalModel
 
     }
     setPedalboardItemEmpty(instanceId: number): number {
-        let pedalboard = this.pedalboard.get();
-        let newPedalboard = pedalboard.clone();
+        const pedalboard = this.pedalboard.get();
+        const newPedalboard = pedalboard.clone();
         this.updateVst3State(newPedalboard);
 
 
-        let item = newPedalboard.getItem(instanceId);
+        const item = newPedalboard.getItem(instanceId);
         if (item === null) {
             throw new PiPedalArgumentError("instanceId not found.");
         }
@@ -2368,7 +2551,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     isOnboarding(): boolean {
-        var settings = this.jackServerSettings.get();
+        const settings = this.jackServerSettings.get();
         return settings.isOnboarding;
     }
 
@@ -2391,7 +2574,11 @@ export class PiPedalModel //implements PiPedalModel
                 }).then(() => {
                     accept(true);
                 }).catch((e) => {
-                    this.setError(getErrorMessage(e));
+                    if (isDisconnectedError(e)) {
+                        console.warn("moveAudioFile failed: Disconnected");
+                    } else {
+                        this.setError(getErrorMessage(e));
+                    }
                     accept(false);
                 });
             }
@@ -2404,7 +2591,7 @@ export class PiPedalModel //implements PiPedalModel
         if (saveAfterInstanceId === -1) {
             saveAfterInstanceId = this.presets.get().selectedInstanceId;
         }
-        let request: any = {
+        const request: any = {
             clientId: this.clientId,
             bankInstanceId: bankInstanceId,
             name: newName,
@@ -2428,7 +2615,7 @@ export class PiPedalModel //implements PiPedalModel
                 nullCast(this.webSocket)
                     .request<UpdateStatus>('getUpdateStatus')
                     .then((result) => {
-                        let updateStatus = new UpdateStatus().deserialize(result);
+                        const updateStatus = new UpdateStatus().deserialize(result);
                         this.onUpdateStatusChanged(updateStatus);
                         accept(result);
                     }).catch(
@@ -2456,7 +2643,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     updateLater(delayMs: number) {
-        let futureDate = new Date(Date.now() + delayMs);
+        const futureDate = new Date(Date.now() + delayMs);
         localStorage.setItem('nextUpdateTime', futureDate.toISOString());
 
         this.updatePromptForUpdate();
@@ -2465,11 +2652,11 @@ export class PiPedalModel //implements PiPedalModel
     updateNow(): Promise<void> {
         return new Promise<void>(
             (accept, reject) => {
-                let updateStatus = this.updateStatus.get();
+                const updateStatus = this.updateStatus.get();
                 if (updateStatus.isOnline && updateStatus.isValid && updateStatus.getActiveRelease().updateAvailable) {
                     this.setState(State.DownloadingUpdate);
                     this.expectDisconnect(ReconnectReason.Updating);
-                    let url = updateStatus.getActiveRelease().updateUrl;
+                    const url = updateStatus.getActiveRelease().updateUrl;
 
                     nullCast(this.webSocket)
                         .request<void>('updateNow', url)
@@ -2493,7 +2680,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     getUpdateTime(): Date | null {
-        let item = localStorage.getItem('nextUpdateTime');
+        const item = localStorage.getItem('nextUpdateTime');
         if (item) {
             return new Date(item);
         }
@@ -2518,7 +2705,7 @@ export class PiPedalModel //implements PiPedalModel
 
     saveCurrentPluginPresetAs(pluginInstanceId: number, newName: string): Promise<number> {
         // default behaviour is to save after the currently selected preset.
-        let request: any = {
+        const request: any = {
             instanceId: pluginInstanceId,
             name: newName,
         };
@@ -2552,7 +2739,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     renamePresetItem(instanceId: number, name: string): Promise<void> {
-        let body: RenamePresetBody = {
+        const body: RenamePresetBody = {
             clientId: this.clientId,
             instanceId: instanceId,
             name: name
@@ -2562,7 +2749,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     copyPreset(fromId: number, toId: number = -1): Promise<number> {
-        let body: any = {
+        const body: any = {
             clientId: this.clientId,
             fromId: fromId,
             toId: toId
@@ -2575,9 +2762,13 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     showAlert(message: any): void {
+        if (isDisconnectedError(message)) {
+            console.warn("Request failed: Disconnected");
+            return;
+        }
         let m: string;
         if (message instanceof Error) {
-            let e = message as Error;
+            const e = message as Error;
             if (e.message) {
                 m = e.message as string;
             } else {
@@ -2593,7 +2784,7 @@ export class PiPedalModel //implements PiPedalModel
     monitorPortSubscriptions: MonitorPortHandleImpl[] = [];
 
     monitorPort(instanceId: number, key: string, updateRateSeconds: number, onUpdated: (value: number) => void): MonitorPortHandle {
-        let result = new MonitorPortHandleImpl(instanceId, key, onUpdated);
+        const result = new MonitorPortHandleImpl(instanceId, key, onUpdated);
         this.monitorPortSubscriptions.push(result);
         if (!this.webSocket) return result;
 
@@ -2614,16 +2805,20 @@ export class PiPedalModel //implements PiPedalModel
 
                     }
                 }
+            })
+            .catch((error) => {
+                // e.g. "Disconnected". The subscription is discarded when the connection is lost.
+                console.warn("monitorPort failed: " + getErrorMessage(error));
             });
         return result;
 
 
     }
     unmonitorPort(handle: MonitorPortHandle): void {
-        let t = handle as MonitorPortHandleImpl;
+        const t = handle as MonitorPortHandleImpl;
 
         for (let i = 0; i < this.monitorPortSubscriptions.length; ++i) {
-            let item = this.monitorPortSubscriptions[i];
+            const item = this.monitorPortSubscriptions[i];
             if (item === t) {
                 this.monitorPortSubscriptions.splice(i, 1);
                 item.valid = false;
@@ -2644,15 +2839,15 @@ export class PiPedalModel //implements PiPedalModel
 
     addVuSubscription(instanceId: number, vuChangedHandler: VuChangedHandler): VuSubscriptionHandle {
 
-        let result = new VuSubscriptionHandleImpl(instanceId, vuChangedHandler);
+        const result = new VuSubscriptionHandleImpl(instanceId, vuChangedHandler);
 
         if (!this.webSocket) return result; // racing to death. don't subscribe.
 
-        let item = this.vuSubscriptions[instanceId];
+        const item = this.vuSubscriptions[instanceId];
         if (item) {
             item.subscribers.push(result);
         } else {
-            let newTarget = new VuSubscriptionTarget();
+            const newTarget = new VuSubscriptionTarget();
             newTarget.subscribers.push(result);
             this.vuSubscriptions[instanceId] = newTarget;
 
@@ -2675,9 +2870,9 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     removeVuSubscription(handle: VuSubscriptionHandle): void {
-        let handleImpl = handle as VuSubscriptionHandleImpl;
+        const handleImpl = handle as VuSubscriptionHandleImpl;
 
-        let item = this.vuSubscriptions[handleImpl.instanceId];
+        const item = this.vuSubscriptions[handleImpl.instanceId];
         if (item) {
             for (let i = 0; i < item.subscribers.length; ++i) {
                 if (item.subscribers[i] === handleImpl) {
@@ -2703,7 +2898,7 @@ export class PiPedalModel //implements PiPedalModel
         }
     }
     setPatchProperty(instanceId: number, uri: string, value: any): Promise<boolean> {
-        let result = new Promise<boolean>((resolve, reject) => {
+        const result = new Promise<boolean>((resolve, reject) => {
             if (this.webSocket) {
                 this.webSocket.request<boolean>(
                     "setPatchProperty",
@@ -2721,15 +2916,15 @@ export class PiPedalModel //implements PiPedalModel
         return result;
     }
     getPatchProperty<Type = any>(instanceId: number, uri: string): Promise<Type> {
-        let result = new Promise<Type>((resolve, reject) => {
-            let pedalboard = this.pedalboard.get();
+        const result = new Promise<Type>((resolve, reject) => {
+            const pedalboard = this.pedalboard.get();
             if (pedalboard) {
                 try {
-                    let item = pedalboard.getItem(instanceId);
+                    const item = pedalboard.getItem(instanceId);
                     if (item) {
                         if (item.pathProperties.hasOwnProperty(uri)) {
-                            let value = item.pathProperties[uri];
-                            let jsonValue = JSON.parse(value);
+                            const value = item.pathProperties[uri];
+                            const jsonValue = JSON.parse(value);
                             resolve(jsonValue as Type);
                         }
 
@@ -2754,7 +2949,7 @@ export class PiPedalModel //implements PiPedalModel
         return result;
     }
     openBank(bankId: number): Promise<void> {
-        let result = new Promise<void>((resolve, reject) => {
+        const result = new Promise<void>((resolve, reject) => {
             if (this.webSocket) {
                 this.webSocket.request<void>("openBank", bankId)
                     .then(() => {
@@ -2770,7 +2965,7 @@ export class PiPedalModel //implements PiPedalModel
         return result;
     }
     renameBank(bankId: number, newName: string): Promise<void> {
-        let result = new Promise<void>((resolve, reject) => {
+        const result = new Promise<void>((resolve, reject) => {
             if (!this.webSocket) {
                 reject("No server connection.");
             } else {
@@ -2784,7 +2979,7 @@ export class PiPedalModel //implements PiPedalModel
         return result;
     }
     saveBankAs(bankId: number, newName: string): Promise<number> {
-        let result = new Promise<number>((resolve, reject) => {
+        const result = new Promise<number>((resolve, reject) => {
             if (!this.webSocket) {
                 reject("No server connection.");
             } else {
@@ -2799,7 +2994,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     getJackStatus(): Promise<JackHostStatus> {
-        let result = new Promise<JackHostStatus>((resolve, reject) => {
+        const result = new Promise<JackHostStatus>((resolve, reject) => {
             if (!this.webSocket) {
                 reject("No connection to server.");
             } else {
@@ -2826,7 +3021,7 @@ export class PiPedalModel //implements PiPedalModel
             } else {
                 this.webSocket!.request<any>("getPluginPresets", uri)
                     .then((result) => {
-                        let presets = new PluginUiPresets().deserialize(result);
+                        const presets = new PluginUiPresets().deserialize(result);
                         this.presetCache[uri] = presets;
                         resolve(presets);
                     })
@@ -2890,11 +3085,11 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     setMidiBinding(instanceId: number, midiBinding: MidiBinding): void {
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (!pedalboard) {
             throw new PiPedalStateError("Pedalboard not loaded.");
         }
-        let newPedalboard = pedalboard.clone();
+        const newPedalboard = pedalboard.clone();
         this.updateVst3State(newPedalboard);
         if (newPedalboard.setMidiBinding(instanceId, midiBinding)) {
             this.setModelPedalboard(newPedalboard);
@@ -2907,11 +3102,11 @@ export class PiPedalModel //implements PiPedalModel
         }
     }
     setSystemMidiBinding(instanceId: number, midiBinding: MidiBinding): void {
-        let currentBindings = this.systemMidiBindings.get();
+        const currentBindings = this.systemMidiBindings.get();
 
-        let result: MidiBinding[] = [];
+        const result: MidiBinding[] = [];
 
-        for (var binding of currentBindings) {
+        for (const binding of currentBindings) {
             if (binding.symbol === midiBinding.symbol) {
                 result.push(midiBinding);
             } else {
@@ -2926,7 +3121,7 @@ export class PiPedalModel //implements PiPedalModel
 
     nextListenHandle = 1;
     listenForMidiEvent(onComplete: (midiMessage: MidiMessage) => void): ListenHandle {
-        let handle = this.nextListenHandle++;
+        const handle = this.nextListenHandle++;
 
         this.midiListeners.push(new MidiEventListener(handle, onComplete));
 
@@ -2942,7 +3137,7 @@ export class PiPedalModel //implements PiPedalModel
         propertyUri: string,
         onReceived: PatchPropertyListener
     ): ListenHandle {
-        let handle = this.nextListenHandle++;
+        const handle = this.nextListenHandle++;
 
         this.monitorPatchPropertyListeners.push(new PatchPropertyListenerItem(handle, instanceId, onReceived));
 
@@ -2964,8 +3159,8 @@ export class PiPedalModel //implements PiPedalModel
     private handleNotifyPathPatchPropertyChanged(
         instanceId: number, propertyUri: string, jsonObjectString: string
     ) {
-        let pedalboard = this.pedalboard.get();
-        let pedalboardItem = pedalboard.getItem(instanceId);
+        const pedalboard = this.pedalboard.get();
+        const pedalboardItem = pedalboard.getItem(instanceId);
         if (pedalboardItem) {
             pedalboardItem.pathProperties[propertyUri] = jsonObjectString;
         }
@@ -2974,9 +3169,9 @@ export class PiPedalModel //implements PiPedalModel
 
     }
     private handleNotifyPatchProperty(clientHandle: number, instanceId: number, propertyUri: string, jsonObject: any) {
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         try {
-            let pedalboardItem = pedalboard.tryGetItem(instanceId);
+            const pedalboardItem = pedalboard.tryGetItem(instanceId);
 
             if (pedalboardItem && pedalboardItem.pathProperties[propertyUri] !== undefined) {
                 pedalboardItem.pathProperties[propertyUri] = JSON.stringify(jsonObject);
@@ -2985,7 +3180,7 @@ export class PiPedalModel //implements PiPedalModel
             // e.g. notification for a pedalboard item that is no longer valid.
         }
         for (let i = 0; i < this.monitorPatchPropertyListeners.length; ++i) {
-            let listener = this.monitorPatchPropertyListeners[i];
+            const listener = this.monitorPatchPropertyListeners[i];
             if (listener.handle === clientHandle && listener.instanceId === instanceId) {
                 listener.callback(instanceId, propertyUri, jsonObject);
             }
@@ -2994,13 +3189,13 @@ export class PiPedalModel //implements PiPedalModel
 
 
     handleNotifyMidiListener(clientHandle: number, cc0: number, cc1: number, cc2: number): void {
-        let midiMessage = new MidiMessage(cc0, cc1, cc2);
+        const midiMessage = new MidiMessage(cc0, cc1, cc2);
 
         if (!midiMessage.isNote() && !midiMessage.isControl()) {
             return;
         }
         for (let i = 0; i < this.midiListeners.length; ++i) {
-            let listener = this.midiListeners[i];
+            const listener = this.midiListeners[i];
             if (listener.handle === clientHandle) {
                 listener.callback(midiMessage);
             }
@@ -3022,14 +3217,14 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     displayMediaFile(filePath: string) {
-        let url = this.varServerUrl + "displayMediaFile?path=" + encodeURIComponent(filePath);
+        const url = this.varServerUrl + "displayMediaFile?path=" + encodeURIComponent(filePath);
         window.open(url, "_blank");
     }
     downloadAudioFile(filePath: string) {
-        let downloadUrl = this.varServerUrl + "downloadMediaFile?path=" + encodeURIComponent(filePath);
+        const downloadUrl = this.varServerUrl + "downloadMediaFile?path=" + encodeURIComponent(filePath);
 
         // download with no flashing temporary tab.
-        let link = window.document.createElement("A") as HTMLAnchorElement;
+        const link = window.document.createElement("A") as HTMLAnchorElement;
         link.href = downloadUrl;
         link.target = "_blank";
         link.setAttribute("download", pathFileName(filePath));
@@ -3040,11 +3235,11 @@ export class PiPedalModel //implements PiPedalModel
 
     download(targetType: string, instanceId: number | string): void {
         if (instanceId === -1) return;
-        let url = this.varServerUrl + targetType + "?id=" + instanceId;
+        const url = this.varServerUrl + targetType + "?id=" + instanceId;
 
         // window.open(url, "_blank");
         // download with no flashing temporary tab.
-        let link = window.document.createElement("A") as HTMLAnchorElement;
+        const link = window.document.createElement("A") as HTMLAnchorElement;
         link.href = url;
         link.target = "_blank";
         link.download = "download.piPreset";
@@ -3054,14 +3249,14 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     uploadUserFile(uploadPage: string, file: File, contentType: string = "application/octet-stream", abortController?: AbortController): Promise<string> {
-        let result = new Promise<string>((resolve, reject) => {
+        const result = new Promise<string>((resolve, reject) => {
             try {
                 if (file.size > this.maxFileUploadSize) {
                     reject("File is too large.");
                 }
                 let url = this.varServerUrl + uploadPage;
-                let parsedUrl = new URL(url);
-                let fileNameOnly = file.name.split('/').pop()?.split('\\')?.pop();
+                const parsedUrl = new URL(url);
+                const fileNameOnly = file.name.split('/').pop()?.split('\\')?.pop();
                 let query = parsedUrl.search;
                 if (query.length === 0) {
                     query += '?';
@@ -3094,7 +3289,7 @@ export class PiPedalModel //implements PiPedalModel
                         }
                     })
                     .then((json) => {
-                        let response = json as { errorMessage: string, path: string };
+                        const response = json as { errorMessage: string, path: string };
                         if (response.errorMessage !== "") {
                             throw new Error(response.errorMessage);
                         }
@@ -3116,7 +3311,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     uploadPreset(uploadPage: string, file: File, uploadAfter: number): Promise<number> {
-        let result = new Promise<number>((resolve, reject) => {
+        const result = new Promise<number>((resolve, reject) => {
             try {
                 if (file.size > this.maxPresetUploadSize) {
                     reject("File is too large.");
@@ -3157,7 +3352,7 @@ export class PiPedalModel //implements PiPedalModel
         return result;
     }
     uploadBank(file: File, uploadAfter: number): Promise<number> {
-        let result = new Promise<number>((resolve, reject) => {
+        const result = new Promise<number>((resolve, reject) => {
             try {
                 console.log("File: " + file.name + " Size: " + file.size);
                 if (file.size > this.maxPresetUploadSize) {
@@ -3199,13 +3394,14 @@ export class PiPedalModel //implements PiPedalModel
         return result;
     }
     setGovernorSettings(governor: string): Promise<void> {
-        let newSettings = this.governorSettings.get().clone();
+        const previousSettings = this.governorSettings.get();
+        const newSettings = previousSettings.clone();
         newSettings.governor = governor;
         this.governorSettings.set(newSettings);
 
         return new Promise<void>((resolve, reject) => {
 
-            let ws = this.webSocket;
+            const ws = this.webSocket;
             if (!ws) {
                 resolve();
                 return;
@@ -3218,6 +3414,29 @@ export class PiPedalModel //implements PiPedalModel
                     resolve();
                 })
                 .catch((err) => {
+                    // The server rejected the governor: drop the optimistic value. Re-read the
+                    // server's setting (another client may have changed it meanwhile); fall
+                    // back to the value we replaced if that fails too.
+                    const revert = () => {
+                        if (this.governorSettings.get() === newSettings) {
+                            this.governorSettings.set(previousSettings);
+                        }
+                    };
+                    const refreshWs = this.webSocket;
+                    if (refreshWs) {
+                        refreshWs.request<any>("getGovernorSettings")
+                            .then((data) => {
+                                // Don't let a stale reply overwrite a newer optimistic choice.
+                                if (this.governorSettings.get() === newSettings) {
+                                    this.governorSettings.set(new GovernorSettings().deserialize(data));
+                                }
+                            })
+                            .catch(() => {
+                                revert();
+                            });
+                    } else {
+                        revert();
+                    }
                     reject(err);
                 });
         });
@@ -3225,7 +3444,7 @@ export class PiPedalModel //implements PiPedalModel
     createNewSampleDirectory(relativePath: string, uiFileProperty: UiFileProperty): Promise<string> {
         return new Promise<string>((resolve, reject) => {
 
-            let ws = this.webSocket;
+            const ws = this.webSocket;
             if (!ws) {
                 resolve("");
                 return;
@@ -3248,7 +3467,7 @@ export class PiPedalModel //implements PiPedalModel
 
     getFilePropertyDirectoryTree(uiFileProperty: UiFileProperty, selectedPath: string): Promise<FilePropertyDirectoryTree> {
         return new Promise<FilePropertyDirectoryTree>((resolve, reject) => {
-            let ws = this.webSocket;
+            const ws = this.webSocket;
             if (!ws) {
                 resolve(new FilePropertyDirectoryTree());
                 return;
@@ -3266,7 +3485,7 @@ export class PiPedalModel //implements PiPedalModel
     renameFilePropertyFile(oldRelativePath: string, newRelativePath: string, uiFileProperty: UiFileProperty): Promise<string> {
         return new Promise<string>((resolve, reject) => {
 
-            let ws = this.webSocket;
+            const ws = this.webSocket;
             if (!ws) {
                 resolve("");
                 return;
@@ -3295,7 +3514,7 @@ export class PiPedalModel //implements PiPedalModel
     ): Promise<string> {
         return new Promise<string>((resolve, reject) => {
 
-            let ws = this.webSocket;
+            const ws = this.webSocket;
             if (!ws) {
                 resolve("");
                 return;
@@ -3319,8 +3538,8 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     setWifiConfigSettings(wifiConfigSettings: WifiConfigSettings): Promise<void> {
-        let result = new Promise<void>((resolve, reject) => {
-            let oldSettings = this.wifiConfigSettings.get();
+        const result = new Promise<void>((resolve, reject) => {
+            const oldSettings = this.wifiConfigSettings.get();
             wifiConfigSettings = wifiConfigSettings.clone();
 
             if ((!oldSettings.isEnabled()) && (!wifiConfigSettings.isEnabled())) {
@@ -3355,7 +3574,7 @@ export class PiPedalModel //implements PiPedalModel
 
 
             // notify the server.
-            let ws = this.webSocket;
+            const ws = this.webSocket;
             if (!ws) {
                 reject("Not connected.");
                 return;
@@ -3375,8 +3594,8 @@ export class PiPedalModel //implements PiPedalModel
         return result;
     }
     setWifiDirectConfigSettings(wifiDirectConfigSettings: WifiDirectConfigSettings): Promise<void> {
-        let result = new Promise<void>((resolve, reject) => {
-            let oldSettings = this.wifiDirectConfigSettings.get();
+        const result = new Promise<void>((resolve, reject) => {
+            const oldSettings = this.wifiDirectConfigSettings.get();
             wifiDirectConfigSettings = wifiDirectConfigSettings.clone();
 
             if ((!oldSettings.enable) && (!wifiDirectConfigSettings.enable)
@@ -3387,7 +3606,7 @@ export class PiPedalModel //implements PiPedalModel
                 return;
             }
             if (!wifiDirectConfigSettings.enable) {
-                let t = wifiDirectConfigSettings.hotspotName; // hotspot name can be changed when disabled because it's also the mDNS service name.
+                const t = wifiDirectConfigSettings.hotspotName; // hotspot name can be changed when disabled because it's also the mDNS service name.
                 wifiDirectConfigSettings = oldSettings.clone();
                 wifiDirectConfigSettings.enable = false;
                 wifiDirectConfigSettings.hotspotName = t;
@@ -3404,13 +3623,13 @@ export class PiPedalModel //implements PiPedalModel
                 }
             }
             // save a  version for the server (potentially carrying a password)
-            let serverConfigSettings = wifiDirectConfigSettings.clone();
+            const serverConfigSettings = wifiDirectConfigSettings.clone();
             this.wifiDirectConfigSettings.set(wifiDirectConfigSettings);
 
 
 
             // notify the server.
-            let ws = this.webSocket;
+            const ws = this.webSocket;
             if (!ws) {
                 reject("Not connected.");
                 return;
@@ -3435,7 +3654,7 @@ export class PiPedalModel //implements PiPedalModel
 
 
     getKnownWifiNetworks(): Promise<string[]> {
-        let result = new Promise<string[]>((resolve, reject) => {
+        const result = new Promise<string[]>((resolve, reject) => {
             if (!this.webSocket) {
                 reject("Connection closed.");
                 return;
@@ -3452,7 +3671,7 @@ export class PiPedalModel //implements PiPedalModel
 
 
     getWifiChannels(countryIso3661: string): Promise<WifiChannel[]> {
-        let result = new Promise<WifiChannel[]>((resolve, reject) => {
+        const result = new Promise<WifiChannel[]>((resolve, reject) => {
             if (!this.webSocket) {
                 reject("Connection closed.");
                 return;
@@ -3467,7 +3686,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     getAlsaDevices(): Promise<AlsaDeviceInfo[]> {
-        let result = new Promise<AlsaDeviceInfo[]>((resolve, reject) => {
+        const result = new Promise<AlsaDeviceInfo[]>((resolve, reject) => {
             if (!this.webSocket) {
                 reject("Connection closed.");
                 return;
@@ -3484,10 +3703,10 @@ export class PiPedalModel //implements PiPedalModel
     zoomUiControl(sourceElement: HTMLElement, instanceId: number, uiControl: UiControl): void {
         let name = uiControl.name;
         if (uiControl.port_group !== "") {
-            let pedalboard = this.pedalboard.get();
+            const pedalboard = this.pedalboard.get();
             if (pedalboard) {
-                let plugin = pedalboard.getItem(instanceId);
-                let uiPlugin = this.getUiPlugin(plugin.uri);
+                const plugin = pedalboard.getItem(instanceId);
+                const uiPlugin = this.getUiPlugin(plugin.uri);
                 if (uiPlugin) {
                     for (let i = 0; i < uiPlugin.port_groups.length; ++i) {
                         if (uiPlugin.port_groups[i].symbol === uiControl.port_group) {
@@ -3501,17 +3720,17 @@ export class PiPedalModel //implements PiPedalModel
         this.zoomedUiControl.set({ source: sourceElement, name: name, instanceId: instanceId, uiControl: uiControl });
     }
     onPreviousZoomedControl(): void {
-        let currentUiControl = this.zoomedUiControl.get();
+        const currentUiControl = this.zoomedUiControl.get();
         if (!currentUiControl) return;
 
-        let currentSymbol = currentUiControl.uiControl.symbol;
+        const currentSymbol = currentUiControl.uiControl.symbol;
 
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (!pedalboard) return;
 
-        let pedalboardItem = pedalboard.getItem(currentUiControl.instanceId);
+        const pedalboardItem = pedalboard.getItem(currentUiControl.instanceId);
 
-        let uiPlugin = this.getUiPlugin(pedalboardItem.uri);
+        const uiPlugin = this.getUiPlugin(pedalboardItem.uri);
         if (!uiPlugin) return;
 
         let i = 0;
@@ -3534,17 +3753,17 @@ export class PiPedalModel //implements PiPedalModel
         this.zoomUiControl(currentUiControl.source, currentUiControl.instanceId, uiPlugin.controls[ix]);
     }
     onNextZoomedControl(): void {
-        let currentUiControl = this.zoomedUiControl.get();
+        const currentUiControl = this.zoomedUiControl.get();
         if (!currentUiControl) return;
 
-        let currentSymbol = currentUiControl.uiControl.symbol;
+        const currentSymbol = currentUiControl.uiControl.symbol;
 
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (!pedalboard) return;
 
-        let pedalboardItem = pedalboard.getItem(currentUiControl.instanceId);
+        const pedalboardItem = pedalboard.getItem(currentUiControl.instanceId);
 
-        let uiPlugin = this.getUiPlugin(pedalboardItem.uri);
+        const uiPlugin = this.getUiPlugin(pedalboardItem.uri);
         if (!uiPlugin) return;
 
         let i = 0;
@@ -3572,8 +3791,8 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     setFavorite(pluginUrl: string, isFavorite: boolean): void {
-        let favorites = this.favorites.get();
-        let newFavorites: FavoritesList = {};
+        const favorites = this.favorites.get();
+        const newFavorites: FavoritesList = {};
         Object.assign(newFavorites, favorites);
         if (isFavorite) {
             newFavorites[pluginUrl] = true;
@@ -3590,7 +3809,7 @@ export class PiPedalModel //implements PiPedalModel
 
 
     setUpdatePolicy(updatePolicy: UpdatePolicyT): void {
-        let iPolicy = updatePolicy as number;
+        const iPolicy = updatePolicy as number;
         if (this.webSocket) {
             this.webSocket.send("setUpdatePolicy", iPolicy);
         }
@@ -3604,10 +3823,10 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     preloadImages(imageList: string): void {
-        let imageNames = imageList.split(';');
+        const imageNames = imageList.split(';');
         for (let i = 0; i < imageNames.length; ++i) {
-            let imageName = imageNames[i];
-            let img = new Image();
+            const imageName = imageNames[i];
+            const img = new Image();
             img.src = "/img/" + imageName;
         }
     }
@@ -3653,8 +3872,8 @@ export class PiPedalModel //implements PiPedalModel
 
 
     reloadPage() {
-        // eslint-disable-next-line no-restricted-globals
-        let url = window.location.href.split('#')[0];
+         
+        const url = window.location.href.split('#')[0];
         window.location.href = url;
         //window.location.reload();
     }
@@ -3664,11 +3883,11 @@ export class PiPedalModel //implements PiPedalModel
     private hotspotReconnectTimer?: number = undefined;
 
     async detectServer(address: string) {
-        let port = window.location.port;
-        let newUrl = new URL("http://" + address + ":" + port + "/manifest.json");
+        const port = window.location.port;
+        const newUrl = new URL("http://" + address + ":" + port + "/manifest.json");
 
         try {
-            let response = await fetch(newUrl);
+            const response = await fetch(newUrl);
             if (response.ok) {
                 return "http://" + address + ":" + port;
             }
@@ -3678,15 +3897,15 @@ export class PiPedalModel //implements PiPedalModel
         }
     }
     async pollForLiveServer() {
-        let wifiConfigSettings = this.wifiConfigSettings.get();
+        const wifiConfigSettings = this.wifiConfigSettings.get();
         if (wifiConfigSettings.mdnsName.length !== 0) {
-            let newUrl = await this.detectServer(wifiConfigSettings.mdnsName);
+            const newUrl = await this.detectServer(wifiConfigSettings.mdnsName);
             if (newUrl.length !== 0) {
                 return newUrl;
             }
         }
         if (this.networkChanging_expectHotspot) {
-            let newUrl = await this.detectServer("10.40.0.1");
+            const newUrl = await this.detectServer("10.40.0.1");
             if (newUrl.length !== 0) {
                 return newUrl;
             }
@@ -3703,7 +3922,7 @@ export class PiPedalModel //implements PiPedalModel
         // poll for access to a running pipedal server
         this.hotspotReconnectTimer = setTimeout(
             async () => {
-                let newUrl = await this.pollForLiveServer();
+                const newUrl = await this.pollForLiveServer();
                 if (newUrl.length === 0) {
                     this.startHotspotReconnectTimer();
                 } else {
@@ -3736,13 +3955,13 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     setPedalboardItemTitle(instanceId: number, title: string, iconColor: string): void {
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (!pedalboard) {
             throw new PiPedalStateError("Pedalboard not loaded.");
         }
-        let newPedalboard = pedalboard.clone();
+        const newPedalboard = pedalboard.clone();
         this.updateVst3State(newPedalboard);
-        let item = newPedalboard.getItem(instanceId);
+        const item = newPedalboard.getItem(instanceId);
         if (item.title === title && item.iconColor === iconColor) {
             return;
         }
@@ -3757,14 +3976,14 @@ export class PiPedalModel //implements PiPedalModel
     }
     async getAlsaSequencerConfiguration(): Promise<AlsaSequencerConfiguration> {
         if (this.webSocket) {
-            let result = await this.webSocket.request<any>("getAlsaSequencerConfiguration");
+            const result = await this.webSocket.request<any>("getAlsaSequencerConfiguration");
             return new AlsaSequencerConfiguration().deserialize(result);
         }
         throw new Error("No connection.");
     }
     async getAlsaSequencerPorts(): Promise<AlsaSequencerPortSelection[]> {
         if (this.webSocket) {
-            let result = await this.webSocket.request<AlsaSequencerPortSelection[]>("getAlsaSequencerPorts");
+            const result = await this.webSocket.request<AlsaSequencerPortSelection[]>("getAlsaSequencerPorts");
             return AlsaSequencerPortSelection.deserialize_array(result);
         }
         throw new Error("No connection.");
@@ -3775,7 +3994,7 @@ export class PiPedalModel //implements PiPedalModel
     private pedalboardItemUseModUiChangeListeners: PedalboardItemUseModUiChangeItem[] = [];
 
     private updatePedalboardItemEnabled(instanceId: number, enabled: boolean) {
-        for (let listener of this.pedalboardItemEnabledChangeListeners) {
+        for (const listener of this.pedalboardItemEnabledChangeListeners) {
             if (listener.instanceId === instanceId) {
                 if (listener.currentValue !== enabled) {
                     listener.currentValue = enabled;
@@ -3786,7 +4005,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     private updatePedalboardItemUseModUi(instanceId: number, useModUi: boolean) {
-        for (let listener of this.pedalboardItemUseModUiChangeListeners) {
+        for (const listener of this.pedalboardItemUseModUiChangeListeners) {
             if (listener.instanceId === instanceId) {
                 if (listener.currentValue !== useModUi) {
                     listener.currentValue = useModUi;
@@ -3800,10 +4019,10 @@ export class PiPedalModel //implements PiPedalModel
         instanceId: number,
         onEnabledChanged: PedalboardItemEnabledChangeCallback
     ): ListenHandle {
-        let handle = ++this.nextListenHandle;
-        let currentValue = this.getPedalboardItemEnabled(instanceId);
+        const handle = ++this.nextListenHandle;
+        const currentValue = this.getPedalboardItemEnabled(instanceId);
 
-        let entry: PedalboardItemEnabledChangeItem = {
+        const entry: PedalboardItemEnabledChangeItem = {
             instanceId: instanceId,
             handle: handle,
             currentValue: currentValue,
@@ -3821,10 +4040,10 @@ export class PiPedalModel //implements PiPedalModel
         onUseModUiChanged: PedalboardItemUseModUiChangeCallback
     ): ListenHandle {
 
-        let handle = ++this.nextListenHandle;
-        let currentValue = this.getPedalboardItemUseModUi(instanceId);
+        const handle = ++this.nextListenHandle;
+        const currentValue = this.getPedalboardItemUseModUi(instanceId);
 
-        let entry: PedalboardItemUseModUiChangeItem = {
+        const entry: PedalboardItemUseModUiChangeItem = {
             instanceId: instanceId,
             handle: handle,
             currentValue: currentValue,
@@ -3881,7 +4100,7 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     setPedalboardSelectedPlugin(pluginId: number): void {
-        let pedalboard = this.pedalboard.get();
+        const pedalboard = this.pedalboard.get();
         if (!pedalboard) {
             throw new PiPedalStateError("Pedalboard not loaded.");
         }
@@ -3904,14 +4123,14 @@ export class PiPedalModel //implements PiPedalModel
         return nullCast(this.webSocket).request<number>("copyPresetsToBank", { bankInstanceId: bankInstanceId, presets: presets });
     }
     setPedalboardSideChainInput(instanceId: number, sideChainInputId: number): void {
-        let pedalboard = this.pedalboard.get().clone();
-        let pedalboardItem = pedalboard.getItem(instanceId);
+        const pedalboard = this.pedalboard.get().clone();
+        const pedalboardItem = pedalboard.getItem(instanceId);
         if (!pedalboardItem) {
             return;
         }
         pedalboardItem.sideChainInputId = sideChainInputId;
-        let oldId = pedalboardItem.instanceId;
-        let newId = ++pedalboard.nextInstanceId;
+        const oldId = pedalboardItem.instanceId;
+        const newId = ++pedalboard.nextInstanceId;
 
         pedalboardItem.instanceId = newId; // force reload of pedalboard.
         pedalboard.selectedPlugin = pedalboardItem.instanceId;
@@ -3923,15 +4142,15 @@ export class PiPedalModel //implements PiPedalModel
     }
 
     removeInvalidSidechains(pedalboard: Pedalboard) {
-        let it = pedalboard.itemsGeneratorSplitAfter();
-        let previousItemIds: Set<number> = new Set<number>();
+        const it = pedalboard.itemsGeneratorSplitAfter();
+        const previousItemIds: Set<number> = new Set<number>();
         previousItemIds.add(-2); // start is visible.
         while (true) {
-            let r = it.next();
+            const r = it.next();
             if (r.done) {
                 break;
             }
-            let item = r.value;
+            const item = r.value;
             if (item.sideChainInputId !== -1) {
                 if (!previousItemIds.has(item.sideChainInputId)) {
                     item.sideChainInputId = -1;
@@ -3943,12 +4162,12 @@ export class PiPedalModel //implements PiPedalModel
         }
     }
     updateSidechainReferences(pedalboard: Pedalboard, oldItemId: number, newItemId: number) {
-        let it = pedalboard.itemsGenerator();
+        const it = pedalboard.itemsGenerator();
 
         while (true) {
-            let r = it.next();
+            const r = it.next();
             if (r.done) break;
-            let item = r.value;
+            const item = r.value;
             if (item.sideChainInputId === oldItemId) {
                 item.sideChainInputId = newItemId;
             }
@@ -4023,7 +4242,7 @@ let instance: PiPedalModel | undefined = undefined;
 export class PiPedalModelFactory {
     static getInstance(): PiPedalModel {
         if (instance === undefined) {
-            let impl: PiPedalModel = new PiPedalModel();
+            const impl: PiPedalModel = new PiPedalModel();
             instance = impl;
 
             impl.initialize();

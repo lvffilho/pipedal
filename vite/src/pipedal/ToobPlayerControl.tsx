@@ -47,7 +47,7 @@ import ControlSlider from './ControlSlider';
 import { getTrackTitle } from './AudioFileMetadata';
 
 
-let Player__seek = "http://two-play.com/plugins/toob-player#seek"
+const Player__seek = "http://two-play.com/plugins/toob-player#seek"
 const AUDIO_FILE_PROPERTY_URI = "http://two-play.com/plugins/toob-player#audioFile";
 const LOOP_PROPERTY_URI = "http://two-play.com/plugins/toob-player#loop";
 class PluginState {
@@ -116,10 +116,10 @@ export function formatTimeCompact(timebase: Timebase, sampleRate: number, second
         case TimebaseUnits.Seconds:
             {
                 const t = Math.round(seconds * 100);
-                let hundredths = t % 100;
+                const hundredths = t % 100;
                 let secs = Math.floor(t / 100);
                 let minutes = Math.floor(secs / 60);
-                let hours = Math.floor(minutes / 60);
+                const hours = Math.floor(minutes / 60);
                 minutes = minutes % 60;
                 secs = secs % 60;
 
@@ -132,11 +132,11 @@ export function formatTimeCompact(timebase: Timebase, sampleRate: number, second
             }
         case TimebaseUnits.Beats:
             {
-                let t = Math.round(seconds * timebase.tempo / 60.0 * 100.0);
-                let hundredths = t % 100;
-                let beats = Math.floor(t / 100.0);
-                let bars = Math.floor(beats / timebase.timeSignature.numerator);
-                let beat = (beats - bars * timebase.timeSignature.numerator);
+                const t = Math.round(seconds * timebase.tempo / 60.0 * 100.0);
+                const hundredths = t % 100;
+                const beats = Math.floor(t / 100.0);
+                const bars = Math.floor(beats / timebase.timeSignature.numerator);
+                const beat = (beats - bars * timebase.timeSignature.numerator);
 
                 return `${bars + 1}:${(beat + 1)}${tidyHundredths(hundredths)}`;
             }
@@ -165,7 +165,7 @@ function getAlbumLine(album: string, artist: string, albumArtist: string): strin
     if (artist === "") {
         artist = albumArtist;
     }
-    let joiner = (artist !== "" && album !== "") ? " - " : "";
+    const joiner = (artist !== "" && album !== "") ? " - " : "";
     return album + joiner + artist;
 
 }
@@ -321,7 +321,7 @@ export default function ToobPlayerControl(
         }
         model.getAudioFileMetadata(path)
             .then((metadata) => {
-                let coverArtUri = getAlbumArtUri(model, metadata, path);
+                const coverArtUri = getAlbumArtUri(model, metadata, path);
                 setCoverArt(coverArtUri);
                 setTitle(getTrackTitle(path, metadata));
                 setAlbum(metadata.album);
@@ -405,7 +405,7 @@ export default function ToobPlayerControl(
         );
     }
     function FilePanel() {
-        let textColor = pluginState == PluginState.Error ? "error" : "textPrimary";
+        const textColor = pluginState == PluginState.Error ? "error" : "textPrimary";
 
         return (
             <ButtonBase style={{ display: "block", width: "100%", borderRadius: 10, textAlign: "left" }}
@@ -456,12 +456,12 @@ export default function ToobPlayerControl(
         }
     }
     function getUiFileProperty(uri: string): UiFileProperty {
-        let pedalboardItem = model.pedalboard.get().getItem(props.instanceId);
-        let uiPlugin = model.getUiPlugin(pedalboardItem.uri);
+        const pedalboardItem = model.pedalboard.get().getItem(props.instanceId);
+        const uiPlugin = model.getUiPlugin(pedalboardItem.uri);
         if (!uiPlugin) {
             throw "uiPlugin not found.";
         }
-        for (let property of uiPlugin.fileProperties) {
+        for (const property of uiPlugin.fileProperties) {
             if (property.patchProperty === uri) {
                 return property;
             }
@@ -478,7 +478,7 @@ export default function ToobPlayerControl(
                         tempo: 120.0,
                         timeSignature: { numerator: 4, denominator: 4 }
                     })
-                let loopParameters = {
+                const loopParameters = {
                     start: 0.0,
                     loopEnable: false,
                     loopStart: 0.0,
@@ -492,9 +492,9 @@ export default function ToobPlayerControl(
                 setLoopEnd(0.0);
                 return;
             }
-            let atomObject = JSON.parse(loopSettingsJson);
-            let loopParameters: LoopParameters = atomObject.loopParameters as LoopParameters;
-            let newTimebase: Timebase | undefined = atomObject.timebase as (Timebase | undefined);;
+            const atomObject = JSON.parse(loopSettingsJson);
+            const loopParameters: LoopParameters = atomObject.loopParameters as LoopParameters;
+            const newTimebase: Timebase | undefined = atomObject.timebase as (Timebase | undefined);;
             if (newTimebase !== undefined) {
                 if (!timebaseEqual(timebase, newTimebase)) {
                     setTimebase(newTimebase);
@@ -507,7 +507,7 @@ export default function ToobPlayerControl(
             } else {
                 throw new Error("Invalid loop settings.");
             }
-        } catch (e) {
+        } catch {
             console.warn("Unable to parse loop settings.");
             setTimebase(
                 {
@@ -525,7 +525,7 @@ export default function ToobPlayerControl(
     function onNextTrack() {
         model.getNextAudioFile(audioFile)
             .then((file) => {
-                let json = JsonAtom._Path(file).asAny();
+                const json = JsonAtom._Path(file).asAny();
                 model.setPatchProperty(
                     props.instanceId,
                     AUDIO_FILE_PROPERTY_URI,
@@ -538,7 +538,7 @@ export default function ToobPlayerControl(
     function onPreviousTrack() {
         model.getPreviousAudioFile(audioFile)
             .then((file) => {
-                let json = JsonAtom._Path(file).asAny();
+                const json = JsonAtom._Path(file).asAny();
                 model.setPatchProperty(
                     props.instanceId,
                     AUDIO_FILE_PROPERTY_URI,
@@ -565,28 +565,28 @@ export default function ToobPlayerControl(
                 model.state.removeOnChangedHandler(onStateChanged);
             }
         }
-        let durationHandle = model.monitorPort(props.instanceId, "duration", 1.0 / 15,
+        const durationHandle = model.monitorPort(props.instanceId, "duration", 1.0 / 15,
             (value) => {
                 setDuration(value);
             }
         );
-        let positionHandle = model.monitorPort(props.instanceId, "position", 1.0,
+        const positionHandle = model.monitorPort(props.instanceId, "position", 1.0,
             (value) => {
                 setPosition(value);
             }
         );
 
-        let pluginStateHandle = model.monitorPort(props.instanceId, "state", 1.0 / 1000.0,
+        const pluginStateHandle = model.monitorPort(props.instanceId, "state", 1.0 / 1000.0,
             (value) => {
                 setPluginState(value);
             }
         );
-        let filePropertyHandle = model.monitorPatchProperty(
+        const filePropertyHandle = model.monitorPatchProperty(
             props.instanceId,
             AUDIO_FILE_PROPERTY_URI,
-            (instanceId: number, propertyUri: string, atomObject: any) => {
-                if (typeof (atomObject) === "object") {
-                    let path = atomObject.value;
+            (instanceId: number, propertyUri: string, atomObject: unknown) => {
+                if (typeof (atomObject) === "object" && atomObject !== null) {
+                    const path = (atomObject as { value: string }).value;
                     onAudioFileChanged(path);
                 } else if (typeof (atomObject) === "string") {
                     onAudioFileChanged(atomObject as string);
@@ -594,10 +594,10 @@ export default function ToobPlayerControl(
             }
 
         );
-        let loopPropertyHandle = model.monitorPatchProperty(
+        const loopPropertyHandle = model.monitorPatchProperty(
             props.instanceId,
             LOOP_PROPERTY_URI,
-            (instanceId: number, propertyUri: string, atomObject: any) => {
+            (instanceId: number, propertyUri: string, atomObject: unknown) => {
                 if (typeof (atomObject) === "string") {
                     onLoopPropertyChanged(atomObject as string);
                 }
@@ -607,13 +607,16 @@ export default function ToobPlayerControl(
 
         model.getPatchProperty(props.instanceId, AUDIO_FILE_PROPERTY_URI)
             .then((o) => {
-                let path = o.value;
+                const path = o.value;
                 onAudioFileChanged(path);
             });
         model.getPatchProperty(props.instanceId, LOOP_PROPERTY_URI)
             .then((o) => {
                 onLoopPropertyChanged(o as string);
             })
+            .catch((e) => {
+                console.warn("Failed to read the loop property. " + e.toString());
+            });
 
 
         return () => {
@@ -697,7 +700,7 @@ export default function ToobPlayerControl(
                         instanceId={props.instanceId}
                         controlKey="position"
                         duration={duration}
-                        onPreviewValue={(value) => {
+                        onPreviewValue={() => {
                         }}
                         onValueChanged={(value) => {
                             OnSeek(value);
@@ -844,7 +847,7 @@ export default function ToobPlayerControl(
                         setShowLoopDialog(false);
                     }}
                     onSetLoop={(loop: LoopParameters) => {
-                        let loopSettings = {
+                        const loopSettings = {
                             timebase: timebase,
                             loopParameters: loop
                         };

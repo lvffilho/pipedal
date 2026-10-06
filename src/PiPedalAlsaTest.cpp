@@ -81,12 +81,27 @@ void EnumerateSequencers()
     }
 }
 
+// Sequencer port id of the developer's MIDI keyboard (an Alesis V25).
+static const std::string READ_TEST_PORT_ID = "V25 V25 In";
+
+static bool HasSequencerPort(const std::string &id)
+{
+    for (const auto &port : AlsaSequencer::EnumeratePorts())
+    {
+        if (port.id == id)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 void ReadFromsequencerTest()
 {
     cout << "--- Reading from ALSA Sequencer" << endl;
     AlsaSequencer::ptr sequencer = AlsaSequencer::Create();
 
-    sequencer->ConnectPort("V25 V25 In"); 
+    sequencer->ConnectPort(READ_TEST_PORT_ID);
     
     AlsaMidiMessage message;
     while (true)
@@ -135,8 +150,17 @@ TEST_CASE("ALSA Seq Test", "[pipedal_alsa_seq_test][Build][Dev]")
     // hw:CARD=V25,DEV=0 V25
     EnumerateSequencers();
     TestConfigMigration();
+}
 
-
+// Interactive: prints incoming MIDI messages forever, so it is hidden from
+// [Build]. Run explicitly with "[pipedal_alsa_seq_read]".
+TEST_CASE("ALSA Seq Read Test", "[.][pipedal_alsa_seq_read]")
+{
+    if (!HasSequencerPort(READ_TEST_PORT_ID))
+    {
+        WARN("ALSA sequencer port '" << READ_TEST_PORT_ID << "' (Alesis V25 MIDI keyboard) is not connected. Skipping.");
+        return;
+    }
     ReadFromsequencerTest();
 }
 

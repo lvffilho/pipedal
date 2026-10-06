@@ -76,7 +76,17 @@ namespace pipedal
 	class Vst3HostImpl : public Vst3Host
 	{
 	private:
-		OPtr<Vst3HostApplication> hostApplication;
+		// The SDK's HostApplication is not reference counted (addRef() and
+		// release() are no-ops), so it can't be owned through an OPtr: that
+		// leaked one per Vst3Host. Plugins may keep the context pointer they
+		// were initialize()d with, and PluginContextFactory holds it as a raw
+		// pointer, so use a single process-lifetime instance (never
+		// destroyed, so it also outlives plugins torn down during exit).
+		static Vst3HostApplication *GetHostApplication()
+		{
+			static Vst3HostApplication *hostApplication = new Vst3HostApplication();
+			return hostApplication;
+		}
 		std::string cacheFilePath;
 
 	public:
@@ -116,7 +126,6 @@ namespace pipedal
 Vst3HostImpl::Vst3HostImpl(const std::string &cacheFilePath)
 	: cacheFilePath(cacheFilePath)
 {
-	this->hostApplication = new Vst3HostApplication();
 	EnsureContext();
 }
 
@@ -243,7 +252,7 @@ static PluginType getVst3PluginType(const ClassInfo &classInfo)
 
 void Vst3HostImpl::EnsureContext()
 {
-	PluginContextFactory::instance().setPluginContext(this->hostApplication);
+	PluginContextFactory::instance().setPluginContext(GetHostApplication());
 }
 
 void Vst3Host::Private::UpdateControlInfo(IEditController *controller, Lv2PluginUiInfo &pluginInfo)

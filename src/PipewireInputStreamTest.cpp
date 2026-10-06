@@ -33,7 +33,10 @@ using namespace pipedal;
 using namespace std;
 
 
-TEST_CASE("PipeWire Input Stream Test", "[pipewire_input_stream]")
+// Interactive: needs a running PipeWire server and prints the captured frame
+// count forever, so it is hidden from the default run. Run explicitly with
+// "[pipewire_input_stream]".
+TEST_CASE("PipeWire Input Stream Test", "[.][pipewire_input_stream]")
 {
 
     auto stream = PipeWireInputStream::Create("PiPedalTest Stream", 48000, 2);

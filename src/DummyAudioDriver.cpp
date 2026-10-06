@@ -441,6 +441,9 @@ namespace pipedal
             DeleteBuffers();
         }
 
+        // Not instrumented with CpuUse read/write marks: this driver is compiled out (#ifdef JUNK)
+        // and does no PCM I/O. The live dummy device is AlsaDriver with isDummyDriver set, which
+        // marks Read/Driver/Execute/Write like any ALSA device.
         PIPEDAL_NON_INLINE virtual float CpuUse()
         {
             return 0;

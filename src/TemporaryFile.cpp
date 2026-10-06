@@ -19,6 +19,10 @@
 
 #include "TemporaryFile.hpp"
 #include <fstream>
+#include <stdexcept>
+#include <vector>
+#include <stdlib.h>
+#include <unistd.h>
 
 using namespace pipedal;
 
@@ -28,39 +32,31 @@ TemporaryFile::TemporaryFile(const std::filesystem::path&directory)
     namespace fs = std::filesystem;
     fs::create_directories(directory);
 
-    // Generate a unique filename
-    std::string filename;
-    do {
-        std::string random_string(8, '\0');
-        const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-        
-        srand(static_cast<unsigned int>(time(nullptr)));
-        for (int i = 0; i < 8; ++i) {
-            random_string[i] = alphanum[rand() % (sizeof(alphanum) - 1)];
-        }
-        
-        filename = directory / ("temp_" + random_string + ".tmp");
-    } while (fs::exists(filename));
-
-    // Create the file
-    std::ofstream file(filename);
-    if (!file) {
+    // mkstemps: unique name, created atomically with mode 0600 (temp files may hold
+    // credentials, e.g. TONE3000 tokens in curl request/response bodies).
+    std::string pathTemplate = (directory / "temp_XXXXXX.tmp").string();
+    std::vector<char> buffer(pathTemplate.begin(), pathTemplate.end());
+    buffer.push_back('\0');
+    int fd = mkstemps(buffer.data(), 4);
+    if (fd < 0) {
         throw std::runtime_error("Failed to create temporary file");
     }
-    file.close();
+    close(fd);
 
-    this->path = filename;
+    this->path = std::filesystem::path(buffer.data());
 
 }
 std::filesystem::path TemporaryFile::Detach() {
     std::filesystem::path result = std::move(this->path);
+    this->path.clear(); // moved-from state is unspecified; make "detached" explicit.
     return result;
 }
 TemporaryFile::~TemporaryFile()
 {
     if (!path.empty() && deleteFile)
     {
-        std::filesystem::remove(path);
+        std::error_code ec;
+        std::filesystem::remove(path, ec); // never throw from a destructor.
     }
 }
 
@@ -72,16 +68,24 @@ void TemporaryFile::SetNonDeletedPath(const std::filesystem::path&path)
 
 
 
+// Moves explicitly clear the source's path: a moved-from std::filesystem::path is only
+// "valid but unspecified", and a non-empty one would make the source delete our file.
 TemporaryFile::TemporaryFile(TemporaryFile&&other) {
     this->path = std::move(other.path);
     this->deleteFile = other.deleteFile;
+    other.path.clear();
 }
 TemporaryFile&TemporaryFile::operator=(TemporaryFile&&other) {
+    if (this == &other) {
+        return *this;
+    }
     if (!this->path.empty() && this->deleteFile) {
-        std::filesystem::remove(this->path);
+        std::error_code ec;
+        std::filesystem::remove(this->path, ec);
         this->path.clear();
     }
     this->path = std::move(other.path);
     this->deleteFile = other.deleteFile;
+    other.path.clear();
     return *this;
 }

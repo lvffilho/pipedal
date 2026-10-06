@@ -220,15 +220,20 @@ void AudioFilesDb::DeleteFile(DbFileInfo *dbFile)
 
 void AudioFilesDb::DeleteThumbnails(id_t idFile)
 {
-    if (!updateThumbnailInfoQueryByName)
+    // Own cached statement. (This used to share updateThumbnailInfoQueryByName,
+    // so whichever of the two ran first fixed the SQL for both: after a
+    // DeleteThumbnails(), UpdateThumbnailInfo(fileName,...) bound 4 values to
+    // the 1-parameter DELETE and threw SQLITE_RANGE, so thumbnail types were
+    // never recorded and thumbnails were regenerated and inserted again.)
+    if (!deleteThumbnailsQuery)
     {
-        updateThumbnailInfoQueryByName = std::make_unique<SQLite::Statement>(
+        deleteThumbnailsQuery = std::make_unique<SQLite::Statement>(
             *db,
             "DELETE FROM thumbnails WHERE idFile = ?");
     }
-    updateThumbnailInfoQueryByName->tryReset();
-    updateThumbnailInfoQueryByName->bind(1, idFile);
-    updateThumbnailInfoQueryByName->exec();
+    deleteThumbnailsQuery->tryReset();
+    deleteThumbnailsQuery->bind(1, idFile);
+    deleteThumbnailsQuery->exec();
 }
 
 size_t AudioFilesDb::GetNumberOfThumbnails()
@@ -273,6 +278,7 @@ void AudioFilesDb::UpdateThumbnailInfo(
             *db,
             "UPDATE files SET thumbnailType = ?,thumbnailFile = ?, thumbnailLastModified = ? WHERE idFile = ?");
     }
+    updateThumbnailInfoQueryById->tryReset();
     updateThumbnailInfoQueryById->bind(1, (int32_t)thumbnailType);
     updateThumbnailInfoQueryById->bind(2, thumbnailFile);
     updateThumbnailInfoQueryById->bind(3, thumbnailLastModified);

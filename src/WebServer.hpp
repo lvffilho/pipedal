@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string.h>
+#include <stdexcept>
 
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ip/network_v6.hpp>
@@ -75,6 +76,8 @@ public:
     constexpr static const char * location = "Location";
     constexpr static const char* accept_encoding = "Accept-Encoding";
     constexpr static const char* content_encoding = "Content-Encoding";
+    constexpr static const char* etag = "ETag";
+    constexpr static const char* if_none_match = "If-None-Match";
 };
 
 
@@ -236,6 +239,20 @@ public:
 
 };
 
+// HTTP status for an exception escaping a request handler: a malformed request
+// (e.g. bad percent-encoding rejected by URL decoding throws std::invalid_argument)
+// is the client's fault (400); anything else is a server error (500).
+// Note: any std::invalid_argument maps to 400, including one thrown by server-side
+// code rather than by decoding the request.
+inline int HttpStatusForException(const std::exception &e)
+{
+    if (dynamic_cast<const std::invalid_argument *>(&e) != nullptr)
+    {
+        return 400;
+    }
+    return 500;
+}
+
 class WebServer {
 public:
     virtual ~WebServer() { }
@@ -252,6 +269,14 @@ public:
 
     // signalOnDone: fire the specified POSIX signal when the service thread terminates. -1 for no signal.
     virtual void RunInBackground(int signalOnDone = -1) = 0;
+
+    // Actual TCP port once the server is listening (useful with port 0); 0 until then.
+    virtual int GetListeningPort() const = 0;
+
+    // Directory upload bodies are spooled to (default /var/pipedal/web_temp).
+    // Call before starting any server; intended for tests.
+    static void SetUploadTempDirectory(const std::filesystem::path &directory);
+    static std::filesystem::path GetUploadTempDirectory();
 
     static std::shared_ptr<WebServer> create(
         const boost::asio::ip::address &address, 

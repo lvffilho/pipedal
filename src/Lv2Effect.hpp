@@ -27,10 +27,15 @@
 #include "FileBrowserFilesFeature.hpp"
 #include "PatchPropertyWriter.hpp"
 #include <unordered_map>
+#include <atomic>
+#include <mutex>
+#include <map>
+#include <numeric>
 #include "MapPathFeature.hpp"
 #include "OptionsFeature.hpp"
 
 #include "IEffect.hpp"
+#include "BypassSuspend.hpp"
 #include "Worker.hpp"
 #include "lv2/patch/patch.h"
 #include "lv2/log/log.h"
@@ -43,6 +48,20 @@
 
 namespace pipedal
 {
+    /**
+     * @brief Output latency of Lv2Effect buffer staging: blocks of `blockLength` frames, host cycles of
+     * `maxBufferSize` frames. The smallest latency at which the staged output never runs dry
+     * (blockLength - gcd(maxBufferSize, blockLength); see Lv2Effect::EnableBufferStaging).
+     */
+    inline size_t StagingLatency(size_t maxBufferSize, size_t blockLength)
+    {
+        if (blockLength == 0 || maxBufferSize == 0)
+        {
+            return 0;
+        }
+        return blockLength - std::gcd(maxBufferSize, blockLength);
+    }
+
 
     class RealtimeRingBufferWriter;    
     class IPatchWriterCallback;
@@ -123,8 +142,25 @@ namespace pipedal
 
         std::vector<LV2_URID> pathProperties;
         std::vector<PatchPropertyWriter> pathPropertyWriters;
+        // Path patch properties dropped on the audio thread because they exceeded the
+        // reserved PatchPropertyWriter capacity. Process-wide, so that the service thread
+        // (rtsvc) can report it without reaching into pedalboards it does not own.
+        static std::atomic<uint64_t> droppedPathPatchProperties;
 
-        std::unordered_map<std::string,std::string> mainThreadPathProperties;
+    public:
+        // Non-realtime: drops (across all instances) since the previous call.
+        static uint64_t TakeDroppedPathPatchProperties()
+        {
+            return droppedPathPatchProperties.exchange(0, std::memory_order_relaxed);
+        }
+
+    private:
+
+        std::unordered_map<std::string,std::string> mainThreadPathProperties; // guarded by mainThreadPathPropertiesMutex.
+        mutable std::mutex mainThreadPathPropertiesMutex;
+        // Serializes the plugin's state save()/restore() (GetLv2State/SetLv2State), which may be called from
+        // several non-realtime threads (the model's state-save path, and the pedalboard builder thread).
+        std::mutex stateMutex;
 
         class Urids
         {
@@ -183,7 +219,9 @@ namespace pipedal
 
         Urids urids;
 
-        uint64_t instanceId;
+        // Atomic: a reused instance is re-keyed (SetInstanceId) by the pedalboard builder thread while the
+        // audio thread may still be running it in the outgoing pedalboard.
+        std::atomic<uint64_t> instanceId;
         BufferPool bufferPool;
 
         static LV2_Worker_Status worker_schedule_fn(LV2_Worker_Schedule_Handle handle,
@@ -196,13 +234,8 @@ namespace pipedal
         void ResetInputAtomBuffer(char*data);
         void ResetOutputAtomBuffer(char*data);
 
-        uint32_t bypassStartingSamples = 0;
-
         bool bypass = true;
-        double targetBypass = 0;
-        double currentBypass = 0;
-        double currentBypassDx = 0;
-        uint32_t bypassSamplesRemaining = 0;
+        BypassFader bypassFader;
 
         bool requestStateChangedNotification = false;
 
@@ -212,16 +245,52 @@ namespace pipedal
         std::vector<std::vector<float>> outputMixBuffers;
         void BypassDezipperTo(float value);
         void BypassDezipperSet(float value);
+        bool suspended = false;
 
         bool borrowedEffect = false;
         bool activated = false;
+        double instantiatedSampleRate = 0;
+        size_t instantiatedMaxBufferSize = 0;
         void EnableBufferStaging(size_t bufferSize);
         void CheckStagingBufferSentries();
 
     public:
         bool RequiresBufferStaging() const;
+        // Appends the events of `sequence` to the sequence `outputForge` is writing (whole events only; stops
+        // when the output is full). frameTime >= 0: every event at that frame; otherwise the events' own times.
+        static void copyAtomBufferEventSequence(LV2_Atom_Sequence *sequence, LV2_Atom_Forge &outputForge, int64_t frameTime = -1);
+        // Output latency of buffer staging, in frames (0 without staging).
+        size_t GetStagingLatency() const { return stagingLatency; }
         bool IsBorrowedEffect() const { return borrowedEffect; }
         void SetBorrowedEffect(bool value) { borrowedEffect = value; }
+
+        // Used to verify that an existing instance can be borrowed by a rebuilt pedalboard.
+        const std::string &PluginUri() const { return info->uri(); }
+        double InstantiatedSampleRate() const { return instantiatedSampleRate; }
+        size_t InstantiatedMaxBufferSize() const { return instantiatedMaxBufferSize; }
+        // Whether a borrowed instance can be wired to `numberOfInputs` input channels without resizing its
+        // buffer vectors (see BorrowKeepsBufferLayout in PresetInstanceReuse.hpp).
+        bool BorrowKeepsBufferLayout(size_t numberOfInputs, size_t maxBufferSize) const;
+        // The plugin's lv2:enabled port, or -1. Only written through SetBypass().
+        int BypassControlIndex() const { return bypassControlIndex; }
+        // Re-key an instance reused for a pedalboard item with a different instance id (preset switches).
+        // Called on the audio thread when the pedalboard that reuses it is swapped in (Lv2Pedalboard::UpdateAudioPorts).
+        // Messages the instance sends from the audio thread carry the new id from then on.
+        void SetInstanceId(uint64_t instanceId) { this->instanceId.store(instanceId); }
+
+        // Audio thread: install the staged buffer pointers of a borrowed effect (element-wise; no allocation).
+        // The plugin's ports are then connected by UpdateAudioPorts().
+        void SetBorrowedAudioBuffers(
+            const std::vector<float *> &inputs,
+            const std::vector<float *> &sidechains,
+            const std::vector<float *> &outputs);
+        // The instance's current path patch properties (property URI -> json atom).
+        // Non-RT. Thread-safe (the pedalboard builder thread reads it without the model mutex).
+        std::map<std::string, std::string> GetPathPatchProperties() const
+        {
+            std::lock_guard<std::mutex> lock(mainThreadPathPropertiesMutex);
+            return std::map<std::string, std::string>(mainThreadPathProperties.begin(), mainThreadPathProperties.end());
+        }
         void UpdateAudioPorts();
         
         // non RT-thread use only.
@@ -262,8 +331,13 @@ namespace pipedal
 
         bool deleted = false;
         size_t stagingBufferSize = 0;
-        size_t stagingInputIx = 0;
-        size_t stagingOutputIx = 0;
+        size_t stagingInputIx = 0; // index of the next frame in the input staging buffers.
+        size_t stagingLatency = 0;  // output delay, in frames (see EnableBufferStaging).
+        // Output FIFO (per output port): the plugin's output blocks, read stagingLatency frames behind.
+        std::vector<std::vector<float>> stagingOutputFifo;
+        size_t stagingFifoCapacity = 0;
+        size_t stagingFifoReadIx = 0;
+        size_t stagingFifoCount = 0;
         std::vector<std::vector<float>> inputStagingBuffers;
         std::vector<std::vector<float>> sidechainStagingBuffers;
         std::vector<std::vector<float>> outputStagingBuffers;
@@ -276,15 +350,17 @@ namespace pipedal
         std::vector<uint8_t> stagedOutputAtomBuffer;
         void *stagedOutputAtomBufferPointer = nullptr;
 
-        size_t stageToOutput(size_t outputIndex, size_t nFrames);
-        size_t stageToInput(size_t inputIndex, size_t nFrames);
+        size_t stageFrames(size_t sampleOffset, size_t samples);
+        void PushStagedOutput();
+        void PopStagedOutput(size_t samples);
+        float *StagedOutputDestination(size_t channel);
 
 
         LV2_Atom_Forge stagedInputForgeRt;
         LV2_Atom_Forge_Frame staged_input_frame;
 
         void MixOutput(uint32_t samples, RealtimeRingBufferWriter *realtimeRingBufferWriter);
-        void copyAtomBufferEventSequence(LV2_Atom_Sequence *sequence, LV2_Atom_Forge &outputForge);
+
         void resetStagedInputAtomBuffer();
 
     public:
@@ -386,6 +462,14 @@ namespace pipedal
 
         virtual void Activate();
         virtual void Run(uint32_t samples, RealtimeRingBufferWriter *realtimeRingBufferWriter);
+        // Run, but skip lilv_instance_run() if suspendBypassedPlugins is set and the
+        // plugin's bypass crossfade has completed. (see BypassSuspend.hpp)
+        void Run(uint32_t samples, RealtimeRingBufferWriter *realtimeRingBufferWriter, bool suspendBypassedPlugins);
+        // True if the plugin has atom input (patch messages, MIDI) queued for this cycle. RT-safe.
+        bool HasPendingAtomInput() const;
+        bool IsSuspended() const { return suspended; }
+        // Replace the (Chunk-reset) atom output buffers with empty sequences, for a cycle in which run() was skipped. RT-safe.
+        void WriteEmptyOutputAtomBuffers();
         virtual void RunWithBufferStaging(uint32_t samples, RealtimeRingBufferWriter *realtimeRingBufferWriter);
         virtual void Deactivate();
     };

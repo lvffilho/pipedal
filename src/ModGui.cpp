@@ -27,6 +27,7 @@
  #include "PluginHost.hpp"
  #include "Finally.hpp"
  #include "lv2/atom/atom.h"
+ #include <filesystem>
 
 
 #define MOD_GUI_PREFIX "http://moddevices.com/ns/modgui#"
@@ -75,6 +76,7 @@ ModGuiUris::ModGuiUris(LilvWorld *pWorld, MapFeature &mapFeature)
     mod_gui__knob = lilv_new_uri(pWorld, MOD_GUI__knob);
     mod_gui__port = lilv_new_uri(pWorld, MOD_GUI__port);
     mod_gui__monitoredOutputs = lilv_new_uri(pWorld, MOD_GUI__monitoredOutputs);
+    rdfs__seeAlso = lilv_new_uri(pWorld, LILV_NS_RDFS "seeAlso");
 }
 
 static const char*NonNull(const char*string) {
@@ -187,6 +189,31 @@ ModGui::ModGui(
 }
 
 
+// lilv collects a plugin's rdfs:seeAlso data files when it first finds the plugin
+// in LV2_PATH. A bundle scanned later that only adds data to an installed plugin
+// (e.g. a ModGUI overlay in /usr/local/lib/lv2 for a plugin in /usr/lib/lv2, see
+// tools/install-mod-guis.sh) has its manifest loaded, but its data files are
+// never read. Load any such files now, so the result doesn't depend on LV2_PATH order.
+static void LoadExtensionDataFiles(LilvWorld *pWorld, ModGuiUris &modGuiUrids, const LilvPlugin *lilvPlugin)
+{
+    const LilvNode *pluginUri = lilv_plugin_get_uri(lilvPlugin);
+    AutoLilvNodes seeAlsoFiles = lilv_world_find_nodes(pWorld, pluginUri, modGuiUrids.rdfs__seeAlso, nullptr);
+    if (!seeAlsoFiles)
+    {
+        return;
+    }
+    const LilvNodes *dataUris = lilv_plugin_get_data_uris(lilvPlugin);
+    LILV_FOREACH(nodes, it, seeAlsoFiles.Get())
+    {
+        if (!lilv_nodes_contains(dataUris, lilv_nodes_get(seeAlsoFiles.Get(), it)))
+        {
+            // Reads the plugin's seeAlso files; lilv skips files it has already loaded.
+            lilv_world_load_resource(pWorld, pluginUri);
+            return;
+        }
+    }
+}
+
 ModGui::ptr ModGui::Create(PluginHost *lv2Host, const LilvPlugin *lilvPlugin)
 {
 
@@ -196,21 +223,33 @@ ModGui::ptr ModGui::Create(PluginHost *lv2Host, const LilvPlugin *lilvPlugin)
     AutoLilvNode modGuiUri;
     std::string resourceDirectory;
 
+    LoadExtensionDataFiles(pWorld, modGuiUrids, lilvPlugin);
+
     AutoLilvNodes modGuiNodes = lilv_plugin_get_value(lilvPlugin,modGuiUrids.mod_gui__gui);
 
     if (!modGuiNodes) {
         return nullptr; // no mod gui found.
     }
+    // A plugin can have more than one modgui:gui, e.g. a package's own description
+    // whose resource files weren't packaged, plus one from an overlay bundle
+    // (tools/install-mod-guis.sh). lilv returns them in no particular order, so
+    // prefer one whose resource directory exists; otherwise the last one.
+    bool resourceDirectoryExists = false;
     LILV_FOREACH(nodes, it, modGuiNodes.Get()) {
         AutoLilvNode node  = lilv_nodes_get(modGuiNodes.Get(), it);
 
         AutoLilvNode resourceDir = lilv_world_get(pWorld, node, modGuiUrids.mod_gui__resourceDirectory,nullptr);
         if (resourceDir) {
-            resourceDirectory = lilv_file_uri_parse(lilv_node_as_string(resourceDir),nullptr);
-            modGuiUri = lilv_node_duplicate(node);
-        } else {
-            resourceDirectory.clear();
-            modGuiUri.Free();
+            char *path = lilv_file_uri_parse(lilv_node_as_string(resourceDir),nullptr);
+            std::string thisDirectory = NonNull(path);
+            lilv_free(path);
+            std::error_code ec;
+            bool exists = !thisDirectory.empty() && std::filesystem::is_directory(thisDirectory, ec);
+            if (exists || !resourceDirectoryExists) {
+                resourceDirectory = thisDirectory;
+                modGuiUri = lilv_node_duplicate(node);
+                resourceDirectoryExists = exists;
+            }
         }
     }
     if (!modGuiUri) {

@@ -17,6 +17,7 @@
 // IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+import LazyBoundary, { lazyWithRetry } from './LazyBoundary';
 import React from 'react';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import { Theme } from '@mui/material/styles';
@@ -35,7 +36,8 @@ import { PiPedalModelFactory } from "./PiPedalModel";
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import { UiPlugin, PortGroup } from './Lv2Plugin';
 import PluginIcon from './PluginIcon';
-import { Remark } from 'react-remark';
+// The markdown renderer is a large dependency; load it only when an info dialog is opened.
+const PluginDescription = lazyWithRetry(() => import('./PluginDescription'));
 import { css } from '@emotion/react';
 
 
@@ -132,7 +134,7 @@ function ioDescription(plugin: UiPlugin): string {
 //     );
 // }
 function makeControls(plugin: UiPlugin, controlHeadeClass: string) {
-    let controls = plugin.controls;
+    const controls = plugin.controls;
     let hasComments = false;
 
     for (let i = 0; i < controls.length; ++i) {
@@ -145,11 +147,11 @@ function makeControls(plugin: UiPlugin, controlHeadeClass: string) {
     let lastPortGroup: PortGroup | null = null;
 
     if (hasComments) {
-        let trs: React.ReactElement[] = [];
+        const trs: React.ReactElement[] = [];
         for (let i = 0; i < controls.length; ++i) {
-            let control = controls[i];
+            const control = controls[i];
             if (!(control.not_on_gui) && control.is_input) {
-                let portGroup = plugin.getPortGroupBySymbol(control.port_group);
+                const portGroup = plugin.getPortGroupBySymbol(control.port_group);
                 if (portGroup !== lastPortGroup) {
                     if (portGroup !== null) 
                     {
@@ -216,10 +218,10 @@ function makeControls(plugin: UiPlugin, controlHeadeClass: string) {
 
 const PluginInfoDialog = withStyles((props: PluginInfoProps) => {
 
-    let model = PiPedalModelFactory.getInstance();
+    const model = PiPedalModelFactory.getInstance();
     const [open, setOpen] = React.useState(false);
-    let { plugin_uri } = props;
-    let classes = withStyles.getClasses(props);
+    const { plugin_uri } = props;
+    const classes = withStyles.getClasses(props);
 
     const handleClickOpen = () => {
         setOpen(true);
@@ -227,7 +229,7 @@ const PluginInfoDialog = withStyles((props: PluginInfoProps) => {
     const handleClose = () => {
         setOpen(false);
     };
-    let uri = props.plugin_uri;
+    const uri = props.plugin_uri;
     let visible = true;
     if (uri === null || uri === "") {
         visible = false;
@@ -235,7 +237,7 @@ const PluginInfoDialog = withStyles((props: PluginInfoProps) => {
     if (!visible) {
         return (<div></div>);
     };
-    let plugin = model.getUiPlugin(plugin_uri);
+    const plugin = model.getUiPlugin(plugin_uri);
 
     if (plugin === null) {
         return (<div></div>)
@@ -311,32 +313,9 @@ const PluginInfoDialog = withStyles((props: PluginInfoProps) => {
                                     Description:
                                 </Typography>
                                 <div style={{ marginLeft: 24, marginTop: 16 }}>
-                                    <Remark
-                                        rehypeReactOptions={{
-                                            components: {
-                                                p: (props: any) => {
-                                                    // return (
-                                                    //     <p className="MuiTypography-root MuiTypography-body2" {...props} />
-                                                    // );
-                                                    return (
-                                                        <Typography variant="body2" paragraph={true} {...props} />
-                                                    );
-
-                                                },
-                                                code: (props: any) => {
-                                                    return (<code style={{ fontSize: 14 }} {...props} />);
-                                                },
-                                                a: (props: any) => {
-                                                    return (
-                                                        <a target="_blank" {...props} />
-                                                    );
-
-                                                }
-                                            },
-                                        }}
-                                    >
-                                        {plugin.description}
-                                    </Remark>
+                                    <LazyBoundary>
+                                        <PluginDescription description={plugin.description} />
+                                    </LazyBoundary>
                                 </div>
                             </div>
                         )}

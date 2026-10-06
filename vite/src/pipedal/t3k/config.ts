@@ -6,7 +6,11 @@ export const T3K_API = (
   'https://www.tone3000.com'
 ).replace(/\/+$/, '');
 
-export const PUBLISHABLE_KEY = "t3k_pub_bHrH8btdwXXTtxz5ryEU8sNLF-2TGRT9";
+// The TONE3000 OAuth client id: a publishable key (t3k_pub_...), safe to ship. The CMake build sets
+// VITE_T3K_PUBLISHABLE_KEY from PIPEDAL_T3K_PUBLISHABLE_KEY, so the web UI and pipedald agree; the
+// fallback (the CMake default) serves a plain `npm run build` / `npm run dev`. Never a secret key.
+export const PUBLISHABLE_KEY: string =
+  import.meta.env.VITE_T3K_PUBLISHABLE_KEY || "t3k_pub_47aYRwEal7tgm_i62bBlQP45wcr_7iwl";
 
 // Per-demo keys — fall back to the shared PUBLISHABLE_KEY for local dev
 export const PUBLISHABLE_KEY_SELECT = PUBLISHABLE_KEY;

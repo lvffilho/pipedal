@@ -74,6 +74,8 @@ namespace pipedal
         const char *errorMessage = nullptr;
         std::string jsonResponse;
         int64_t sampleTimeout = 0;
+        // The instance-id lineage of the pedalboard instanceId refers to (Lv2Pedalboard::GetInstanceIdLineage()).
+        uint64_t instanceIdLineage = 0;
 
         RealtimePatchPropertyRequest *pNext = nullptr;
 
@@ -154,6 +156,57 @@ namespace pipedal
         PortMonitorCallback onUpdate;
     };
 
+    // MIDI value changes, patch set replies and path property notifications from the audio thread
+    // carry the effect that sent them. Between the install of a new pedalboard and the audio
+    // thread's swap, the outgoing pedalboard keeps running: its instance ids may name unrelated
+    // items of the new one (ids collide across presets), and a reused instance is only re-keyed to
+    // its new instance id at the swap. So the sender is identified by address in the installed
+    // pedalboard: returns false if it isn't there (a message from the outgoing pedalboard),
+    // otherwise sets *installedInstanceId to the id it has in the installed pedalboard. The effect
+    // is only compared, never dereferenced. PEDALBOARD: Lv2Pedalboard (a template only so that
+    // tests can use a stand-in).
+    template <typename PEDALBOARD>
+    bool FindInstalledSender(PEDALBOARD *installedPedalboard, const IEffect *sourceEffect, uint64_t *installedInstanceId)
+    {
+        if (sourceEffect == nullptr || installedPedalboard == nullptr)
+        {
+            return false;
+        }
+        const auto &effects = installedPedalboard->GetEffects();
+        for (size_t i = 0; i < effects.size(); ++i)
+        {
+            if (effects[i] == sourceEffect)
+            {
+                *installedInstanceId = installedPedalboard->GetInstanceIdAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // MIDI value changes are stricter than FindInstalledSender(): a value from the outgoing
+    // pedalboard is dropped even if its instance is reused by the installed one, because the swap
+    // applies the installed item's own value (and MIDI bindings) to a reused instance, so applying
+    // a pre-swap value to the model would leave it disagreeing with the audio. A value applies only
+    // if it came from the installed pedalboard itself (sourcePedalboard; per pedalboard, not per
+    // lineage, so a reuse build's swap is covered too), and the sender has that instance id there.
+    // The outgoing pedalboard stays alive until the host reads its EffectReplaced, which follows
+    // all of its messages, so its address can't be reused by the installed pedalboard while a
+    // message from it is pending.
+    template <typename PEDALBOARD>
+    bool IsMidiValueFromInstalledPedalboard(
+        PEDALBOARD *installedPedalboard,
+        const void *sourcePedalboard,
+        uint64_t instanceId,
+        const IEffect *sourceEffect)
+    {
+        uint64_t installedInstanceId = 0;
+        return installedPedalboard != nullptr &&
+               (const void *)installedPedalboard == sourcePedalboard &&
+               FindInstalledSender(installedPedalboard, sourceEffect, &installedInstanceId) &&
+               installedInstanceId == instanceId;
+    }
+
     class IAudioHostCallbacks
     {
     public:
@@ -161,15 +214,21 @@ namespace pipedal
         virtual bool OnNotifyMaybeLv2StateChanged(uint64_t instanceId) = 0;
         virtual void OnNotifyVusSubscription(const std::vector<VuUpdateX> &updates) = 0;
         virtual void OnNotifyMonitorPort(const MonitorPortUpdate &update) = 0;
-        virtual void OnNotifyMidiValueChanged(int64_t instanceId, int portIndex, float value) = 0;
+        // sourceEffect: see FindInstalledSender().
+        // sourceEffect, sourcePedalboard: see IsMidiValueFromInstalledPedalboard().
+        virtual void OnNotifyMidiValueChanged(int64_t instanceId, int portIndex, float value, IEffect *sourceEffect, Lv2Pedalboard *sourcePedalboard) = 0;
         virtual void OnNotifyMidiListen(uint8_t cc0, uint8_t cc1, uint8_t cc2) = 0;
 
+        // sourceEffect: the instance that sent it (the instance id is ambiguous just after a new pedalboard is
+        // installed, until the audio thread has swapped it in). See FindInstalledSender().
         virtual void OnNotifyPathPatchPropertyReceived(
             int64_t instanceId,
+            const IEffect *sourceEffect,
             LV2_URID pathPatchProperty,
             LV2_Atom *pathProperty) = 0;
 
-        virtual void OnPatchSetReply(uint64_t instanceId, LV2_URID patchSetProperty, const LV2_Atom *atomValue) = 0;
+        // sourceEffect: see FindInstalledSender().
+        virtual void OnPatchSetReply(uint64_t instanceId, IEffect *sourceEffect, LV2_URID patchSetProperty, const LV2_Atom *atomValue) = 0;
 
         // virtual bool WantsAtomOutput(uint64_t instanceId,LV2_URID patchSetProperty) = 0;
         // virtual void OnNotifyPatchProperty(uint64_t instanceId, LV2_URID patchSetProperty, const std::string&atomJson) = 0;
@@ -246,6 +305,8 @@ namespace pipedal
         virtual void SetOutputVolume(float value) = 0;
         virtual void SetPluginPreset(uint64_t instanceId, const std::vector<ControlValue> &values) = 0;
         virtual void SetBypass(uint64_t instanceId, bool enabled) = 0;
+        // "Suspend bypassed plugins (saves CPU)". Applies to the current and all subsequent pedalboards.
+        virtual void SetSuspendBypassedPlugins(bool value) = 0;
 
         virtual bool IsOpen() const = 0;
 
@@ -262,11 +323,6 @@ namespace pipedal
         virtual JackHostStatus getJackStatus() = 0;
 
         virtual void LoadSnapshot(Snapshot &snapshot, PluginHost &pluginHost) = 0;
-
-        virtual void OnNotifyPathPatchPropertyReceived(
-            int64_t instanceId,
-            const std::string &pathPatchPropertyUri,
-            const std::string &jsonAtom) = 0;
     };
 
 } // namespace pipedal.

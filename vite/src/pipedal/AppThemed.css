@@ -68,13 +68,16 @@ img {
 }
 .ppSignalFlow {
     stroke-dasharray: 4 4;
+}
+/* Movement is opt-in: Settings > Display > "Animate signal flow" sets pp-animate-flow on <html>. */
+.pp-animate-flow .ppSignalFlow {
     animation: ppSignalFlow 1.2s linear infinite;
 }
 
 /* The dashes stay, so an enabled path still reads differently from a bypassed one; only the
    movement stops. The LED has its own rule, beside its emotion style in PedalboardView. */
 @media (prefers-reduced-motion: reduce) {
-    .ppSignalFlow {
+    .pp-animate-flow .ppSignalFlow {
         animation: none;
     }
 }

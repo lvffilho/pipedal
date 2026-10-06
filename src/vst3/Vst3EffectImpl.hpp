@@ -27,6 +27,9 @@
 
 #include "RtInversionGuard.hpp"
 #include "Vst3RtStream.hpp"
+#include "Vst3RtParameterSlots.hpp"
+#include <mutex>
+#include <thread>
 #include "StateInterface.hpp" // Lv2PluginState / Lv2PluginStateEntry
 #include <lv2/atom/atom.h>    // LV2_ATOM__Chunk
 #include <cstring>            // std::strncpy
@@ -90,6 +93,11 @@ namespace pipedal
 		virtual void CheckSync();
 
 		//- PluginHost Interfaces.
+
+		// Realtime-safe. Called from the audio thread (ring buffer SetValue,
+		// MIDI bindings) as well as from non-realtime threads. It only records
+		// the plain value; normalization and IEditController updates happen on
+		// controlWorkerThread (see FlushControlChanges()).
 		virtual void SetControl(int index, float value);
 		virtual float GetControlValue(int index) const
 		{
@@ -300,7 +308,48 @@ namespace pipedal
 		void SendControlChanges(RealtimeRingBufferWriter *realtimeRingBufferWriter);
 		//--------------------------------------------------------------------
 	private:
-		std::mutex parameterMutex;
+		// Parameter flow, plain -> controller -> processor:
+		//
+		//   SetControl() [any thread, RT-safe]
+		//      -> pendingPlainValues (lock-free slots) + controlWorkerWake.Post()
+		//   controlWorkerThread / FlushControlChanges() [non-RT, controllerMutex]
+		//      -> plainParamToNormalized + setParamNormalized
+		//      -> pendingNormalizedValues (lock-free slots)
+		//   preprocess() [audio thread]
+		//      -> inputParameterChanges
+		//
+		// No lock is taken on the audio thread, and the edit controller is never
+		// called there.
+		RtParameterSlots<float> pendingPlainValues;
+		RtParameterSlots<double> pendingNormalizedValues;
+		RtWakeSemaphore controlWorkerWake;
+		std::thread controlWorkerThread;
+		std::atomic<bool> controlWorkerStopping{false};
+		// Serializes non-realtime IEditController access (the control worker
+		// vs. state load/save vs. plugin-initiated performEdit()). Recursive
+		// because plugins may call back into restartComponent()/performEdit()
+		// from inside controller calls. Outermost host lock: no other host
+		// lock is held when taking it or taken while holding it. Never taken
+		// on the audio thread.
+		std::recursive_mutex controllerMutex;
+		void StartControlWorker();
+		void StopControlWorker();
+		void ControlWorkerProc();
+		// Non-RT; caller need not hold controllerMutex.
+		void FlushControlChanges();
+		// Guarded by controllerMutex. Depth of FlushControlChanges() on the
+		// owning thread (> 0 when the plugin re-enters from inside one of its
+		// controller calls), and the indices whose value the outer pass is
+		// currently handing to the controller.
+		int controlFlushDepth = 0;
+		std::vector<uint32_t> controlFlushInFlight;
+		// Set by a restartComponent(kParamValuesChanged) that could not take
+		// controllerMutex without blocking (or was called on the audio
+		// thread); the control worker runs the restart instead.
+		std::atomic<bool> deferredParamValuesRestart{false};
+		// Non-RT; takes controllerMutex (blocking).
+		void RestartParamValues();
+
 		Buffers buffers;
 		std::vector<ParamID> lv2ToVstParam;
 		std::vector<float> parameterValues;
@@ -328,11 +377,9 @@ namespace pipedal
 		IEditController *controller = nullptr;
 		FUnknownPtr<IAudioProcessor> processor;
 
-		ParameterChangeTransfer paramTransferrer;
-
 		MidiCCMapping midiCCMapping;
 		// IMediaServerPtr mediaServer;
-		bool isProcessing = false;
+		std::atomic<bool> isProcessing{false}; // written off-RT, read on the audio thread.
 
 		Name name;
 

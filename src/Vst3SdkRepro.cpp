@@ -1,4 +1,8 @@
 #include <string>
+#include <filesystem>
+#include <iostream>
+#include <stdexcept>
+#include <cassert>
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
 #include "public.sdk/source/vst/hosting/plugprovider.h"
@@ -27,7 +31,9 @@ PluginFactory::ClassInfos GetVst3ClassInfos(const std::string& pluginPath)
 
     if (!module)
     {
-        assert(false && "Vst3 load failed.");
+        // Was assert(false) only: compiled out under NDEBUG, so the null
+        // module was then dereferenced below (SIGSEGV in classInfos()).
+        throw std::runtime_error("Vst3 load failed: " + pluginPath + " (" + error + ")");
     }
     const PluginFactory &factory = module->getFactory();
 
@@ -38,8 +44,17 @@ static std::string HomePath() { return getenv("HOME"); }
 
 void BugReportTest()
 {
-    auto _ = GetVst3ClassInfos(HomePath() + "/.vst3/adelay.vst3");
-    PluginFactory::ClassInfos classInfos = GetVst3ClassInfos(HomePath() + "/.vst3/mda-vst3.vst3");
+    // Repro for a VST3 SDK bug; needs the SDK's adelay sample and the mda-vst3
+    // plugins installed in ~/.vst3.
+    std::string adelayPath = HomePath() + "/.vst3/adelay.vst3";
+    std::string mdaPath = HomePath() + "/.vst3/mda-vst3.vst3";
+    if (!std::filesystem::exists(adelayPath) || !std::filesystem::exists(mdaPath))
+    {
+        std::cout << "SKIP BugReportTest: requires " << adelayPath << " and " << mdaPath << std::endl;
+        return;
+    }
+    auto _ = GetVst3ClassInfos(adelayPath);
+    PluginFactory::ClassInfos classInfos = GetVst3ClassInfos(mdaPath);
 
     // right size.
     assert(classInfos.size() == 68); // succeeds

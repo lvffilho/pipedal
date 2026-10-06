@@ -122,7 +122,7 @@ private:
             return;
         }
         savedGovernor = pipedal::GetCpuGovernor();
-        pipedal::SetCpuGovernor(this->governor);
+        pipedal::TrySetCpuGovernor(this->governor);
         while (true)
         {
             bool cancelled;
@@ -150,10 +150,10 @@ private:
                 savedGovernor = activeGovernor;
 
                 // but insist on using ours!!
-                pipedal::SetCpuGovernor(governor);
+                pipedal::TrySetCpuGovernor(governor);
             }
         }
-        pipedal::SetCpuGovernor(savedGovernor);
+        pipedal::TrySetCpuGovernor(savedGovernor);
     }
     std::unique_ptr<std::thread> pThread;
     std::string governor;

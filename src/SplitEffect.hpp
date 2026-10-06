@@ -399,6 +399,22 @@ namespace pipedal
         {
             outputBuffers[index] = buffer;
         }
+        // True if the top (or bottom) chain currently contributes nothing to the output:
+        // its blend gains are exactly 0 and no blend transition is in progress.
+        // RT-safe. Used to suspend the silent branch of a split (see BypassSuspend.hpp).
+        bool IsBranchSilent(bool topBranch) const
+        {
+            if (!activated || this->blendFadeSamples != 0)
+            {
+                return false;
+            }
+            if (topBranch)
+            {
+                return this->blendLTop == 0 && (this->outputBuffers.size() == 1 || this->blendRTop == 0);
+            }
+            return this->blendLBottom == 0 && (this->outputBuffers.size() == 1 || this->blendRBottom == 0);
+        }
+
         void PreMix(uint32_t frames)
         {
             (this->*preAbTop)(frames);

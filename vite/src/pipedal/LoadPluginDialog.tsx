@@ -66,7 +66,7 @@ const VIEW_MODE_STORAGE_KEY = "com.twoplay.pipedal.load_dlg.view_mode";
 
 export type PluginViewMode = "grid" | "list";
 
-const ALPHABET_RAIL_WIDTH = 26;
+const ALPHABET_RAIL_WIDTH = 36;
 const ALPHABET_LETTERS = "#ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
 const ALPHABET_RAIL_PADDING = 2;
 const ALPHABET_RAIL_FONT_SIZE = 11;
@@ -237,7 +237,7 @@ export const LoadPluginDialog =
                 this.searchInputRef = React.createRef<HTMLInputElement>();
 
                 let filterType_ = PluginType.Plugin; // i.e. "Any".
-                let persistedFilter = window.localStorage.getItem(FILTER_STORAGE_KEY);
+                const persistedFilter = window.localStorage.getItem(FILTER_STORAGE_KEY);
                 if (persistedFilter) {
                     filterType_ = persistedFilter as PluginType;
                 }
@@ -275,7 +275,7 @@ export const LoadPluginDialog =
             margin_reserve: number = 30;
 
             getCellColumns(width: number) {
-                let gridWidth = width - this.margin_reserve;
+                const gridWidth = width - this.margin_reserve;
                 let columns = Math.floor((gridWidth) / this.nominal_column_width);
                 if (columns < 1) columns = 1;
                 if (columns > 3) columns = 3;
@@ -288,7 +288,7 @@ export const LoadPluginDialog =
             }
 
             handleKeyPress(e: React.KeyboardEvent<HTMLDivElement>) {
-                let searchInput = this.searchInputRef.current;
+                const searchInput = this.searchInputRef.current;
                 if (searchInput && e.target !== searchInput) // if the search input doesn't have focus.
                 {
                     if (this.searchInputRef.current) // we do have one, right?
@@ -300,7 +300,7 @@ export const LoadPluginDialog =
                                 {
                                     e.preventDefault();
 
-                                    let newValue = searchInput.value + e.key;
+                                    const newValue = searchInput.value + e.key;
                                     searchInput.value = newValue; // add the key. to the value.
                                     this.handleSearchStringChanged(newValue);
                                     searchInput.focus();
@@ -325,7 +325,7 @@ export const LoadPluginDialog =
             }
 
             handleFavoritesChanged() {
-                let favorites = this.model.favorites.get();
+                const favorites = this.model.favorites.get();
                 this.requestScrollTo();
                 this.setState(
                     {
@@ -405,7 +405,7 @@ export const LoadPluginDialog =
                 this.setState({ viewMode: viewMode });
             }
             onClearFilter(): void {
-                let value = PluginType.Plugin;
+                const value = PluginType.Plugin;
                 window.localStorage.setItem(FILTER_STORAGE_KEY, value as string);
                 if (this.state.filterType !== value) {
                     this.requestScrollTo();
@@ -417,7 +417,7 @@ export const LoadPluginDialog =
 
             selectItem(item: number): void {
                 let uri: string = "";
-                let plugins = this.model.ui_plugins.get();
+                const plugins = this.model.ui_plugins.get();
                 if (item >= 0 && item < plugins.length) {
                     uri = plugins[item].uri;
                 }
@@ -434,7 +434,7 @@ export const LoadPluginDialog =
 
                 let selectedPlugin: UiPlugin | undefined = undefined;
                 if (this.state.selected_uri) {
-                    let t = this.model.getUiPlugin(this.state.selected_uri);
+                    const t = this.model.getUiPlugin(this.state.selected_uri);
                     if (t) selectedPlugin = t;
                 }
                 if (!selectedPlugin)
@@ -473,7 +473,7 @@ export const LoadPluginDialog =
 
                 // a better doubleclick: tracks how many recent clicks in the same area.
                 // regardless of whether we re-rendered in the interrim. 
-                let isDoubleClick = e.detail === 2;
+                const isDoubleClick = e.detail === 2;
                 // we have to synthesize double clicks because 
                 // DOM rewrites interfere with natural double click.
                 if (isDoubleClick) {
@@ -510,7 +510,7 @@ export const LoadPluginDialog =
                 if (!uiPlugin) {
                     return (<Fragment />);
                 } else {
-                    let stereoIndicator = "\u00A0" + this.stereo_indicator(uiPlugin)
+                    const stereoIndicator = "\u00A0" + this.stereo_indicator(uiPlugin)
                     if (uiPlugin.author_name !== "") {
                         if (uiPlugin.author_homepage !== "") {
                             return (<Fragment>
@@ -542,8 +542,8 @@ export const LoadPluginDialog =
             }
             createFilterChildren(result: ReactNode[], classNode: PluginClass, level: number): void {
                 for (let i = 0; i < classNode.children.length; ++i) {
-                    let child = classNode.children[i];
-                    let name = "\u00A0".repeat(level * 3 + 1) + child.display_name;
+                    const child = classNode.children[i];
+                    const name = "\u00A0".repeat(level * 3 + 1) + child.display_name;
                     result.push((<MenuItem key={child.plugin_type} value={child.plugin_type}>{name}</MenuItem>));
                     if (child.children.length !== 0) {
                         this.createFilterChildren(result, child, level + 1);
@@ -551,8 +551,8 @@ export const LoadPluginDialog =
                 }
             }
             createFilterOptions(): ReactNode[] {
-                let classes = this.model.plugin_classes.get();
-                let result: ReactNode[] = [];
+                const classes = this.model.plugin_classes.get();
+                const result: ReactNode[] = [];
 
                 result.push((<MenuItem key={PluginType.Plugin} value={PluginType.Plugin}>&nbsp;All</MenuItem>));
                 this.createFilterChildren(result, classes, 1);
@@ -611,25 +611,68 @@ export const LoadPluginDialog =
                 return map;
             }
 
+            private railScrubbing: boolean = false;
+            private railLastLetter: string | null = null;
+
+            // Maps a pointer y coordinate on the rail to a letter and jumps to it.
+            private scrubRail(e: React.PointerEvent<HTMLElement>, index: Map<string, number>): void {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const top = rect.top + ALPHABET_RAIL_PADDING;
+                const height = rect.height - 2 * ALPHABET_RAIL_PADDING;
+                if (height <= 0) return;
+                let ix = Math.floor((e.clientY - top) / height * ALPHABET_LETTERS.length);
+                ix = Math.max(0, Math.min(ALPHABET_LETTERS.length - 1, ix));
+                const letter = ALPHABET_LETTERS[ix];
+                if (letter === this.railLastLetter) return;
+                const row = index.get(letter);
+                if (row === undefined) return; // no plugins under this letter.
+                this.railLastLetter = letter;
+                this.scrollToRow(row);
+            }
+
             renderAlphabetRail(gridItems: UiPlugin[], columnCount: number): ReactNode {
                 const index = this.buildAlphabetIndex(gridItems, columnCount);
                 return (
-                    <div style={{
-                        flex: "0 0 auto", width: ALPHABET_RAIL_WIDTH,
-                        display: "flex", flexFlow: "column nowrap",
-                        alignItems: "stretch", justifyContent: "space-evenly",
-                        paddingTop: ALPHABET_RAIL_PADDING, paddingBottom: ALPHABET_RAIL_PADDING,
-                        userSelect: "none",
-                    }}>
+                    <div
+                        role="navigation"
+                        aria-label="Jump to letter"
+                        onPointerDown={(e) => {
+                            if (e.pointerType === "mouse" && e.button !== 0) return; // primary button only
+                            this.railScrubbing = true;
+                            this.railLastLetter = null;
+                            try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) { /* not capturable */ }
+                            this.scrubRail(e, index);
+                        }}
+                        onPointerMove={(e) => {
+                            if (this.railScrubbing) this.scrubRail(e, index);
+                        }}
+                        onPointerUp={(e) => {
+                            this.railScrubbing = false;
+                            try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+                        }}
+                        onPointerCancel={() => { this.railScrubbing = false; }}
+                        style={{
+                            flex: "0 0 auto", width: ALPHABET_RAIL_WIDTH,
+                            display: "flex", flexFlow: "column nowrap",
+                            alignItems: "stretch", justifyContent: "space-evenly",
+                            paddingTop: ALPHABET_RAIL_PADDING, paddingBottom: ALPHABET_RAIL_PADDING,
+                            userSelect: "none", touchAction: "none",
+                        }}>
                         {ALPHABET_LETTERS.map((letter) => {
                             const row = index.get(letter);
                             const enabled = row !== undefined;
                             return (
-                                <div
+                                <button
                                     key={letter}
-                                    onClick={enabled ? () => { this.scrollToRow(row as number); } : undefined}
+                                    type="button"
+                                    aria-label={letter === "#" ? "Jump to non-alphabetic names" : "Jump to " + letter}
+                                    disabled={!enabled}
+                                    // Pointer jumps are handled by the rail; a click with detail 0 is the keyboard.
+                                    onClick={(e) => { if (enabled && e.detail === 0) this.scrollToRow(row as number); }}
                                     style={{
                                         cursor: enabled ? "pointer" : "default",
+                                        background: "none", border: "none", padding: 0, margin: 0,
+                                        fontFamily: "inherit",
                                         textAlign: "center",
                                         fontSize: ALPHABET_RAIL_FONT_SIZE,
                                         lineHeight: ALPHABET_RAIL_LINE_HEIGHT,
@@ -640,7 +683,7 @@ export const LoadPluginDialog =
                                     }}
                                 >
                                     {letter}
-                                </div>
+                                </button>
                             );
                         })}
                     </div>
@@ -662,12 +705,12 @@ export const LoadPluginDialog =
                         favoritesList = this.state.favoritesList;
                     }
 
-                    let results: { score: number; plugin: UiPlugin }[] = [];
-                    let searchFilter = new SearchFilter(searchString);
+                    const results: { score: number; plugin: UiPlugin }[] = [];
+                    const searchFilter = new SearchFilter(searchString);
                     const rootClass = this.model.plugin_classes.get();
 
                     for (let i = 0; i < plugins.length; ++i) {
-                        let plugin = plugins[i];
+                        const plugin = plugins[i];
                         if (this.props.modGuiOnly == true && !plugin.modGui)
                             continue;
                         try {
@@ -696,7 +739,7 @@ export const LoadPluginDialog =
                         if (right.score > left.score) return 1;
                         return left.plugin.name.localeCompare(right.plugin.name);
                     });
-                    let t: UiPlugin[] = [];
+                    const t: UiPlugin[] = [];
                     for (let i = 0; i < results.length; ++i) {
                         t.push(results[i].plugin);
                     }
@@ -724,7 +767,7 @@ export const LoadPluginDialog =
                     if (this.scrollToRequested) {
                         this.scrollToRequested = false;
                         let position = -1;
-                        let gridItems = this.cachedGridItems;
+                        const gridItems = this.cachedGridItems;
                         for (let i = 0; i < gridItems.length; ++i) {
                             if (this.state.selected_uri === gridItems[i].uri) {
                                 position = i;
@@ -779,15 +822,15 @@ export const LoadPluginDialog =
 
             }
             renderItem(gridItems: UiPlugin[], row: number, column: number): React.ReactNode {
-                let item: number = (row) * this.gridColumnCount + (column);
+                const item: number = (row) * this.gridColumnCount + (column);
                 if (item >= gridItems.length) {
                     return (<div />);
                 }
-                let value = gridItems[item];
+                const value = gridItems[item];
 
                 const classes = withStyles.getClasses(this.props);
                 const isListView = this.state.viewMode === "list";
-                let isFavorite: boolean = this.state.favoritesList[value.uri] ?? false;
+                const isFavorite: boolean = this.state.favoritesList[value.uri] ?? false;
                 let pluginType = value.plugin_type;
                 if (value.uri === "http://two-play.com/plugins/toob-nam") {
                     pluginType = PluginType.NamPlugin;
@@ -864,7 +907,7 @@ export const LoadPluginDialog =
 
                 let selectedPlugin: UiPlugin | undefined = undefined;
                 if (this.state.selected_uri) {
-                    let t = this.model.getUiPlugin(this.state.selected_uri);
+                    const t = this.model.getUiPlugin(this.state.selected_uri);
                     if (t) selectedPlugin = t;
                 }
 
@@ -878,7 +921,7 @@ export const LoadPluginDialog =
                 // A search sorts by match score, not alphabetically, so the rail would jump to
                 // arbitrary rows.
                 const showAlphabetRail = this.state.search_string === "";
-                let isFavorite = this.state.favoritesList[this.state.selected_uri ?? ""];
+                const isFavorite = this.state.favoritesList[this.state.selected_uri ?? ""];
                 // Not computed inside the AutoSizer callback: that has not run on the first pass, and the
                 // A-Z rail needs the same array.
                 const gridItems = this.getFilteredPlugins(
@@ -1006,10 +1049,10 @@ export const LoadPluginDialog =
                                             if ((!arg.width) || (!arg.height)) {
                                                 return (<div></div>);
                                             }
-                                            let width = arg.width ?? 1;
-                                            let height = arg.height ?? 1;
+                                            const width = arg.width ?? 1;
+                                            const height = arg.height ?? 1;
 
-                                            let scrollRef = (grid: FixedSizeGrid) => { this.handleScrollToCallback(grid); }
+                                            const scrollRef = (grid: FixedSizeGrid) => { this.handleScrollToCallback(grid); }
 
 
                                             return (
@@ -1023,11 +1066,11 @@ export const LoadPluginDialog =
                                                     overscanRowCount={10}
                                                     rowCount={Math.ceil(gridItems.length / this.gridColumnCount)}
                                                     itemKey={(args: { columnIndex: number, data: any, rowIndex: number }) => {
-                                                        let index = args.columnIndex + this.gridColumnCount * args.rowIndex;
+                                                        const index = args.columnIndex + this.gridColumnCount * args.rowIndex;
                                                         if (index >= gridItems.length) {
                                                             return "blank-" + args.columnIndex + "-" + args.rowIndex;
                                                         }
-                                                        let plugin = gridItems[index];
+                                                        const plugin = gridItems[index];
                                                         return plugin.uri + "-" + args.rowIndex + "-" + args.columnIndex;
 
                                                     }}

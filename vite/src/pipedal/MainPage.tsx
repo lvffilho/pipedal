@@ -17,6 +17,7 @@
 // IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+import LazyBoundary, { lazyWithRetry } from './LazyBoundary';
 import { SyntheticEvent } from 'react';
 import { Theme } from '@mui/material/styles';
 import WithStyles, { withTheme } from './WithStyles';
@@ -32,7 +33,7 @@ import {
     Pedalboard, PedalboardItem, PedalboardSplitItem, SplitType
 } from './Pedalboard';
 import InputIcon from '@mui/icons-material/Input';
-import LoadPluginDialog from './LoadPluginDialog';
+const LoadPluginDialog = lazyWithRetry(() => import('./LoadPluginDialog'));
 import Switch from '@mui/material/Switch';
 import Typography from '@mui/material/Typography';
 
@@ -79,7 +80,7 @@ const SNAPSHOT_BADGE_FONT_WEIGHT = 700;
 const SNAPSHOT_BADGE_TEXT_COLOR = '#FFF';
 const SNAPSHOT_BADGE_OUTLINE_WIDTH = 1.5;
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+ 
 // const HORIZONTAL_LAYOUT_MQ = "@media (max-height: " + HORIZONTAL_CONTROL_SCROLL_HEIGHT_BREAK + "px)";
 
 const styles = ({ palette }: Theme) => {
@@ -172,7 +173,7 @@ export const MainPage =
                 constructor(props: MainProps) {
                     super(props);
                     this.model = PiPedalModelFactory.getInstance();
-                    let pedalboard = this.model.pedalboard.get();
+                    const pedalboard = this.model.pedalboard.get();
                     let selectedPedal = pedalboard.selectedPlugin;
                     if (selectedPedal === -1) {
                         selectedPedal = pedalboard.getFirstSelectableItem();
@@ -211,25 +212,25 @@ export const MainPage =
                 }
                 onInsertPedal(instanceId: number) {
                     this.setAddMenuAnchorEl(null);
-                    let newId = this.model.addPedalboardItem(instanceId, false);
+                    const newId = this.model.addPedalboardItem(instanceId, false);
                     this.setSelection(newId);
                 }
                 onAppendPedal(instanceId: number) {
                     this.setAddMenuAnchorEl(null);
-                    let newId = this.model.addPedalboardItem(instanceId, true);
+                    const newId = this.model.addPedalboardItem(instanceId, true);
 
                     this.setSelection(newId);
 
                 }
                 onInsertSplit(instanceId: number) {
                     this.setAddMenuAnchorEl(null);
-                    let newId = this.model.addPedalboardSplitItem(instanceId, false);
+                    const newId = this.model.addPedalboardSplitItem(instanceId, false);
                     this.setSelection(newId);
 
                 }
                 onAppendSplit(instanceId: number) {
                     this.setAddMenuAnchorEl(null);
-                    let newId = this.model.addPedalboardSplitItem(instanceId, true);
+                    const newId = this.model.addPedalboardSplitItem(instanceId, true);
                     this.setSelection(newId);
 
                 }
@@ -251,8 +252,8 @@ export const MainPage =
                     this.setState({ showMidiBindingsDialog: true });
                 }
                 handleEnableCurrentItemChanged(event: any): void {
-                    let newValue = event.target.checked;
-                    let item = this.getSelectedPedalboardItem();
+                    const newValue = event.target.checked;
+                    const item = this.getSelectedPedalboardItem();
                     if (item != null) {
                         this.model.setPedalboardItemEnabled(item.getInstanceId(), newValue);
 
@@ -292,7 +293,7 @@ export const MainPage =
                 }
                 onDeletePedal(instanceId: number): void {
                     // ok.
-                    let result = this.model.deletePedalboardPedal(instanceId);
+                    const result = this.model.deletePedalboardPedal(instanceId);
                     if (result != null)
                         this.setSelection(result); {
                     }
@@ -344,14 +345,14 @@ export const MainPage =
                 }
                 onPedalDoubleClick(selectedId: number): void {
                     this.setSelection(selectedId);
-                    let item = this.getPedalboardItem(selectedId);
+                    const item = this.getPedalboardItem(selectedId);
                     if (item != null) {
                         if (item.isStart() || item.isEnd()) {
                             // do nothing.
                         } else if (item.isSplit()) {
-                            let split = item as PedalboardSplitItem;
+                            const split = item as PedalboardSplitItem;
                             if (split.getSplitType() === SplitType.Ab) {
-                                let cv = split.getToggleAbControlValue();
+                                const cv = split.getToggleAbControlValue();
                                 if (split.instanceId === undefined) throw new PiPedalStateError("Split without valid id.");
                                 this.model.setPedalboardControl(split.instanceId, cv.key, cv.value);
                             }
@@ -365,8 +366,8 @@ export const MainPage =
                 }
                 onLoadOk(selectedUri: string): void {
                     this.setState({ loadDialogOpen: false });
-                    let itemId = this.state.selectedPedal;
-                    let newSelectedItem = this.model.loadPedalboardPlugin(itemId, selectedUri);
+                    const itemId = this.state.selectedPedal;
+                    const newSelectedItem = this.model.loadPedalboardPlugin(itemId, selectedUri);
                     this.setSelection(newSelectedItem);
                 }
                 onSnapshotDialogOk(): void {
@@ -385,7 +386,7 @@ export const MainPage =
                 getPedalboardItem(selectedId?: number): PedalboardItem | null {
                     if (selectedId === undefined) return null;
 
-                    let pedalboard = this.model.pedalboard.get();
+                    const pedalboard = this.model.pedalboard.get();
                     if (!pedalboard) return null;
 
                     if (selectedId === Pedalboard.START_CONTROL_ID) // synthetic input volume item.
@@ -396,12 +397,12 @@ export const MainPage =
                         return pedalboard.makeEndItem();
                     }
 
-                    let it = pedalboard.itemsGenerator();
+                    const it = pedalboard.itemsGenerator();
                     if (!selectedId) return null;
                     while (true) {
-                        let v = it.next();
+                        const v = it.next();
                         if (v.done) break;
-                        let item = v.value;
+                        const item = v.value;
                         if (item.instanceId === selectedId) {
                             return item;
                         }
@@ -412,9 +413,9 @@ export const MainPage =
                 }
 
                 handleShowModUi() {
-                    let newState = !this.state.showModUi;
+                    const newState = !this.state.showModUi;
                     this.model.setPedalboardItemUseModUi(this.state.selectedPedal, newState);
-                    let item = this.model.pedalboard.get().maybeGetItem(this.state.selectedPedal);
+                    const item = this.model.pedalboard.get().maybeGetItem(this.state.selectedPedal);
                     if (item) {
                         setDefaultModGuiPreference(item.uri, newState);
                     }
@@ -427,12 +428,12 @@ export const MainPage =
                     return this.getPedalboardItem(this.state.selectedPedal);
                 }
                 getSelectedUri(): string {
-                    let pedalboardItem = this.getSelectedPedalboardItem();
+                    const pedalboardItem = this.getSelectedPedalboardItem();
                     if (pedalboardItem === null) return "";
                     return pedalboardItem.uri;
                 }
                 titleBar(pedalboardItem: PedalboardItem | null, canShowModUi: boolean): React.ReactNode {
-                    let uiPlugin = pedalboardItem ? this.model.getUiPlugin(pedalboardItem?.uri) : null;
+                    const uiPlugin = pedalboardItem ? this.model.getUiPlugin(pedalboardItem?.uri) : null;
                     let title = "";
                     let author = "";
                     let infoPluginUri = "";
@@ -450,7 +451,7 @@ export const MainPage =
                             infoPluginUri = "";
                         }
                         else {
-                            let uiPlugin = this.model.getUiPlugin(pedalboardItem.uri);
+                            const uiPlugin = this.model.getUiPlugin(pedalboardItem.uri);
                             if (!uiPlugin) {
                                 missing = true;
                                 title = pedalboardItem?.pluginName ?? "Missing plugin";
@@ -619,7 +620,7 @@ export const MainPage =
                 }
 
                 canShowModUi(pedalboardItem: PedalboardItem): boolean {
-                    let pluginInfo = this.model.getUiPlugin(pedalboardItem.uri);
+                    const pluginInfo = this.model.getUiPlugin(pedalboardItem.uri);
                     if (pluginInfo === null) {
                         return false;
                     }
@@ -629,8 +630,8 @@ export const MainPage =
 
                 render() {
                     const classes = withStyles.getClasses(this.props);
-                    let pedalboard = this.model.pedalboard.get();
-                    let pedalboardItem = this.getSelectedPedalboardItem();
+                    const pedalboard = this.model.pedalboard.get();
+                    const pedalboardItem = this.getSelectedPedalboardItem();
                     let uiPlugin = null;
                     let bypassVisible = false;
                     let bypassChecked = false;
@@ -676,7 +677,7 @@ export const MainPage =
                             }
                         }
                     }
-                    let horizontalScrollLayout = this.state.horizontalScrollLayout;
+                    const horizontalScrollLayout = this.state.horizontalScrollLayout;
 
                     return (
                         <div className={classes.frame}>
@@ -812,9 +813,11 @@ export const MainPage =
                             />
                             {
                                 (this.state.loadDialogOpen) && (
-                                    <LoadPluginDialog open={this.state.loadDialogOpen} uri={this.getSelectedUri()}
-                                        onOk={this.onLoadOk} onCancel={this.onLoadCancel}
-                                    />
+                                    <LazyBoundary onLoadFailed={() => this.setState({ loadDialogOpen: false })}>
+                                        <LoadPluginDialog open={this.state.loadDialogOpen} uri={this.getSelectedUri()}
+                                            onOk={this.onLoadOk} onCancel={this.onLoadCancel}
+                                        />
+                                    </LazyBoundary>
 
                                 )
                             }

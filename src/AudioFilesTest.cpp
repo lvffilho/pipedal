@@ -27,6 +27,8 @@
 #include "json.hpp"
 #include "json_variant.hpp"
 #include "MimeTypes.hpp"
+#include "AudioFilesDb.hpp"
+#include <stdlib.h>
 
 using namespace std;
 using namespace pipedal;
@@ -35,7 +37,8 @@ namespace fs = std::filesystem;
 fs::path testDir = fs::temp_directory_path() / "AudioFilesTest" / "files";
 fs::path sourceDirectory = fs::current_path() / "artifacts" / "TestTracks";
 fs::path tempDir = fs::temp_directory_path() / "AudioFilesTest" / "tmp";
-fs::path resourceDir = fs::current_path() / "vite" / "public" / "img";
+// The web root, as in main.cpp (DefaultThumbnailTemporaryFile() appends "img/...").
+fs::path resourceDir = fs::current_path() / "vite" / "public";
 fs::path textIndexPath = fs::temp_directory_path() / "AudioFilesTest" / "TextIndex.pipedal";
 
 static void CreateTestDirectory()
@@ -516,8 +519,23 @@ void ProfileMusicDirectory() {
     }
 
 }
-TEST_CASE("Search for audio files with multple thumbnails", "[ScanThumbnails]")
+// The two cases below scan and profile the developer's whole ~/Music
+// library, so they are hidden from the default run, and skip when there is
+// no ~/Music.
+static bool HaveMusicDirectory()
 {
+    const char *home = getenv("HOME");
+    if (home == nullptr || !std::filesystem::is_directory(std::filesystem::path(home) / "Music"))
+    {
+        WARN("$HOME/Music does not exist. Skipping.");
+        return false;
+    }
+    return true;
+}
+
+TEST_CASE("Search for audio files with multple thumbnails", "[.][ScanThumbnails]")
+{
+    if (!HaveMusicDirectory()) return;
     AudioDirectoryInfo::SetTemporaryDirectory(tempDir);
     AudioDirectoryInfo::SetResourceDirectory(resourceDir);
     ScanThumbnails(); // scan all files in music directory.
@@ -526,11 +544,83 @@ TEST_CASE("Search for audio files with multple thumbnails", "[ScanThumbnails]")
     REQUIRE(true); // Just to ensure the test runs without failure
 }
 
-TEST_CASE("Thumbnail performance test", "[ProfileThumbnails]" )
+TEST_CASE("Thumbnail performance test", "[.][ProfileThumbnails]" )
 {
+    if (!HaveMusicDirectory()) return;
     AudioDirectoryInfo::SetTemporaryDirectory(tempDir);
     AudioDirectoryInfo::SetResourceDirectory(resourceDir);
     ProfileMusicDirectory(); // Scans all folders in music directory.
 
     REQUIRE(true); // Just to ensure the test runs without failure
+}
+
+namespace
+{
+    struct AudioFilesDbTempDir
+    {
+        fs::path path;
+        AudioFilesDbTempDir()
+        {
+            char tmpl[] = "/tmp/audiofilesdbtestXXXXXX";
+            REQUIRE(mkdtemp(tmpl) != nullptr);
+            path = tmpl;
+        }
+        ~AudioFilesDbTempDir()
+        {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+        }
+    };
+
+    // DeleteThumbnails() and UpdateThumbnailInfo(fileName, ...) used to share
+    // one cached SQLite statement, so whichever ran second used the other's SQL.
+    void ThumbnailStatementsTest(bool deleteFirst)
+    {
+        using namespace pipedal::impl;
+        AudioFilesDbTempDir tempDir;
+        AudioFilesDb db(tempDir.path);
+
+        DbFileInfo file;
+        file.fileName("Track1.mp3");
+        db.WriteFile(&file);
+        REQUIRE(file.idFile() != -1);
+
+        std::vector<uint8_t> thumbnail{1, 2, 3, 4};
+        db.AddThumbnail(file.idFile(), 200, 200, thumbnail);
+        REQUIRE(db.GetNumberOfThumbnails() == 1);
+
+        for (int i = 0; i < 2; ++i) // twice: the cached statements are reused.
+        {
+            if (deleteFirst)
+            {
+                REQUIRE_NOTHROW(db.DeleteThumbnails(file.idFile()));
+                REQUIRE(db.GetNumberOfThumbnails() == 0);
+                REQUIRE_NOTHROW(db.UpdateThumbnailInfo("Track1.mp3", ThumbnailType::Embedded));
+                REQUIRE_NOTHROW(db.UpdateThumbnailInfo(file.idFile(), ThumbnailType::Embedded));
+            }
+            else
+            {
+                REQUIRE_NOTHROW(db.UpdateThumbnailInfo("Track1.mp3", ThumbnailType::Embedded));
+                REQUIRE_NOTHROW(db.UpdateThumbnailInfo(file.idFile(), ThumbnailType::Embedded));
+                REQUIRE_NOTHROW(db.DeleteThumbnails(file.idFile()));
+                REQUIRE(db.GetNumberOfThumbnails() == 0);
+            }
+            REQUIRE(db.GetThumbnailInfo("Track1.mp3").thumbnailType() == ThumbnailType::Embedded);
+
+            db.AddThumbnail(file.idFile(), 200, 200, thumbnail);
+            REQUIRE(db.GetNumberOfThumbnails() == 1); // doesn't grow.
+        }
+    }
+}
+
+TEST_CASE("AudioFilesDb thumbnail statements don't interfere", "[AudioFilesDb]")
+{
+    SECTION("DeleteThumbnails then UpdateThumbnailInfo")
+    {
+        ThumbnailStatementsTest(true);
+    }
+    SECTION("UpdateThumbnailInfo then DeleteThumbnails")
+    {
+        ThumbnailStatementsTest(false);
+    }
 }

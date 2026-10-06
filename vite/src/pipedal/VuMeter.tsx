@@ -65,7 +65,7 @@ class TelltaleState {
         this.telltaleHoldValue = MIN_DB;
     }
     getTelltaleHoldValue(currentDb: number): number {
-        let t = new Date().getTime();
+        const t = new Date().getTime();
 
         let holdValue: number;
         if (t < this.telltaleHoldTime) {
@@ -218,7 +218,7 @@ function dbToY(db: number): number {
     if (db < MIN_DB) db = MIN_DB;
     if (db > MAX_DB) db = MAX_DB;
 
-    let y = INTERIOR_DISPLAY_HEIGHT - (db - MIN_DB) / (MAX_DB - MIN_DB) * INTERIOR_DISPLAY_HEIGHT;;
+    const y = INTERIOR_DISPLAY_HEIGHT - (db - MIN_DB) / (MAX_DB - MIN_DB) * INTERIOR_DISPLAY_HEIGHT;;
     return y;
 }
 
@@ -265,7 +265,7 @@ export const VuMeter =
                     {
                         displayValue = "-";
                     } else {
-                        let iDb = Math.round(telltaleDb);
+                        const iDb = Math.round(telltaleDb);
                         if (iDb > 0)
                         {
                             displayValue = "+" + Math.round(telltaleDb).toString() + "\u00A0"
@@ -308,7 +308,7 @@ export const VuMeter =
             {
                 let value: number;
                 let valueR: number;
-                let vuInfo = this.currentVuInfo;
+                const vuInfo = this.currentVuInfo;
                 if (!vuInfo) {
                     return; // no vu info.
                 }
@@ -340,9 +340,9 @@ export const VuMeter =
                     }
                 }
 
-                let childNodes = this.divRef.current!.childNodes;
+                const childNodes = this.divRef.current!.childNodes;
 
-                let leftFrameChildNodes = childNodes[0].childNodes;
+                const leftFrameChildNodes = childNodes[0].childNodes;
 
                 let vuData: VuChannelData = {
                     value: value,
@@ -353,7 +353,7 @@ export const VuMeter =
                 };
                 this.updateChannel(vuData,this.telltaleStateL);
                 if (this.state.isStereo) {
-                    let rightFrameChildren = childNodes[1].childNodes;
+                    const rightFrameChildren = childNodes[1].childNodes;
                     vuData = {
                         value: valueR,
                         redDiv: rightFrameChildren[0] as HTMLDivElement,
@@ -382,8 +382,8 @@ export const VuMeter =
                 let db = aToDb(vuData.value);
                 if (db < MIN_DB) db = MIN_DB;
 
-                let y = dbToY(db);
-                let INVISIBLE_Y = INTERIOR_DISPLAY_HEIGHT + "px";
+                const y = dbToY(db);
+                const INVISIBLE_Y = INTERIOR_DISPLAY_HEIGHT + "px";
                 if (y >= this.yYellow) {
                     // green only.
                     vuData.greenDiv.style.transform = `translateY(${y}px)`;
@@ -399,7 +399,7 @@ export const VuMeter =
                         vuData.redDiv.style.transform = `translateY(${y}px)`;
                     }
                 }
-                let dbTelltale = telltaleState.getTelltaleHoldValue(db);
+                const dbTelltale = telltaleState.getTelltaleHoldValue(db);
                 let yTelltale = dbToY(dbTelltale);
 
                 if (yTelltale < this.yZero) {
@@ -448,7 +448,7 @@ export const VuMeter =
 
             componentDidUpdate()
             {
-                if (this.subscribedInstanceId)
+                if (this.subscribedInstanceId !== undefined && this.subscribedInstanceId !== -1)
                 {
                     if (this.props.instanceId !== this.subscribedInstanceId)
                     {
@@ -461,12 +461,12 @@ export const VuMeter =
 
 
             render() {
-                let displayText = this.props.displayText??false;
+                const displayText = this.props.displayText??false;
                 const classes = withStyles.getClasses(this.props);
                 if (this.props.height !== undefined) 
                 {
-                    let height = this.props.height;
-                    let scale = height / DISPLAY_HEIGHT;
+                    const height = this.props.height;
+                    const scale = height / DISPLAY_HEIGHT;
                     return (
                         <div style={{ display: "flex" , flexFlow: "column nowrap", alignItems: "center" }}>
                             <div style={{ height: height, transform: `scale(1.0, ${scale})`, transformOrigin: "top left" }}>
@@ -548,6 +548,10 @@ export const VuMeter =
                 //this.addVuSubscription();
             }
             componentWillUnmount() {
+                if (this.animationFrameHandle !== null) {
+                    window.cancelAnimationFrame(this.animationFrameHandle);
+                    this.animationFrameHandle = null;
+                }
                 this.removeVuSubscription();
                 this.model.state.removeOnChangedHandler(this.onStateChanged);
             }

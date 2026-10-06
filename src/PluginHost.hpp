@@ -20,6 +20,7 @@
 #pragma once
 
 #include <vector>
+#include <map>
 #include <memory>
 #include "json.hpp"
 #include "PluginType.hpp"
@@ -1045,6 +1046,14 @@ namespace pipedal
         virtual Lv2Pedalboard *CreateLv2Pedalboard(Pedalboard &pedalboard, Lv2PedalboardErrorList &errorList);
 
         virtual Lv2Pedalboard *UpdateLv2PedalboardStructure(Pedalboard &pedalboard, Lv2Pedalboard *existingPedalboard, Lv2PedalboardErrorList &errorList);
+
+        // Build a pedalboard with a different structure (e.g. a preset switch), reusing running effect instances.
+        // reusableEffects maps the instance id of an item of `pedalboard` to the running effect it may reuse
+        // (see MatchReusableInstances in PresetInstanceReuse.hpp). Effects that are borrowed are removed from
+        // the map. Their new buffers, the item's instance id and the item's settings are staged in the new
+        // pedalboard and applied on the audio thread when it is swapped in; until then the running pedalboard is
+        // unchanged. Same threading rules as UpdateLv2PedalboardStructure().
+        virtual Lv2Pedalboard *CreateLv2PedalboardReusingInstances(Pedalboard &pedalboard, std::map<uint64_t, std::shared_ptr<IEffect>> &reusableEffects, Lv2PedalboardErrorList &errorList);
 
         void setSampleRate(double sampleRate)
         {

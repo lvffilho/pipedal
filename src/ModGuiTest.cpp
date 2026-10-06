@@ -25,9 +25,10 @@
 #include <iostream>
 #include <atomic>
 #include <thread>
+#include <filesystem>
 #include "ModTemplateGenerator.hpp"
 
-#include "PiPedalModel.hpp"
+#include "PluginHost.hpp"
 
 using namespace pipedal;
 using namespace std;
@@ -37,10 +38,17 @@ class PluginHostTest {
 public:
     static void TestInit()
     {
-        PiPedalModel model;
-        model.GetPluginHost().LoadLilv();
-        const auto&plugins = model.GetPluginHost().GetPlugins();
-        REQUIRE(!plugins.empty());
+        // A bare PluginHost, not a PiPedalModel: the model's Storage reads and
+        // writes the user's ~/var/PiPedal and it connects to the admin service,
+        // neither of which plugin/modgui discovery needs.
+        PluginHost pluginHost;
+        pluginHost.LoadLilv();
+        const auto&plugins = pluginHost.GetPlugins();
+        if (plugins.empty())
+        {
+            WARN("No LV2 plugins installed. Skipping.");
+            return;
+        }
         size_t modGuicount = 0;
         for (const auto&plugin : plugins)
         {
@@ -51,7 +59,12 @@ public:
                 modGuicount++;
                 const auto&modGui = plugin->modGui();
                 REQUIRE(!modGui->iconTemplate().empty());
-                REQUIRE(modGui->javascript().empty());
+                // modgui:javascript is optional, and real plugins ship it
+                // (e.g. guitaramp-suite). If present it must be a real file.
+                if (!modGui->javascript().empty())
+                {
+                    REQUIRE(std::filesystem::exists(modGui->javascript()));
+                }
                 REQUIRE(!modGui->stylesheet().empty());
                 REQUIRE(!modGui->screenshot().empty());
                 REQUIRE(!modGui->thumbnail().empty());

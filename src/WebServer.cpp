@@ -52,12 +52,14 @@
 
 #include "WebServerLog.hpp"
 #include "TemporaryFile.hpp"
+#include "UploadPolicy.hpp"
 
 using namespace pipedal;
 using namespace std;
 
 static const bool ENABLE_KEEP_ALIVE = true;
-static const std::filesystem::path WEB_TEMP_DIR{ "/var/pipedal/web_temp" };
+// Where upload bodies are spooled. Overridable (before the server starts) for tests.
+static std::filesystem::path g_webTempDir{ "/var/pipedal/web_temp" };
 
 using tcp = boost::asio::ip::tcp; // from <boost/asio/ip/tcp.hpp>
 
@@ -67,6 +69,9 @@ using namespace boost;
 using namespace websocketpp::http;
 
 
+
+// Process-wide cap on concurrent upload bodies being received/processed.
+static UploadLimiter g_uploadLimiter{ 2 };
 
 class request_with_file_upload : public websocketpp::http::parser::parser
 {
@@ -91,6 +96,14 @@ public:
 
     const std::filesystem::path& get_body_input_file();
     void detach_body_input_file();
+    // True if the body was discarded because no upload slot was free.
+    bool upload_rejected() const { return m_uploadRejected; }
+    // Slow-loris check for the per-connection watchdog (see UploadRatePolicy).
+    bool rate_expired(UploadRatePolicy::time_point now, UploadRatePolicy::time_point connectedAt) const
+    {
+        return !m_ready && m_ratePolicy.Expired(now, body_bytes_received(), connectedAt);
+    }
+    void release_upload_slot() { m_uploadSlot = UploadLimiter::Slot(); }
     size_t content_length() const { return m_content_length; }
 
     /// Returns the full raw request (including the body)
@@ -158,6 +171,20 @@ public:
     std::ifstream m_inputStream;
     std::stringstream m_stringInputStream;
     bool m_outputOpen = false;
+    bool m_uploadRejected = false;
+    // Held from the start of body receipt until the response is done (or the request is destroyed).
+    UploadLimiter::Slot m_uploadSlot;
+    UploadRatePolicy m_ratePolicy;
+    uint64_t body_bytes_received() const
+    {
+        return m_ratePolicy.BodyStarted() ? (uint64_t)(m_content_length - m_body_bytes_needed) : 0;
+    }
+    // websocketpp's parser errors can't express 408; this maps to "400 Bad Request" and the
+    // connection is closed.
+    static std::error_code request_too_slow_error()
+    {
+        return websocketpp::http::error::make_error_code(websocketpp::http::error::general);
+    }
 };
 const std::filesystem::path& request_with_file_upload::get_body_input_file()
 {
@@ -211,12 +238,24 @@ bool request_with_file_upload::prepare_body(std::error_code& ec)
     if (!result)
         return result;
     m_content_length = m_body_bytes_needed;
+    if (m_body_bytes_needed > m_max_in_memory_upload && m_method == "POST")
+    {
+        // Take a slot before any temp file is created or body byte is stored.
+        m_uploadSlot = g_uploadLimiter.TryAcquire();
+        if (!m_uploadSlot)
+        {
+            // websocketpp's parser can only fail a request with 400/413/500, so rather than
+            // fail we swallow the body without storing it and let the handler answer 503.
+            m_uploadRejected = true;
+            return true;
+        }
+    }
     if (m_body_bytes_needed > m_max_in_memory_upload)
     {
         m_uploading_to_file = true;
         try
         {
-            this->m_temporaryFile = std::make_shared<TemporaryFile>(WEB_TEMP_DIR);
+            this->m_temporaryFile = std::make_shared<TemporaryFile>(g_webTempDir);
             m_outputStream.open(this->m_temporaryFile->Path(), std::ios_base::trunc | std::ios_base::out | std::ios_base::binary);
             if (!m_outputStream)
             {
@@ -238,6 +277,13 @@ inline size_t request_with_file_upload::process_body(char const* buf, size_t len
     using namespace websocketpp::http;
     using namespace websocketpp::http::parser;
 
+    if (m_uploadRejected)
+    {
+        size_t processed = (std::min)(m_body_bytes_needed, len);
+        m_body_bytes_needed -= processed;
+        ec = std::error_code();
+        return processed;
+    }
     if (!this->m_uploading_to_file)
     {
         return super::process_body(buf, len, ec);
@@ -284,6 +330,9 @@ inline size_t request_with_file_upload::consume(char const* buf, size_t len, std
         ec = std::error_code();
         return 0;
     }
+    // Slow-loris: one steady_clock read per read completion.
+    auto now = UploadRatePolicy::clock::now();
+    m_ratePolicy.OnBytes(now);
 
     if (m_body_bytes_needed > 0)
     {
@@ -301,7 +350,18 @@ inline size_t request_with_file_upload::consume(char const* buf, size_t len, std
             m_outputStream.close();
             m_ready = true;
         }
+        else if (m_ratePolicy.Expired(now, body_bytes_received()))
+        {
+            // Average body rate below UploadRatePolicy::MIN_UPLOAD_RATE after the grace period.
+            ec = request_too_slow_error();
+        }
         return bytes_processed;
+    }
+    if (m_ratePolicy.Expired(now, 0))
+    {
+        // Headers not complete within UploadRatePolicy::HEADER_DEADLINE of the first byte.
+        ec = request_too_slow_error();
+        return 0;
     }
 
     // at this point we have an incomplete request still waiting for headers
@@ -399,6 +459,7 @@ inline size_t request_with_file_upload::consume(char const* buf, size_t len, std
 
             if (need_more)
             {
+                m_ratePolicy.OnBodyStart(now);
                 bytes_processed += process_body(buf + bytes_processed, len - bytes_processed, ec);
                 if (ec)
                 {
@@ -535,6 +596,7 @@ public:
     typedef websocketpp::config::asio base;
 
     static size_t max_http_body_size; // websocketpp::config::asio::max_http_body_size;
+
     typedef pipedal_elog elog_type;
     typedef pipedal_alog alog_type;
 
@@ -668,13 +730,15 @@ static bool encoding_allowed(const std::string& acceptEncodingHeader, const std:
 
 static bool can_use_gzip_encoding(
     const std::string& acceptEncodingHeader,
+    const std::filesystem::path& root,
     const std::filesystem::path& filename,
     std::filesystem::path* gzName)
 {
     if (!encoding_allowed(acceptEncodingHeader, "gzip"))
         return false;
     *gzName = filename.string() + ".gz";
-    if (std::filesystem::exists(*gzName)) {
+    // the .gz sibling may be a symlink pointing outside the web root.
+    if (std::filesystem::exists(*gzName) && pipedal::HtmlHelper::IsPathUnderCanonicalRoot(root, *gzName)) {
         return true;
     }
     return false;
@@ -692,8 +756,10 @@ namespace pipedal
         std::string address;
         int port = -1;
         std::filesystem::path rootPath;
+        std::filesystem::path canonicalRootPath; // resolved once at startup; used with the *CanonicalRoot helpers.
         int threads = 1;
-        size_t maxUploadSize = 512 * 1024 * 1024;
+        size_t maxUploadSize = 64 * 1024 * 1024;
+        std::atomic<int> listeningPort = 0;
 
         std::unique_ptr<std::thread> pBgThread;
         std::recursive_mutex io_mutex;
@@ -725,6 +791,8 @@ namespace pipedal
             }
 
             virtual size_t content_length() const { return m_request.content_length(); }
+            bool upload_rejected() const { return m_request.upload_rejected(); }
+            void release_upload_slot() { m_request.release_upload_slot(); }
 
             virtual const std::string& method() const { return m_request.get_method(); }
             virtual const std::string& get(const std::string& key) const { return m_request.get_header(key); }
@@ -899,57 +967,33 @@ namespace pipedal
             }
         }
 
+        void ErrorResponse(server::connection_type& connection, websocketpp::http::status_code::value status, const std::string& title, const std::string& error)
+        {
+            try
+            {
+                std::string body = SS("<!doctype html><html><head><title>Error " << status << " (" << title << ")</title></head><body>"
+                    << "<h1>Error " << status << "</h1><p>" << HtmlHelper::HtmlEncode(error) << "</p></body></html>");
+                connection.set_body(body);
+                connection.replace_header(HttpField::content_length, std::to_string(body.length()));
+                connection.set_status(status);
+            }
+            catch (const std::exception&)
+            {
+            }
+        }
         void NotFound(server::connection_type& connection, const std::string& filename)
         {
-            try
-            {
-                // 404 error
-                std::stringstream ss;
-
-                ss << "<!doctype html><html><head>"
-                    << "<title>Error 404 (Resource not found)</title><body>"
-                    << "<h1>Error 404</h1>"
-                    << "<p>The requested URL " << HtmlHelper::HtmlEncode(filename) << " was not found on this server.</p>"
-                    << "</body></head></html>";
-
-                std::string body = ss.str();
-                connection.set_body(body);
-                std::stringstream ssLen;
-                ssLen << body.length();
-                connection.replace_header(HttpField::content_length, ssLen.str());
-                connection.set_status(websocketpp::http::status_code::not_found);
-            }
-            catch (const std::exception&)
-            {
-                // ignored. Things weren't going well anyway.
-            }
-            return;
-        };
+            ErrorResponse(connection, websocketpp::http::status_code::not_found, "Resource not found",
+                SS("The requested URL " << filename << " was not found on this server."));
+        }
         void ServerError(server::connection_type& connection, const std::string& error)
         {
-            try
-            {
-                // 404 error
-                std::stringstream ss;
-
-                ss << "<!doctype html><html><head>"
-                    << "<title>Error 500 (Server error)</title><body>"
-                    << "<h1>Error 500</h1>"
-                    << "<p>" << HtmlHelper::HtmlEncode(error) << "</p>"
-                    << "</body></head></html>";
-                std::string body = ss.str();
-                connection.set_body(body);
-                std::stringstream ssLen;
-                ssLen << body.length();
-                connection.replace_header(HttpField::content_length, ssLen.str());
-
-                connection.set_status(websocketpp::http::status_code::internal_server_error);
-            }
-            catch (const std::exception&)
-            {
-            }
-            return;
-        };
+            ErrorResponse(connection, websocketpp::http::status_code::internal_server_error, "Server error", error);
+        }
+        void BadRequest(server::connection_type& connection, const std::string& error)
+        {
+            ErrorResponse(connection, websocketpp::http::status_code::bad_request, "Bad request", error);
+        }
 
         static std::string endpointToString(const boost::asio::ip::tcp::endpoint& endpoint) {
             std::stringstream ss;
@@ -1033,6 +1077,32 @@ namespace pipedal
             port = address.substr(portPos);
         }
         void on_http(connection_hdl hdl)
+        {
+            // No exception may escape into websocketpp (std::terminate).
+            server::connection_ptr con;
+            try
+            {
+                con = m_endpoint.get_con_from_hdl(hdl);
+                on_http_impl(hdl);
+            }
+            catch (const std::invalid_argument& e)
+            {
+                Lv2Log::debug(SS("HTTP request rejected: " << e.what()));
+                if (con) BadRequest(*con, e.what());
+            }
+            catch (const std::exception& e)
+            {
+                Lv2Log::error(SS("Unexpected error in on_http: " << e.what()));
+                if (con) ServerError(*con, SS("Unexpected error. " << e.what()));
+            }
+            catch (...)
+            {
+                Lv2Log::error("Unknown error in on_http.");
+                if (con) ServerError(*con, "Unexpected error.");
+            }
+        }
+
+        void on_http_impl(connection_hdl hdl)
         {
             // Upgrade our connection handle to a full connection_ptr
 
@@ -1145,6 +1215,13 @@ namespace pipedal
                             res.set(HttpField::date, HtmlHelper::timeToHttpDate(time(nullptr)));
                             res.set(HttpField::access_control_allow_origin, origin);
 
+                            if (req.upload_rejected())
+                            {
+                                ErrorResponse(*con, websocketpp::http::status_code::service_unavailable,
+                                    "Service unavailable", "Too many concurrent uploads. Try again later.");
+                                return;
+                            }
+                            struct SlotReleaser { HttpRequestImpl& r; ~SlotReleaser() { r.release_upload_slot(); } } slotReleaser{ req };
                             requestHandler->post_response(fromAddress, requestUri, req, res, ec);
 
                             if (ec == std::errc::no_such_file_or_directory)
@@ -1167,7 +1244,15 @@ namespace pipedal
                     }
                     catch (std::exception& e)
                     {
-                        ServerError(*con, SS("Unexpected error. " << e.what()));
+                        if (HttpStatusForException(e) == websocketpp::http::status_code::bad_request)
+                        {
+                            Lv2Log::debug(SS("HTTP request rejected: " << e.what()));
+                            BadRequest(*con, e.what());
+                        }
+                        else
+                        {
+                            ServerError(*con, SS("Unexpected error. " << e.what()));
+                        }
                         return;
                     }
                 }
@@ -1178,14 +1263,20 @@ namespace pipedal
             std::string response;
             if (requestUri.segment_count() == 0)
             {
-                filename = this->rootPath / "index.html";
+                filename = this->canonicalRootPath / "index.html";
             }
             else
             {
-                filename = this->rootPath;
+                std::vector<std::string> segments;
                 for (size_t i = 0; i < requestUri.segment_count(); ++i)
                 {
-                    filename /= requestUri.segment(i);
+                    segments.push_back(requestUri.segment(i));
+                }
+                // reject traversal (e.g. %2F-encoded absolute paths, "..").
+                if (!HtmlHelper::TryResolveUnderCanonicalRoot(this->canonicalRootPath, segments, &filename))
+                {
+                    NotFound(*con, requestUri.str());
+                    return;
                 }
             }
 
@@ -1211,7 +1302,12 @@ namespace pipedal
 
                 size_t contentLength = 0;
 
-                if (can_use_gzip_encoding(req.get(HttpField::accept_encoding), filename, &gzName))
+                {
+                    std::error_code vec;
+                    if (std::filesystem::exists(filename.string() + ".gz", vec))
+                        res.set("Vary", "Accept-Encoding"); // representation depends on Accept-Encoding.
+                }
+                if (can_use_gzip_encoding(req.get(HttpField::accept_encoding), this->canonicalRootPath, filename, &gzName))
                 {
                     filename = gzName;
                     res.set(HttpField::content_encoding, "gzip");
@@ -1227,6 +1323,18 @@ namespace pipedal
                 if (req.method() != HttpVerb::get)
                 {
                     ServerError(*con, "Unknown HTTP-Method");
+                    return;
+                }
+
+                std::string etag = MakeETag(contentLength, std::filesystem::last_write_time(filename));
+                res.set(HttpField::etag, etag);
+                if (IfNoneMatchMatches(req.get(HttpField::if_none_match), etag))
+                {
+                    res.set(HttpField::access_control_allow_origin, origin);
+                    res.set(HttpField::date, HtmlHelper::timeToHttpDate(time(nullptr)));
+                    con->set_body("");
+                    con->replace_header(HttpField::content_length, "0");
+                    con->set_status(websocketpp::http::status_code::not_modified);
                     return;
                 }
 
@@ -1258,8 +1366,59 @@ namespace pipedal
             }
             catch (const std::exception &e)
             {
-                ServerError(*con, SS("Unexpected error. " << e.what()));
+                if (HttpStatusForException(e) == websocketpp::http::status_code::bad_request)
+                {
+                    Lv2Log::debug(SS("HTTP request rejected: " << e.what()));
+                    BadRequest(*con, e.what());
+                }
+                else
+                {
+                    ServerError(*con, SS("Unexpected error. " << e.what()));
+                }
                 return;
+            }
+        }
+
+        // Slow-loris watchdog. consume() only runs when bytes arrive, so a client that goes
+        // silent (before or during headers, or mid-body) would otherwise hold its connection
+        // and upload slot until the open-handshake cap. Every second, on the connection's
+        // strand (transport set_timer is strand-wrapped, as is the read handler that calls
+        // consume()), re-evaluate UploadRatePolicy and terminate the connection if it fails.
+        // Stops once the request has been fully read (or the connection left "connecting").
+        static void ScheduleRequestWatchdog(
+            const std::weak_ptr<server::connection_type>& weakCon,
+            UploadRatePolicy::time_point connectedAt)
+        {
+            auto con = weakCon.lock();
+            if (!con)
+                return;
+            con->set_timer(1000, [weakCon, connectedAt](const std::error_code& ec)
+                {
+                    if (ec)
+                        return;
+                    auto con = weakCon.lock();
+                    if (!con || con->get_state() != websocketpp::session::state::connecting)
+                        return;
+                    const auto& request = con->get_request();
+                    if (request.ready())
+                        return;
+                    if (request.rate_expired(UploadRatePolicy::clock::now(), connectedAt))
+                    {
+                        con->terminate(websocketpp::error::make_error_code(websocketpp::error::open_handshake_timeout));
+                        return;
+                    }
+                    ScheduleRequestWatchdog(weakCon, connectedAt);
+                });
+        }
+        void on_tcp_post_init(connection_hdl hdl)
+        {
+            try
+            {
+                ScheduleRequestWatchdog(m_endpoint.get_con_from_hdl(hdl), UploadRatePolicy::clock::now());
+            }
+            catch (const std::exception& e)
+            {
+                Lv2Log::error(SS("WebServer: unable to start request watchdog. " << e.what()));
             }
         }
 
@@ -1342,6 +1501,16 @@ namespace pipedal
                 m_endpoint.set_open_handler(bind(&WebServerImpl::on_open, this, _1));
                 m_endpoint.set_close_handler(bind(&WebServerImpl::on_close, this, _1));
                 m_endpoint.set_http_handler(bind(&WebServerImpl::on_http, this, _1));
+                m_endpoint.set_tcp_post_init_handler(bind(&WebServerImpl::on_tcp_post_init, this, _1));
+
+                // websocketpp arms its "open handshake" timer when it starts reading a request and
+                // only cancels it once the response is written, and the request BODY is read inside
+                // that window. So this is a hard wall-clock cap on receiving an entire request,
+                // uploads included (the 5 s default cut off any upload slower than that). Sized so
+                // a maxUploadSize upload at the minimum acceptable rate fits; slow clients are cut
+                // off much sooner by UploadRatePolicy (consume() + watchdog). The cap is the backstop.
+                m_endpoint.set_open_handshake_timeout(
+                    (long)UploadRatePolicy::RequestTimeCap(maxUploadSize).count());
 
                 DisplayIpAddresses();
 
@@ -1349,6 +1518,14 @@ namespace pipedal
                 ss << port;
                 // m_endpoint.listen(this->address, ss.str());
                 m_endpoint.listen(tcp::v6(), (uint16_t)port);
+                {
+                    boost::system::error_code ec;
+                    auto localEndpoint = m_endpoint.get_local_endpoint(ec);
+                    if (!ec)
+                    {
+                        listeningPort = localEndpoint.port();
+                    }
+                }
                 m_endpoint.start_accept();
 
                 // Start IOC service threads.
@@ -1485,6 +1662,8 @@ namespace pipedal
 
         virtual void DisplayIpAddresses() override;
 
+        virtual int GetListeningPort() const override { return listeningPort.load(); }
+
         WebServerImpl(const std::string& address, int port, const char* rootPath, int threads, size_t maxUploadSize);
     };
 } // namespace pipedal
@@ -1508,7 +1687,24 @@ WebServerImpl::WebServerImpl(const std::string& address, int port, const char* r
     threads(threads),
     maxUploadSize(maxUploadSize)
 {
+    try
+    {
+        canonicalRootPath = std::filesystem::weakly_canonical(this->rootPath);
+    }
+    catch (const std::exception& e)
+    {
+        throw std::runtime_error(SS("Unable to resolve web root '" << this->rootPath.string() << "'. " << e.what()));
+    }
     ::CustomPpConfig::max_http_body_size = maxUploadSize;
+}
+
+void pipedal::WebServer::SetUploadTempDirectory(const std::filesystem::path& directory)
+{
+    g_webTempDir = directory;
+}
+std::filesystem::path pipedal::WebServer::GetUploadTempDirectory()
+{
+    return g_webTempDir;
 }
 
 std::shared_ptr<WebServer> pipedal::WebServer::create(

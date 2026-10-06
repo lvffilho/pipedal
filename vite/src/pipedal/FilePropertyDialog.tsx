@@ -18,11 +18,16 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
+import LazyBoundary, { lazyWithRetry } from './LazyBoundary';
 import React from 'react';
 import { createStyles } from './WithStyles';
 
-import TextInfoDialog from './TextInfoDialog';
-import Tone3000HelpDialog from './Tone3000HelpDialog';
+const TextInfoDialog = lazyWithRetry(() => import('./TextInfoDialog'));
+const Tone3000HelpDialog = lazyWithRetry(() => import('./Tone3000HelpDialog'));
+const Tone3000SignInDialog = lazyWithRetry(() => import('./Tone3000SignInDialog'));
+const Tone3000CatalogDialog = lazyWithRetry(() => import('./t3k/Tone3000CatalogDialog'));
+import PhoneIphoneIcon from '@mui/icons-material/PhoneIphone';
+import ManageSearchIcon from '@mui/icons-material/ManageSearch';
 import GuitarMLHelpDialog from './GuitarMlHelpDialog';
 import HelpOutlineIcon from '@mui/icons-material/HelpOutline';
 import LinkEx from './LinkEx';
@@ -117,18 +122,18 @@ const audioFileExtensions: { [name: string]: boolean } = {
 };
 
 function screenToClient(currentTarget: HTMLElement, e: React.PointerEvent | React.MouseEvent): Point {
-    let rect = currentTarget.getBoundingClientRect();
+    const rect = currentTarget.getBoundingClientRect();
     const x = e.clientX + rect.left;
     const y = e.clientY + rect.right;
     return { x: x, y: y };
 }
 function isAudioFile(filename: string) {
-    let npos = filename.lastIndexOf('.');
-    let nposSlash = filename.lastIndexOf('/');
+    const npos = filename.lastIndexOf('.');
+    const nposSlash = filename.lastIndexOf('/');
     if (nposSlash >= npos) {
         return false;
     }
-    let extension = filename.substring(npos);
+    const extension = filename.substring(npos);
     return audioFileExtensions[extension] !== undefined;
 }
 
@@ -179,6 +184,8 @@ export interface FilePropertyDialogState {
     multiSelect: boolean,
     selectedFiles: string[],
     openTone3000Help: boolean,
+    openTone3000SignIn: boolean,
+    openTone3000Catalog: boolean,
     openGuitarMlHelp: boolean,
 
     textFileName?: string;
@@ -211,7 +218,7 @@ export default withStyles(
         }
         isFolderArtwork(filePath: string): boolean {
             if (!this.isTracksDirectory()) return false;
-            let extension = pathExtension(filePath);
+            const extension = pathExtension(filePath);
             return extension === ".png" || extension === ".jpg" || extension === ".jpeg";
         }
 
@@ -222,7 +229,7 @@ export default withStyles(
 
             this.model = PiPedalModelFactory.getInstance();
 
-            let selectedFile = props.selectedFile;
+            const selectedFile = props.selectedFile;
             this.state = {
                 reordering: false,
                 loading: false,
@@ -257,6 +264,8 @@ export default withStyles(
                 multiSelect: false,
                 selectedFiles: [],
                 openTone3000Help: false,
+                openTone3000SignIn: false,
+                openTone3000Catalog: false,
                 openGuitarMlHelp: false,
                 modelSelectionDialogParams: undefined,
             };
@@ -284,7 +293,7 @@ export default withStyles(
         private maybeScrollIntoView() {
             if (this.scrollRef !== null && this.state.fileResult.files.length !== 0 && this.mounted && this.requestScroll) {
                 this.requestScroll = false;
-                let options: ScrollIntoViewOptions = { block: "nearest" };
+                const options: ScrollIntoViewOptions = { block: "nearest" };
                 options.block = "nearest";
 
                 this.scrollRef.scrollIntoView(options);
@@ -323,7 +332,7 @@ export default withStyles(
                         this.cancelProgressTimeout();
                         filesResult.files.splice(0, 0, { pathname: "", displayName: "<none>", isDirectory: false, isProtected: true });
 
-                        let fileEntry = this.getFileEntry(filesResult.files, this.state.selectedFile);
+                        const fileEntry = this.getFileEntry(filesResult.files, this.state.selectedFile);
                         this.setState({
                             loading: false,
                             showProgress: false,
@@ -378,11 +387,11 @@ export default withStyles(
                 if (!this.isTracksDirectory()) {
                     return false;
                 }
-                let element = currentTarget;
-                let index = parseInt(element.getAttribute("data-position") as string, 10);
+                const element = currentTarget;
+                const index = parseInt(element.getAttribute("data-position") as string, 10);
                 if (this.listContainerElementRef) {
                     this.longPressStartPoint = screenToClient(currentTarget, e);
-                    let dragState: DragState = {
+                    const dragState: DragState = {
                         activeItem: fileEntry.pathname,
                         dragElement: element,
                         height: element.clientHeight,
@@ -416,17 +425,17 @@ export default withStyles(
         updateReorderPosition(element: HTMLButtonElement, point: Point) {
             if (this.longPressStartPoint) {
                 let dragDy = point.y - this.longPressStartPoint.y;
-                let height = element.clientHeight;
+                const height = element.clientHeight;
 
-                let dragFromPosition = parseInt(element.getAttribute("data-position") as string, 10);
+                const dragFromPosition = parseInt(element.getAttribute("data-position") as string, 10);
 
-                let elementOffset = dragFromPosition * height;
+                const elementOffset = dragFromPosition * height;
                 let newOffset = elementOffset + dragDy;
                 if (newOffset < 0) {
                     dragDy = -elementOffset;
                     newOffset = 0;
                 }
-                let maxOffset = (this.maxPosition - 1) * height;
+                const maxOffset = (this.maxPosition - 1) * height;
                 if (newOffset > maxOffset) {
                     dragDy = maxOffset - elementOffset;
                     newOffset = maxOffset;
@@ -458,8 +467,8 @@ export default withStyles(
                     return;
                 }
                 if (this.listContainerElementRef) {
-                    let element = e.target as HTMLButtonElement;
-                    let point = screenToClient(e.currentTarget, e);
+                    const element = e.target as HTMLButtonElement;
+                    const point = screenToClient(e.currentTarget, e);
                     this.updateReorderPosition(element, point);
                     this.startAutoScroll()
 
@@ -470,8 +479,8 @@ export default withStyles(
 
             // Update the local state with the new order so that we don't 
             // flash the old order while waiting for a server update.
-            let oldFileResult = this.state.fileResult;
-            let newFileResult = new FileRequestResult();
+            const oldFileResult = this.state.fileResult;
+            const newFileResult = new FileRequestResult();
             newFileResult.files = oldFileResult.files.slice();
             newFileResult.isProtected = oldFileResult.isProtected;
             newFileResult.currentDirectory = oldFileResult.currentDirectory;
@@ -481,7 +490,7 @@ export default withStyles(
             let ixTo = -1;
             let ix = 0;
             for (let i = 0; i < newFileResult.files.length; ++i) {
-                let fileEntry = newFileResult.files[i];
+                const fileEntry = newFileResult.files[i];
                 if (fileEntry.metadata) {
                     if (ix === from) {
                         ixFrom = i;
@@ -517,7 +526,7 @@ export default withStyles(
                 if (!this.isTracksDirectory()) {
                     return;
                 }
-                let dragState = this.state.dragState;
+                const dragState = this.state.dragState;
                 if (dragState && dragState.to != dragState.from) {
                     this.handleReorderFiles(dragState.from, dragState.to);
 
@@ -529,7 +538,7 @@ export default withStyles(
                 this.setState({ dragState: null });
                 this.stopAutoScroll();
             } else if (!this.state.multiSelect) {
-                let selectedFile = fileEntry.pathname;
+                const selectedFile = fileEntry.pathname;
                 if (selectedFile === "") {
                     return;
                 }
@@ -544,10 +553,10 @@ export default withStyles(
         onMeasureRef(div: HTMLDivElement | null) {
             this.lastDivRef = div;
             if (div) {
-                let width = div.offsetWidth;
+                const width = div.offsetWidth;
                 if (width === 0) return;
-                let columns = 1;
-                let columnWidth = (width - 40) / columns;
+                const columns = 1;
+                const columnWidth = (width - 40) / columns;
                 if (columns !== this.state.columns || columnWidth !== this.state.columnWidth) {
                     this.setState({ columns: columns, columnWidth: columnWidth });
                 }
@@ -617,8 +626,8 @@ export default withStyles(
             if (prevProps.open !== this.props.open
             ) {
                 if (this.props.open) {
-                    let selectedFile = this.props.selectedFile;
-                    let navDirectory = this.getNavDirectoryFromFile(selectedFile, this.props.fileProperty);
+                    const selectedFile = this.props.selectedFile;
+                    const navDirectory = this.getNavDirectoryFromFile(selectedFile, this.props.fileProperty);
                     this.setState({
                         selectedFile: selectedFile,
                         selectedFileIsDirectory: false,
@@ -637,7 +646,7 @@ export default withStyles(
         }
 
         private isDirectory(path: string): boolean {
-            for (var fileEntry of this.state.fileResult.files) {
+            for (const fileEntry of this.state.fileResult.files) {
                 if (fileEntry.pathname === path) {
                     return fileEntry.isDirectory;
                 }
@@ -648,7 +657,7 @@ export default withStyles(
 
             let hasSelection = false;
             if (file === "") return true;
-            for (var listFile of files) {
+            for (const listFile of files) {
                 if (listFile.pathname === file) {
                     hasSelection = true;
                     break;
@@ -659,7 +668,7 @@ export default withStyles(
         private getFileEntry(files: FileEntry[], file: string): FileEntry | undefined {
 
             if (file === "") return undefined;
-            for (var listFile of files) {
+            for (const listFile of files) {
                 if (listFile.pathname === file) {
                     return listFile;
                 }
@@ -678,8 +687,8 @@ export default withStyles(
                     return;
                 }
                 if (this.state.multiSelect) {
-                    let selectedFiles = this.state.selectedFiles.slice();
-                    let ix = selectedFiles.indexOf(fileEntry.pathname);
+                    const selectedFiles = this.state.selectedFiles.slice();
+                    const ix = selectedFiles.indexOf(fileEntry.pathname);
                     if (ix === -1) {
                         selectedFiles.push(fileEntry.pathname);
                     } else {
@@ -697,7 +706,7 @@ export default withStyles(
                         });
                     }
                 } else {
-                    let selectedFiles = [fileEntry.pathname];
+                    const selectedFiles = [fileEntry.pathname];
                     if (this.state.hasSelection) {
                         if (this.state.selectedFile !== "") {
                             selectedFiles.push(this.state.selectedFile);
@@ -776,7 +785,7 @@ export default withStyles(
             if (this.state.selectedFileProtected || !this.state.hasFileSelection) {
                 return;
             }
-            let file = this.state.selectedFile;
+            const file = this.state.selectedFile;
             this.model.downloadAudioFile(file);
         }
         async handleConfirmDelete() {
@@ -791,17 +800,17 @@ export default withStyles(
                 files = [this.state.selectedFile];
             }
             let selectedFile = (!this.state.multiSelect && this.state.hasSelection) ? this.state.selectedFile : undefined;
-            let newSelectedFiles = this.state.selectedFiles.slice();
-            let multiSelect = this.state.multiSelect;
-            let resultFiles = this.state.fileResult.files;
+            const newSelectedFiles = this.state.selectedFiles.slice();
+            const multiSelect = this.state.multiSelect;
+            const resultFiles = this.state.fileResult.files;
 
             try {
-                for (let file of files) {
+                for (const file of files) {
                     if (!multiSelect) {
                         if (selectedFile) {
                             let position = -1;
                             for (let i = 0; i < resultFiles.length; ++i) {
-                                let file = resultFiles[i];
+                                const file = resultFiles[i];
                                 if (file.pathname === selectedFile) {
                                     position = i;
                                     break;
@@ -820,7 +829,7 @@ export default withStyles(
                             }
                         }
                     } else {
-                        let ix = newSelectedFiles.indexOf(file);
+                        const ix = newSelectedFiles.indexOf(file);
                         if (ix >= 0) {
                             newSelectedFiles.splice(ix, 1);
                         }
@@ -867,7 +876,7 @@ export default withStyles(
             }
         }
         getCompactTrackTitle(fileEntry: FileEntry): string {
-            let metadata = fileEntry.metadata;
+            const metadata = fileEntry.metadata;
             let title = getTrackTitle(fileEntry.pathname, metadata);
             if (!metadata) {
                 return title;
@@ -885,15 +894,15 @@ export default withStyles(
             if (artist == "") {
                 artist = fileEntry.metadata?.albumArtist || "";
             }
-            let album = fileEntry.metadata?.album || "";
-            let joiner = (artist !== "" && album !== "") ? " - " : "";
+            const album = fileEntry.metadata?.album || "";
+            const joiner = (artist !== "" && album !== "") ? " - " : "";
             return album + joiner + artist;
         }
         getTrackThumbnail(fileEntry: FileEntry): string {
             return getAlbumArtUri(this.model, fileEntry.metadata, fileEntry.pathname);
         }
         renderBreadcrumbs() {
-            let breadcrumbs: React.ReactElement[] = [(
+            const breadcrumbs: React.ReactElement[] = [(
                 <Button variant="text"
                     color="inherit"
                     key="h" onClick={() => { this.handleBreadcrumbNavigate(""); }}
@@ -906,7 +915,7 @@ export default withStyles(
             ];
 
             for (let i = 1; i < this.state.fileResult.breadcrumbs.length - 1; ++i) {
-                let breadcrumb: BreadcrumbEntry = this.state.fileResult.breadcrumbs[i];
+                const breadcrumb: BreadcrumbEntry = this.state.fileResult.breadcrumbs[i];
 
                 breadcrumbs.push((
                     <Typography key={"x" + (i)} variant="body2" style={{ marginTop: 6, marginBottom: 6 }} noWrap>/</Typography>
@@ -927,7 +936,7 @@ export default withStyles(
                 ));
             }
             if (this.state.fileResult.breadcrumbs.length > 1) {
-                let lastdirectory = this.state.fileResult.breadcrumbs[this.state.fileResult.breadcrumbs.length - 1];
+                const lastdirectory = this.state.fileResult.breadcrumbs[this.state.fileResult.breadcrumbs.length - 1];
                 breadcrumbs.push((
                     <Typography key={"xLast"} variant="body2" style={{ userSelect: "none", marginTop: 6, marginBottom: 6 }} noWrap>/</Typography>
 
@@ -956,8 +965,8 @@ export default withStyles(
         // yyy: depends on dialog type!!!
         private getDefaultPath(): string {
             try {
-                let storage = window.localStorage;
-                let result = storage.getItem("fpDefaultPath");
+                const storage = window.localStorage;
+                const result = storage.getItem("fpDefaultPath");
                 if (result) {
                     return result;
                 }
@@ -969,7 +978,7 @@ export default withStyles(
         }
         setDefaultPath(path: string) {
             try {
-                let storage = window.localStorage;
+                const storage = window.localStorage;
                 storage.setItem("fpDefaultPath", path);
             } catch (e) {
 
@@ -980,7 +989,7 @@ export default withStyles(
         }
         getFileExtensionList(uiFileProperty: UiFileProperty): string {
             let result = "";
-            for (var fileType of uiFileProperty.fileTypes) {
+            for (const fileType of uiFileProperty.fileTypes) {
                 if (fileType.fileExtension !== "" && fileType.fileExtension !== ".zip") {
                     if (result !== "") result = result + ",";
                     result += fileType.fileExtension;
@@ -991,7 +1000,7 @@ export default withStyles(
 
 
         private getIcon(fileEntry: FileEntry, largeIcon: boolean) {
-            let style = largeIcon
+            const style = largeIcon
                 ? {
                     flex: "0 0 auto", opacity: 0.7, width: 32, height: 32,
                     marginLeft: 16, marginRight: 24, marginTop: 16, marginBottom: 16,
@@ -1020,17 +1029,17 @@ export default withStyles(
         private autoScrollTimer: number | null = null;
 
         handleAutoScrollTick() {
-            let dragState = this.state.dragState;
+            const dragState = this.state.dragState;
             if (!dragState) return;
 
-            let scrollContainer = this.scrollContainerElementRef;
+            const scrollContainer = this.scrollContainerElementRef;
             if (!scrollContainer) {
                 return;
             }
-            let scrollBounds_ = scrollContainer.getBoundingClientRect();
-            let scrollClientTop = scrollBounds_.top;
-            let scrollClientBottom = scrollClientTop + scrollContainer.clientHeight;
-            let dragBounds = dragState.dragElement?.getBoundingClientRect();
+            const scrollBounds_ = scrollContainer.getBoundingClientRect();
+            const scrollClientTop = scrollBounds_.top;
+            const scrollClientBottom = scrollClientTop + scrollContainer.clientHeight;
+            const dragBounds = dragState.dragElement?.getBoundingClientRect();
 
             let dy = 0;
             let y = scrollContainer.scrollTop;
@@ -1044,7 +1053,7 @@ export default withStyles(
                 dy = AUTOSCROLL_SCROLL_RATE;
 
                 y = scrollContainer.scrollTop + dy;
-                let maxScrollTop = scrollContainer.scrollHeight - scrollContainer.clientHeight;
+                const maxScrollTop = scrollContainer.scrollHeight - scrollContainer.clientHeight;
                 if (y > maxScrollTop) {
                     y = maxScrollTop;
                 }
@@ -1063,21 +1072,21 @@ export default withStyles(
                 y: this.longPressStartPoint.y - dy
             };
             let dragElementDy = dragState.lastMousePoint.y - this.longPressStartPoint.y;
-            let originalY = dragState.from * dragState.height;
+            const originalY = dragState.from * dragState.height;
             let newY = originalY + dragElementDy;
             if (newY < 0) {
                 newY = 0;
                 dragElementDy = -originalY;
             }
-            let maxDy = (this.maxPosition - 1) * dragState.height;
+            const maxDy = (this.maxPosition - 1) * dragState.height;
             if (newY > maxDy) {
                 newY = maxDy;
                 dragElementDy = maxDy - originalY;
             }
-            let newTo = Math.floor((newY + dragState.height / 2) / dragState.height);
+            const newTo = Math.floor((newY + dragState.height / 2) / dragState.height);
 
 
-            let newDragState = { ...dragState };
+            const newDragState = { ...dragState };
 
             newDragState.dragElementDy = dragElementDy;
             newDragState.to = newTo;
@@ -1109,6 +1118,22 @@ export default withStyles(
         handleTone3000Dialog(e: React.MouseEvent<HTMLButtonElement>) {
             e.stopPropagation();
             e.preventDefault();
+            this.launchTone3000Popup();
+        }
+
+        handleTone3000SignIn(e: React.MouseEvent<HTMLButtonElement>) {
+            e.stopPropagation();
+            e.preventDefault();
+            this.setState({ openTone3000SignIn: true });
+        }
+
+        handleTone3000Catalog(e: React.MouseEvent<HTMLButtonElement>) {
+            e.stopPropagation();
+            e.preventDefault();
+            this.setState({ openTone3000Catalog: true });
+        }
+
+        launchTone3000Popup() {
             // Popup launch MUST be done from javascript, not react to avoid default popup blockers in browers. 
             // The dialog just provides a blocker dialog to cancel the popup if the TONE3000 Select APIs escape.
 
@@ -1172,23 +1197,23 @@ export default withStyles(
             const isToobMLModelFile = this.props.fileProperty.patchProperty === ToobMlModelFileUrl;
 
             const classes = withStyles.getClasses(this.props);
-            let columnWidth = this.state.columnWidth;
+            const columnWidth = this.state.columnWidth;
             let okButtonText = "Select";
             if (this.state.hasSelection && this.state.selectedFileIsDirectory) {
                 okButtonText = "Open";
             }
-            let protectedDirectory = this.state.fileResult.isProtected;
+            const protectedDirectory = this.state.fileResult.isProtected;
             let protectedItem = true;
             if (this.state.hasSelection) {
                 protectedItem = this.state.selectedFileProtected;
             }
-            let canMove = this.hasSelectedFileOrFolder() && !protectedItem;
-            let canRename = this.hasSelectedFileOrFolder() && !protectedItem && !isTracksDirectory;
-            let canReorder = isTracksDirectory;
-            let needsDivider = canMove || canRename || canReorder;
+            const canMove = this.hasSelectedFileOrFolder() && !protectedItem;
+            const canRename = this.hasSelectedFileOrFolder() && !protectedItem && !isTracksDirectory;
+            const canReorder = isTracksDirectory;
+            const needsDivider = canMove || canRename || canReorder;
             let trackPosition = 0;
-            let compactVertical = this.state.windowHeight < 700;
-            let canSelectFile = this.state.hasSelection && !this.isFolderArtwork(this.state.selectedFile);
+            const compactVertical = this.state.windowHeight < 700;
+            const canSelectFile = this.state.hasSelection && !this.isFolderArtwork(this.state.selectedFile);
 
 
             return this.props.open &&
@@ -1430,7 +1455,7 @@ export default withStyles(
                                                 displayValue = "<none>";
                                             }
                                             let dataPosition = "";
-                                            let myTrackPosition = trackPosition;
+                                            const myTrackPosition = trackPosition;
 
                                             if (value.metadata && value.metadata.track) {
                                                 dataPosition = trackPosition.toString();
@@ -1455,7 +1480,7 @@ export default withStyles(
                                             }
                                             let dragOffset = 0;
                                             let dragLeft = 0;
-                                            let dragState = this.state.dragState;
+                                            const dragState = this.state.dragState;
                                             let zIndex: number | undefined = undefined;
                                             let background: string | undefined = undefined;
                                             if (dragState && value.metadata) {
@@ -1472,7 +1497,7 @@ export default withStyles(
                                                     background = isDarkMode() ? "#555" : "#EEF";
                                                 }
                                             }
-                                            let dragButtonStyle: React.CSSProperties = {
+                                            const dragButtonStyle: React.CSSProperties = {
                                                 width: columnWidth, flex: "0 0 auto", height: (value.metadata && !compactVertical) ? 64 : 48,
                                                 position: "relative",
                                                 top: dragOffset,
@@ -1606,6 +1631,16 @@ export default withStyles(
                                                     }
 
                                                 </Button>
+                                                <IconButtonEx tooltip="Browse TONE3000 in PiPedal"
+                                                    onClick={(e) => { this.handleTone3000Catalog(e); }} aria-label="browse TONE3000" color="inherit" style={{ opacity: 0.6, marginLeft: 8 }}
+                                                >
+                                                    <ManageSearchIcon />
+                                                </IconButtonEx>
+                                                <IconButtonEx tooltip="Sign in to TONE3000 with your phone"
+                                                    onClick={(e) => { this.handleTone3000SignIn(e); }} aria-label="sign in with phone" color="inherit" style={{ opacity: 0.6, marginLeft: 8 }}
+                                                >
+                                                    <PhoneIphoneIcon />
+                                                </IconButtonEx>
                                                 <IconButtonEx tooltip="Help"
                                                     onClick={(e) => { this.handleTone3000Help(e); }} aria-label="help" edge="end" color="inherit" style={{ opacity: 0.6, marginLeft: 8 }}
                                                 >
@@ -1833,11 +1868,33 @@ export default withStyles(
                             )
                         }
                         {this.state.openTone3000Help && (
-                            <Tone3000HelpDialog
+                            <LazyBoundary onLoadFailed={() => this.setState({ openTone3000Help: false })}>
+                                <Tone3000HelpDialog
                                 open={this.state.openTone3000Help}
                                 onClose={() => this.setState({ openTone3000Help: false })}
                                 downloadType={isToobNamModelFile ? Tone3000DownloadType.Nam : Tone3000DownloadType.CabIr}
-                            />
+                                />
+                            </LazyBoundary>
+                        )}
+                        {this.state.openTone3000Catalog && (
+                            <LazyBoundary onLoadFailed={() => this.setState({ openTone3000Catalog: false })}>
+                                <Tone3000CatalogDialog
+                                    open={this.state.openTone3000Catalog}
+                                    onClose={() => this.setState({ openTone3000Catalog: false })}
+                                    downloadType={isToobNamModelFile ? Tone3000DownloadType.Nam : Tone3000DownloadType.CabIr}
+                                    downloadPath={this.state.currentDirectory}
+                                    onUseBrowserSignIn={() => { this.launchTone3000Popup(); }}
+                                />
+                            </LazyBoundary>
+                        )}
+                        {this.state.openTone3000SignIn && (
+                            <LazyBoundary onLoadFailed={() => this.setState({ openTone3000SignIn: false })}>
+                                <Tone3000SignInDialog
+                                    open={this.state.openTone3000SignIn}
+                                    onClose={() => this.setState({ openTone3000SignIn: false })}
+                                    onUseBrowserSignIn={() => { this.launchTone3000Popup(); }}
+                                />
+                            </LazyBoundary>
                         )}
                         {this.state.openGuitarMlHelp && (
                             <GuitarMLHelpDialog
@@ -1846,20 +1903,22 @@ export default withStyles(
                             />
                         )}
                         {this.state.textFileName !== undefined && (
-                            <TextInfoDialog open={true}
+                            <LazyBoundary onLoadFailed={() => this.setState({ textFileName: undefined })}>
+                                <TextInfoDialog open={true}
                                 title={pathFileNameOnly(this.state.textFileName)}
                                 fileName={this.state.textFileName} onClose={() => this.setState({ textFileName: undefined })}
                                 onT3kLinkClick={(href) => {
                                     return this.handleT3kLinkClick(href);
                                 }
                                 }
-                            />
+                                />
+                            </LazyBoundary>
                         )}
                     </DialogEx>
                 );
         }
         isTextFile(fileName: string) {
-            let extension = pathExtension(fileName);
+            const extension = pathExtension(fileName);
             if (extension === ".txt" || extension === ".md") {
                 return true;
             }
@@ -1867,7 +1926,7 @@ export default withStyles(
 
         }
         isPdfFile(fileName: string) {
-            let extension = pathExtension(fileName);
+            const extension = pathExtension(fileName);
             if (extension === ".pdf") {
                 return true;
             }
@@ -1905,7 +1964,7 @@ export default withStyles(
         }
 
         private renameDefaultName(): string {
-            let name = this.state.selectedFile;
+            const name = this.state.selectedFile;
             if (name === "") return "";
             if (this.isDirectory(name)) {
                 return pathFileName(name);
@@ -1920,16 +1979,16 @@ export default withStyles(
             this.setState({ copyDialogOpen: true });
         }
         private async onExecuteMoveMulti(newDirectory: string) {
-            let files = this.state.selectedFiles.slice();
-            let newFileList = this.state.selectedFiles.slice();
+            const files = this.state.selectedFiles.slice();
+            const newFileList = this.state.selectedFiles.slice();
             try {
-                for (let file of files) {
-                    let fileName = pathFileName(file);
-                    let oldFilePath = pathConcat(this.state.navDirectory, fileName);
-                    let newFilePath = pathConcat(newDirectory, fileName);
+                for (const file of files) {
+                    const fileName = pathFileName(file);
+                    const oldFilePath = pathConcat(this.state.navDirectory, fileName);
+                    const newFilePath = pathConcat(newDirectory, fileName);
 
                     await this.model.renameFilePropertyFile(oldFilePath, newFilePath, this.props.fileProperty);
-                    let index = newFileList.indexOf(file);
+                    const index = newFileList.indexOf(file);
                     if (index !== -1) {
                         newFileList.splice(index, 1);
                     }
@@ -1960,9 +2019,9 @@ export default withStyles(
                 this.onExecuteMoveMulti(newDirectory);
                 return;
             }
-            let fileName = pathFileName(this.state.selectedFile);
-            let oldFilePath = pathConcat(this.state.navDirectory, fileName);
-            let newFilePath = pathConcat(newDirectory, fileName);
+            const fileName = pathFileName(this.state.selectedFile);
+            const oldFilePath = pathConcat(this.state.navDirectory, fileName);
+            const newFilePath = pathConcat(newDirectory, fileName);
 
             this.model.renameFilePropertyFile(oldFilePath, newFilePath, this.props.fileProperty)
                 .then(() => {
@@ -1990,12 +2049,12 @@ export default withStyles(
         }
         private async onExecuteCopyMulti(newDirectory: string) {
 
-            let files = this.state.selectedFiles.slice();
-            let fileProperty = this.props.fileProperty;
+            const files = this.state.selectedFiles.slice();
+            const fileProperty = this.props.fileProperty;
             try {
-                for (let fileName of files) {
-                    let oldFilePath = pathConcat(this.state.navDirectory, fileName);
-                    let newFilePath = pathConcat(newDirectory, fileName);
+                for (const fileName of files) {
+                    const oldFilePath = pathConcat(this.state.navDirectory, fileName);
+                    const newFilePath = pathConcat(newDirectory, fileName);
 
                     await this.model.copyFilePropertyFile(oldFilePath, newFilePath, fileProperty, true);
                 }
@@ -2014,9 +2073,9 @@ export default withStyles(
                 this.onExecuteCopyMulti(newDirectory);
                 return;
             }
-            let fileName = pathFileName(this.state.selectedFile);
-            let oldFilePath = pathConcat(this.state.navDirectory, fileName);
-            let newFilePath = pathConcat(newDirectory, fileName);
+            const fileName = pathFileName(this.state.selectedFile);
+            const oldFilePath = pathConcat(this.state.navDirectory, fileName);
+            const newFilePath = pathConcat(newDirectory, fileName);
 
             this.model.copyFilePropertyFile(oldFilePath, newFilePath, this.props.fileProperty, false)
                 .then((filename) => {
@@ -2056,14 +2115,14 @@ export default withStyles(
             let newPath: string = "";
             let oldPath: string = "";
             if (this.isDirectory(this.state.selectedFile)) {
-                let oldName = pathFileName(this.state.selectedFile);
+                const oldName = pathFileName(this.state.selectedFile);
                 if (oldName === newName) return;
                 oldPath = pathConcat(this.state.navDirectory, oldName);
                 newPath = pathConcat(this.state.navDirectory, newName);;
             } else {
-                let oldName = pathFileNameOnly(this.state.selectedFile);
+                const oldName = pathFileNameOnly(this.state.selectedFile);
                 if (oldName === newName) return;
-                let extension = pathExtension(this.state.selectedFile);
+                const extension = pathExtension(this.state.selectedFile);
                 oldPath = pathConcat(this.state.navDirectory, oldName + extension);
                 newPath = pathConcat(this.state.navDirectory, newName + extension);
             }

@@ -257,8 +257,11 @@ set (PIPEDAL_SOURCES
     Curl.cpp Curl.hpp
     Tone3000DownloadType.cpp Tone3000DownloadType.hpp
     Tone3000DownloadProgress.cpp Tone3000DownloadProgress.hpp
+    IrClassifier.cpp IrClassifier.hpp
     Tone3000Download.cpp Tone3000Download.hpp
     Tone3000Downloader.cpp Tone3000Downloader.hpp
+    Tone3000Auth.cpp Tone3000Auth.hpp
+    Tone3000Catalog.cpp Tone3000Catalog.hpp
     Tone3000Throttler.cpp Tone3000Throttler.hpp
 
     CrashGuard.cpp CrashGuard.hpp
@@ -313,7 +316,7 @@ set (PIPEDAL_SOURCES
     AutoLilvNode.hpp
     AutoLilvNode.cpp
     RtInversionGuard.hpp
-    CpuUse.hpp CpuUse.cpp 
+    CpuUse.hpp
     AvahiService.cpp AvahiService.hpp
     StdErrorCapture.hpp StdErrorCapture.cpp
     Ipv6Helpers.cpp Ipv6Helpers.hpp
@@ -340,6 +343,7 @@ set (PIPEDAL_SOURCES
     Lv2Pedalboard.cpp Lv2Pedalboard.hpp
     BufferPool.hpp
     SplitEffect.hpp SplitEffect.cpp
+    BypassSuspend.hpp
     RingBufferReader.hpp
     MapFeature.hpp MapFeature.cpp
     LogFeature.hpp LogFeature.cpp
@@ -365,6 +369,8 @@ set (PIPEDAL_SOURCES
 
     JackDriver.cpp JackDriver.hpp
     AlsaDriver.cpp AlsaDriver.hpp
+    CpuDmaLatency.cpp CpuDmaLatency.hpp
+    AudioSampleClamp.hpp
     DummyAudioDriver.cpp DummyAudioDriver.hpp
     AudioDriver.hpp
     AudioConfig.hpp
@@ -474,10 +480,14 @@ add_executable(pipedaltest
     testMain.cpp
 
     ModGuiTest.cpp
+    ModGuiOverlayTest.cpp
+    ModGuiJavascriptTest.cpp
     PipewireInputStreamTest.cpp
 
     AudioFilesTest.cpp
     LRUCacheTest.cpp
+    VuUpdatesTest.cpp
+    PersistenceTest.cpp
     ModFileTypesTest.cpp
     jsonTest.cpp
     UpdaterTest.cpp
@@ -485,6 +495,7 @@ add_executable(pipedaltest
     utilTest.cpp
 
     AlsaDriverTest.cpp
+    CpuUseTest.cpp
     AvahiServiceTest.cpp
     WifiChannelsTest.cpp
     PiPedalAlsaTest.cpp
@@ -498,11 +509,33 @@ add_executable(pipedaltest
     SystemConfigFile.hpp SystemConfigFile.cpp
     SystemConfigFileTest.cpp
     WebServerTest.cpp
+    WebPathSafetyTest.cpp
+    SocketUploadsTest.cpp
+    DeferredMidiTest.cpp
+    FinalReviewFixesTest.cpp
+    RingBufferTest.cpp
+    IrClassifierTest.cpp
+    UploadSlowLorisTest.cpp
+    PlatformLatencyTest.cpp
+    Vst3RtParameterSlotsTest.cpp
+    RtHygieneTest.cpp
+    AudioMessageReliabilityTest.cpp
+    PreSwapMessageTest.cpp
+    PedalboardBuilderTest.cpp
+    Tone3000AuthTest.cpp
+    BypassSuspendTest.cpp
+    Tone3000CatalogTest.cpp
+    Tone3000ApiTest.cpp
+    PresetInstanceReuseTest.cpp
+    Lv2BufferStagingTest.cpp
+    ModelEditRoutingTest.cpp
     MemDebug.cpp
     MemDebug.hpp
     )
 target_link_libraries(pipedaltest PRIVATE ${PIPEDAL_LIBS} ${ICU_LIBRARIES})
 target_include_directories(pipedaltest PRIVATE ${PIPEDAL_INCLUDES})
+# AudioFilesTest uses AudioFilesDb directly (SQLiteCpp is private to libpipedald).
+target_link_libraries(pipedaltest PRIVATE SQLiteCpp)
 
 if(Catch2_FOUND)
     target_link_libraries(pipedaltest PRIVATE Catch2::Catch2 Catch2::Catch2WithMain)
@@ -823,13 +856,14 @@ add_executable(pipedal_latency_test
     PiPedalAlsa.hpp PiPedalAlsa.cpp
     asan_options.cpp
     AlsaDriver.cpp AlsaDriver.hpp
+    CpuDmaLatency.cpp CpuDmaLatency.hpp
+    AudioSampleClamp.hpp
     SchedulerPriority.cpp SchedulerPriority.hpp
     DummyAudioDriver.cpp DummyAudioDriver.hpp
     JackConfiguration.hpp JackConfiguration.cpp
     JackServerSettings.hpp JackServerSettings.cpp
     CrashGuard.cpp CrashGuard.hpp
     CpuUse.hpp
-    CpuUse.cpp
     )
 
 target_link_libraries(pipedal_latency_test PRIVATE pthread asound PiPedalCommon)
