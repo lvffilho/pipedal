@@ -14,3 +14,7 @@ src/dbus/bluez_proxy.h
 
 CMakeFiles
 vg.output
+# Local build output and tool working directories
+build-release/
+.claude/
+.superpowers/
