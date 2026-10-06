@@ -18,6 +18,7 @@
 // IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+import LazyBoundary, { lazyWithRetry } from './LazyBoundary';
 import React, { SyntheticEvent, Component } from 'react';
 import Switch from "@mui/material/Switch";
 import ChannelRouterSettings from './ChannelRouterSettings';
@@ -30,6 +31,7 @@ import { isDarkMode } from './DarkMode';
 import { PiPedalModel, PiPedalModelFactory, State } from './PiPedalModel';
 import { ColorTheme } from './DarkMode';
 import { ContentAlignment, getContentAlignment, setContentAlignment } from './ContentAlignment';
+import { getAnimateSignalFlow, setAnimateSignalFlow } from './SignalFlowAnimation';
 import ButtonBase from "@mui/material/ButtonBase";
 import AppBar from '@mui/material/AppBar';
 import Button from '@mui/material/Button';
@@ -45,8 +47,8 @@ import AudioDeviceDialog from './AudioDeviceDialog';
 import JackHostStatus from './JackHostStatus';
 import WifiConfigSettings from './WifiConfigSettings';
 import WifiDirectConfigSettings from './WifiDirectConfigSettings';
-import WifiConfigDialog from './WifiConfigDialog';
-import WifiDirectConfigDialog from './WifiDirectConfigDialog';
+const WifiConfigDialog = lazyWithRetry(() => import('./WifiConfigDialog'));
+const WifiDirectConfigDialog = lazyWithRetry(() => import('./WifiDirectConfigDialog'));
 import DialogEx from './DialogEx'
 import GovernorSettings from './GovernorSettings';
 import SystemMidiBindingsDialog from './SystemMidiBindingsDialog';
@@ -77,7 +79,9 @@ interface SettingsDialogProps extends WithStyles<typeof styles> {
 interface SettingsDialogState {
     showStatusMonitor: boolean;
     showStatusMonitorDialog: boolean;
+    suspendBypassedPlugins: boolean;
     contentAlignment: ContentAlignment;
+    animateSignalFlow: boolean;
     jackConfiguration: JackConfiguration;
     jackSettings: JackChannelSelection | null;
     channelRouterSettings: ChannelRouterSettings | null;
@@ -196,7 +200,9 @@ const SettingsDialog = withStyles(
             this.state = {
                 showStatusMonitor: this.model.showStatusMonitor.get(),
                 showStatusMonitorDialog: false,
+                suspendBypassedPlugins: this.model.suspendBypassedPlugins.get(),
                 contentAlignment: getContentAlignment(),
+                animateSignalFlow: getAnimateSignalFlow(),
 
                 jackServerSettings: this.model.jackServerSettings.get(),
                 channelRouterSettings: this.model.channelRouterSettings.get(),
@@ -239,6 +245,7 @@ const SettingsDialog = withStyles(
             this.handleGovernorSettingsChanged = this.handleGovernorSettingsChanged.bind(this);
             this.handleConnectionStateChanged = this.handleConnectionStateChanged.bind(this);
             this.handleShowStatusMonitorChanged = this.handleShowStatusMonitorChanged.bind(this);
+            this.handleSuspendBypassedPluginsChanged = this.handleSuspendBypassedPluginsChanged.bind(this);
             this.handleHasWifiChanged = this.handleHasWifiChanged.bind(this);
             this.handleKeepScreenOnChanged = this.handleKeepScreenOnChanged.bind(this);
             this.handleScreenOrientationChanged = this.handleScreenOrientationChanged.bind(this);
@@ -259,6 +266,13 @@ const SettingsDialog = withStyles(
 
         handleShowStatusMonitorChanged(): void {
             this.setState({ showStatusMonitor: this.model.showStatusMonitor.get() });
+        }
+        handleSuspendBypassedPluginsChanged(): void {
+            this.setState({ suspendBypassedPlugins: this.model.suspendBypassedPlugins.get() });
+        }
+        handleAnimateSignalFlowChanged(value: boolean): void {
+            setAnimateSignalFlow(value);
+            this.setState({ animateSignalFlow: value });
         }
         handleContentAlignmentChanged(centered: boolean): void {
             const value = centered ? ContentAlignment.Center : ContentAlignment.Start;
@@ -375,7 +389,7 @@ const SettingsDialog = withStyles(
         }
 
         updateActive() {
-            let active = this.mounted && this.props.open;
+            const active = this.mounted && this.props.open;
             if (active !== this.active) {
                 this.active = active;
                 if (active) {
@@ -384,6 +398,7 @@ const SettingsDialog = withStyles(
                     this.model.hasWifiDevice.addOnChangedHandler(this.handleHasWifiChanged);
                     this.model.state.addOnChangedHandler(this.handleConnectionStateChanged);
                     this.model.showStatusMonitor.addOnChangedHandler(this.handleShowStatusMonitorChanged);
+                    this.model.suspendBypassedPlugins.addOnChangedHandler(this.handleSuspendBypassedPluginsChanged);
                     this.model.jackSettings.addOnChangedHandler(this.handleJackSettingsChanged);
                     this.model.jackConfiguration.addOnChangedHandler(this.handleJackConfigurationChanged);
                     this.model.alsaSequencerConfiguration.addOnChangedHandler(this.handleAlsaSequencerConfigurationChanged);
@@ -410,6 +425,7 @@ const SettingsDialog = withStyles(
                     this.handleAlsaSequencerConfigurationChanged();
                     this.handleJackSettingsChanged();
                     this.handleShowStatusMonitorChanged();
+                    this.handleSuspendBypassedPluginsChanged();
                     this.handleJackServerSettingsChanged();
                     this.handleChannelRouterSettingsChanged();
                     this.handleWifiConfigSettingsChanged();
@@ -423,6 +439,7 @@ const SettingsDialog = withStyles(
                     }
                     this.model.state.removeOnChangedHandler(this.handleConnectionStateChanged);
                     this.model.showStatusMonitor.removeOnChangedHandler(this.handleShowStatusMonitorChanged);
+                    this.model.suspendBypassedPlugins.removeOnChangedHandler(this.handleSuspendBypassedPluginsChanged);
                     this.model.keepScreenOn.removeOnChangedHandler(this.handleKeepScreenOnChanged);
                     this.model.screenOrientation.removeOnChangedHandler(this.handleScreenOrientationChanged);
 
@@ -536,11 +553,11 @@ const SettingsDialog = withStyles(
         }
 
         midiSummary(): string {
-            let ports = this.state.alsaSequencerConfiguration.connections;
+            const ports = this.state.alsaSequencerConfiguration.connections;
             if (ports.length === 0) return "Disabled";
 
             let result = "";
-            for (let port of ports) {
+            for (const port of ports) {
                 if (result.length !== 0) {
                     result += ", ";
                 }
@@ -607,14 +624,14 @@ const SettingsDialog = withStyles(
         render() {
             const classes = withStyles.getClasses(this.props);
 
-            let isConfigValid = this.state.jackConfiguration.isValid;
-            let selectedChannels: string[] =
+            const isConfigValid = this.state.jackConfiguration.isValid;
+            const selectedChannels: string[] =
                 this.state.jackSettings === null ? [] :
                     this.state.showInputSelectDialog ? this.state.jackSettings.inputAudioPorts : this.state.jackSettings.outputAudioPorts;
-            let disableShutdown = this.state.shuttingDown || this.state.restarting;
+            const disableShutdown = this.state.shuttingDown || this.state.restarting;
 
-            let canKeepScreenOn = this.model.canKeepScreenOn;
-            let hasAudioConfig = isConfigValid
+            const canKeepScreenOn = this.model.canKeepScreenOn;
+            const hasAudioConfig = isConfigValid
                 && this.state.jackConfiguration.inputAudioPorts.length >= 1
                 && this.state.jackConfiguration.outputAudioPorts.length >= 1;
 
@@ -756,6 +773,36 @@ const SettingsDialog = withStyles(
                                             this.state.channelRouterSettings?.isValid(this.state.jackConfiguration) ?? false
                                              ?  "textSecondary": "error"} noWrap>{
                                             this.state.channelRouterSettings?.getDescription(this.state.jackConfiguration)??""}</Typography>
+                                    </div>
+                                </ButtonBase>
+
+                                <ButtonBase
+                                    className={classes.setting}
+                                    onClick={() => {
+                                        this.model.setSuspendBypassedPlugins(!this.state.suspendBypassedPlugins);
+                                    }}  >
+                                    <SelectHoverBackground selected={false} showHover={true} />
+                                    <div style={{ width: "100%" }}>
+                                        <div style={{
+                                            width: "100%", display: "flex", flexDirection: "row", flexWrap: "nowrap",
+                                            alignItems: "center", maxWidth: SETTING_ROW_MAX_WIDTH
+                                        }}>
+                                            <div style={{ flex: "1 1 auto", minWidth: 0 }}>
+                                                <Typography className={classes.primaryItem} display="block" variant="body2" color="textPrimary" noWrap>
+                                                    Suspend bypassed plugins (saves CPU)</Typography>
+                                                <Typography className={classes.secondaryItem} display="block" variant="caption" color="textSecondary">
+                                                    Bypassed plugins stop processing. When re-enabled, an old reverb or delay tail may be heard briefly.</Typography>
+                                            </div>
+
+                                            <div style={{ flex: "0 0 auto" }}>
+                                                <Switch
+                                                    checked={this.state.suspendBypassedPlugins}
+                                                    onChange={
+                                                        (e) => { this.model.setSuspendBypassedPlugins(e.target.checked); }
+                                                    }
+                                                />
+                                            </div>
+                                        </div>
                                     </div>
                                 </ButtonBase>
 
@@ -948,6 +995,36 @@ const SettingsDialog = withStyles(
                                                             checked={this.state.contentAlignment === ContentAlignment.Center}
                                                             onChange={
                                                                 (e) => { this.handleContentAlignmentChanged(e.target.checked); }
+                                                            }
+                                                        />
+                                                    </div>
+
+                                                </div>
+                                            </div>
+                                        </ButtonBase>
+                                        <ButtonBase
+                                            className={classes.setting}
+                                            onClick={() => {
+                                                this.handleAnimateSignalFlowChanged(!this.state.animateSignalFlow);
+                                            }}  >
+                                            <SelectHoverBackground selected={false} showHover={true} />
+                                            <div style={{ width: "100%" }}>
+                                                <div style={{
+                                                    width: "100%", display: "flex", flexDirection: "row", flexWrap: "nowrap",
+                                                    alignItems: "center", maxWidth: SETTING_ROW_MAX_WIDTH
+                                                }}>
+                                                    <div style={{ flex: "1 1 auto" }}>
+                                                        <Typography className={classes.primaryItem} display="block" variant="body2" color="textPrimary" noWrap>
+                                                            Animate signal flow</Typography>
+                                                        <Typography className={classes.secondaryItem} display="block" variant="caption" color="textSecondary" noWrap>
+                                                            Moving connectors and a pulsing active-plugin LED. Uses more CPU.</Typography>
+                                                    </div>
+
+                                                    <div style={{ flex: "0 0 auto" }}>
+                                                        <Switch
+                                                            checked={this.state.animateSignalFlow}
+                                                            onChange={
+                                                                (e) => { this.handleAnimateSignalFlowChanged(e.target.checked); }
                                                             }
                                                         />
                                                     </div>
@@ -1151,19 +1228,23 @@ const SettingsDialog = withStyles(
                     {
                         (this.state.showWifiConfigDialog) &&
                         (
-                            <WifiConfigDialog wifiConfigSettings={this.state.wifiConfigSettings} open={this.state.showWifiConfigDialog}
+                            <LazyBoundary onLoadFailed={() => this.setState({ showWifiConfigDialog: false })}>
+                                <WifiConfigDialog wifiConfigSettings={this.state.wifiConfigSettings} open={this.state.showWifiConfigDialog}
                                 onClose={() => this.setState({ showWifiConfigDialog: false })}
                                 onOk={(wifiConfigSettings) => this.handleApplyWifiConfig(wifiConfigSettings)}
-                            />
+                                />
+                            </LazyBoundary>
 
                         )
                     }
                     {
                         this.state.showWifiDirectConfigDialog && (
-                            <WifiDirectConfigDialog wifiDirectConfigSettings={this.state.wifiDirectConfigSettings} open={this.state.showWifiDirectConfigDialog}
+                            <LazyBoundary onLoadFailed={() => this.setState({ showWifiDirectConfigDialog: false })}>
+                                <WifiDirectConfigDialog wifiDirectConfigSettings={this.state.wifiDirectConfigSettings} open={this.state.showWifiDirectConfigDialog}
                                 onClose={() => this.setState({ showWifiDirectConfigDialog: false })}
                                 onOk={(wifiDirectConfigSettings: WifiDirectConfigSettings) => this.handleApplyWifiDirectConfig(wifiDirectConfigSettings)}
-                            />
+                                />
+                            </LazyBoundary>
 
                         )
                     }

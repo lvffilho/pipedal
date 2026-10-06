@@ -18,6 +18,7 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include "pch.h"
+#include <unordered_map>
 
 #include "Curl.hpp"
 #include "PiPedalSocket.hpp"
@@ -37,6 +38,7 @@
 #include <mutex>
 #include "Tone3000Downloader.hpp"
 #include "Tone3000Tone.hpp"
+#include "Tone3000Catalog.hpp"
 
 #include "AdminClient.hpp"
 #include "WifiConfigSettings.hpp"
@@ -793,6 +795,24 @@ public:
             model.RemoveVuSubscription(activeVuSubscriptions[i].subscriptionHandle);
         }
         activeVuSubscriptions.resize(0);
+        {
+            // Don't cancel this client's TONE3000 sign-in (a phone browser drops the socket while the user
+            // enters the code elsewhere); orphan it, so that any client (e.g. this one, reconnected) can cancel it.
+            auto tone3000Auth = model.GetTone3000Auth();
+            if (tone3000Auth)
+            {
+                tone3000Auth->ReleaseDeviceFlowOwner(this->clientId);
+            }
+        }
+
+        {
+            // drop outstanding request reservations; no replies will arrive now.
+            std::unordered_map<int, std::unique_ptr<IRequestReservation>> dropped;
+            {
+                std::lock_guard<std::recursive_mutex> guard(requestMutex);
+                dropped.swap(requestReservations);
+            }
+        }
 
         model.RemoveNotificationSubsription(shared_from_this());
         // Warning: potentially deleted after return.
@@ -998,7 +1018,7 @@ private:
         }
     };
     std::recursive_mutex requestMutex;
-    std::vector<IRequestReservation *> requestReservations;
+    std::unordered_map<int, std::unique_ptr<IRequestReservation>> requestReservations;
     std::atomic<int> nextRequestId{1};
 
 public:
@@ -1007,15 +1027,15 @@ public:
                  std::function<void(const REPLY &)> onSuccess,
                  std::function<void(const std::exception &error)> onError)
     {
+        int reservationId = (int)++nextRequestId;
         try
         {
-            RequestReservation<REPLY> *reservation = new RequestReservation<REPLY>(
-                (int)++nextRequestId,
-                onSuccess,
-                onError);
             {
                 std::lock_guard<std::recursive_mutex> lock(requestMutex);
-                requestReservations.push_back(reservation);
+                requestReservations[reservationId] = std::make_unique<RequestReservation<REPLY>>(
+                    reservationId,
+                    onSuccess,
+                    onError);
             }
             std::stringstream s(ios_base::out);
 
@@ -1024,7 +1044,7 @@ public:
             {
                 writer.start_object();
                 {
-                    writer.write_member("replyTo", reservation->GetReservationid());
+                    writer.write_member("replyTo", reservationId);
                     writer.write_raw(",");
                     writer.write_member("message", message);
                 }
@@ -1040,6 +1060,11 @@ public:
         }
         catch (const std::exception &e)
         {
+            {
+                // send failed: nobody will ever reply; don't leak the reservation.
+                std::lock_guard<std::recursive_mutex> lock(requestMutex);
+                requestReservations.erase(reservationId);
+            }
             onError(PiPedalException(e.what()));
         }
     }
@@ -1388,6 +1413,8 @@ public:
         // {
         //     throw PiPedalException("Permission denied. Not on local subnet.");
         // }
+        // Throws for an unavailable governor; onReceive turns that into an "error" reply, which
+        // rejects the client's request (the UI then reverts its optimistic value).
         this->model.SetGovernorSettings(governor);
         this->Reply(replyTo, "setGovernorSettings");
     }
@@ -1598,6 +1625,20 @@ public:
         Reply(replyTo, "getShowStatusMonitor", this->model.GetShowStatusMonitor());
     }
     REGISTER_MESSAGE_HANDLER(getShowStatusMonitor)
+
+    void handle_setSuspendBypassedPlugins(int replyTo, json_reader *pReader)
+    {
+        bool value;
+        pReader->read(&value);
+        this->model.SetSuspendBypassedPlugins(value);
+    }
+    REGISTER_MESSAGE_HANDLER(setSuspendBypassedPlugins)
+
+    void handle_getSuspendBypassedPlugins(int replyTo, json_reader *pReader)
+    {
+        Reply(replyTo, "getSuspendBypassedPlugins", this->model.GetSuspendBypassedPlugins());
+    }
+    REGISTER_MESSAGE_HANDLER(getSuspendBypassedPlugins)
 
     void handle_version(int replyTo, json_reader *pReader)
     {
@@ -2142,21 +2183,218 @@ public:
     }
     REGISTER_MESSAGE_HANDLER(pingTone3000Server)
 
+    // TONE3000 account session (device-code sign-in). Status changes arrive as onT3kAuthStatusChanged.
+    std::shared_ptr<Tone3000Auth> RequireTone3000Auth()
+    {
+        auto auth = model.GetTone3000Auth();
+        if (!auth)
+        {
+            throw std::runtime_error("TONE3000 sign-in is not available.");
+        }
+        return auth;
+    }
+    void handle_t3kAuthGetStatus(int replyTo, json_reader *pReader)
+    {
+        Tone3000AuthStatus status = RequireTone3000Auth()->GetStatus();
+        this->Reply(replyTo, "t3kAuthGetStatus", status);
+    }
+    REGISTER_MESSAGE_HANDLER(t3kAuthGetStatus)
+
+    void handle_t3kAuthStartDeviceFlow(int replyTo, json_reader *pReader)
+    {
+        auto auth = RequireTone3000Auth();
+        auth->StartDeviceFlow(this->clientId); // polls on its own background thread.
+        Tone3000AuthStatus status = auth->GetStatus();
+        this->Reply(replyTo, "t3kAuthStartDeviceFlow", status);
+    }
+    REGISTER_MESSAGE_HANDLER(t3kAuthStartDeviceFlow)
+
+    void handle_t3kAuthCancelDeviceFlow(int replyTo, json_reader *pReader)
+    {
+        // Only a flow this client started (or an orphaned one): another client's sign-in dialog stays up.
+        bool cancelled = RequireTone3000Auth()->CancelDeviceFlow(this->clientId);
+        this->Reply(replyTo, "t3kAuthCancelDeviceFlow", cancelled);
+    }
+    REGISTER_MESSAGE_HANDLER(t3kAuthCancelDeviceFlow)
+
+    void handle_t3kAuthSignOut(int replyTo, json_reader *pReader)
+    {
+        RequireTone3000Auth()->SignOut();
+        this->Reply(replyTo, "t3kAuthSignOut", true);
+    }
+    REGISTER_MESSAGE_HANDLER(t3kAuthSignOut)
+
+    // A short-lived access token for downloads done in the browser. The refresh token stays here.
+    void handle_t3kAuthGetAccessToken(int replyTo, json_reader *pReader)
+    {
+        Tone3000AccessTokenRequest request = ReadTone3000AccessTokenRequest(*pReader);
+        auto auth = RequireTone3000Auth();
+        // Tracked: Tone3000Auth::Close() (model shutdown) waits for the thread, which can
+        // reach the model through the handler (FinalCleanup when it drops the last reference).
+        auto operation = auth->BeginOperation();
+        std::shared_ptr<PiPedalSocketHandler> this_ = shared_from_this();
+        // May refresh over the network: off the socket thread.
+        std::thread([this_, auth, operation, replyTo, request]() mutable
+                    {
+            Tone3000AccessTokenReply reply;
+            try {
+                Tone3000Tokens tokens = auth->GetTokens(request.forceRefresh, request.rejectedAccessToken);
+                reply.ok_ = true;
+                reply.accessToken_ = tokens.accessToken;
+                reply.expiresAtMs_ = tokens.expiresAtMs;
+            } catch (const std::exception &e) {
+                reply.ok_ = false;
+                reply.error_ = e.what();
+            }
+            try {
+                this_->Reply(replyTo, "t3kAuthGetAccessToken", reply);
+            } catch (const std::exception &) {
+                // client went away.
+            }
+            this_.reset(); // before the operation ends.
+            operation.reset(); })
+            .detach();
+    }
+    REGISTER_MESSAGE_HANDLER(t3kAuthGetAccessToken)
+
+    // TONE3000 catalog, proxied so the access token stays here. Requests are validated on the
+    // socket thread (bad parameters are answered at once); the network call runs on a detached
+    // thread, at most t3k_catalog::MAX_REQUESTS_IN_FLIGHT at a time.
+    template <typename REPLY, typename FN>
+    void RunT3kCatalogRequest(int replyTo, const char *message, const std::function<void()> &validate, FN fn)
+    {
+        try
+        {
+            validate();
+        }
+        catch (const std::exception &e)
+        {
+            REPLY reply;
+            reply.error_ = e.what();
+            this->Reply(replyTo, message, reply);
+            return;
+        }
+        auto slot = std::make_shared<Tone3000CatalogRequestSlot>();
+        if (!slot->Acquired())
+        {
+            REPLY reply;
+            reply.error_ = "Too many TONE3000 requests at once. Please try again.";
+            this->Reply(replyTo, message, reply);
+            return;
+        }
+        auto auth = RequireTone3000Auth();
+        auto operation = auth->BeginOperation(); // Tone3000Auth::Close() waits for it (see t3kAuthGetAccessToken).
+        auto catalog = std::make_shared<Tone3000Catalog>(auth);
+        std::shared_ptr<PiPedalSocketHandler> this_ = shared_from_this();
+        std::thread([this_, slot, catalog, operation, replyTo, message, fn]() mutable
+                    {
+            REPLY reply;
+            try {
+                reply = fn(*catalog);
+            } catch (const std::exception &e) {
+                reply = REPLY();
+                reply.error_ = e.what();
+            }
+            try {
+                this_->Reply(replyTo, message, reply);
+            } catch (const std::exception &) {
+                // client went away.
+            }
+            this_.reset(); // before the operation ends.
+            operation.reset(); })
+            .detach();
+    }
+
+    void handle_t3kCatalogSearch(int replyTo, json_reader *pReader)
+    {
+        Tone3000CatalogQuery query;
+        pReader->read(&query);
+        RunT3kCatalogRequest<Tone3000CatalogTonesReply>(
+            replyTo, "t3kCatalogSearch",
+            [&query]()
+            { BuildTone3000TonesPath(query); },
+            [query](Tone3000Catalog &catalog)
+            { return catalog.Search(query); });
+    }
+    REGISTER_MESSAGE_HANDLER(t3kCatalogSearch)
+
+    void handle_t3kCatalogTrending(int replyTo, json_reader *pReader)
+    {
+        std::string gear;
+        pReader->read(&gear);
+        RunT3kCatalogRequest<Tone3000CatalogTonesReply>(
+            replyTo, "t3kCatalogTrending",
+            [&gear]()
+            { BuildTone3000TrendingPath(gear); },
+            [gear](Tone3000Catalog &catalog)
+            { return catalog.Trending(gear); });
+    }
+    REGISTER_MESSAGE_HANDLER(t3kCatalogTrending)
+
+    void handle_t3kCatalogSetFavorite(int replyTo, json_reader *pReader)
+    {
+        Tone3000CatalogFavoriteRequest request;
+        pReader->read(&request);
+        RunT3kCatalogRequest<Tone3000CatalogFavoriteReply>(
+            replyTo, "t3kCatalogSetFavorite",
+            [&request]()
+            { BuildTone3000FavoritePath(request.toneId_); },
+            [request](Tone3000Catalog &catalog)
+            { return catalog.SetFavorite(request); });
+    }
+    REGISTER_MESSAGE_HANDLER(t3kCatalogSetFavorite)
+
+    void handle_t3kCatalogModels(int replyTo, json_reader *pReader)
+    {
+        Tone3000CatalogModelsQuery query;
+        pReader->read(&query);
+        RunT3kCatalogRequest<Tone3000CatalogModelsReply>(
+            replyTo, "t3kCatalogModels",
+            [&query]()
+            { BuildTone3000ModelsPath(query); },
+            [query](Tone3000Catalog &catalog)
+            { return catalog.Models(query); });
+    }
+    REGISTER_MESSAGE_HANDLER(t3kCatalogModels)
+
+    void handle_t3kCatalogTags(int replyTo, json_reader *pReader)
+    {
+        Tone3000CatalogTaxonomyQuery query;
+        pReader->read(&query);
+        RunT3kCatalogRequest<Tone3000CatalogNamesReply>(
+            replyTo, "t3kCatalogTags",
+            [&query]()
+            { BuildTone3000TaxonomyPath("tags", query); },
+            [query](Tone3000Catalog &catalog)
+            { return catalog.Taxonomy("tags", query); });
+    }
+    REGISTER_MESSAGE_HANDLER(t3kCatalogTags)
+
+    void handle_t3kCatalogMakes(int replyTo, json_reader *pReader)
+    {
+        Tone3000CatalogTaxonomyQuery query;
+        pReader->read(&query);
+        RunT3kCatalogRequest<Tone3000CatalogNamesReply>(
+            replyTo, "t3kCatalogMakes",
+            [&query]()
+            { BuildTone3000TaxonomyPath("makes", query); },
+            [query](Tone3000Catalog &catalog)
+            { return catalog.Taxonomy("makes", query); });
+    }
+    REGISTER_MESSAGE_HANDLER(t3kCatalogMakes)
+
     void handleMessage(int reply, int replyTo, const std::string &message, json_reader *pReader)
     {
         if (reply != -1)
         {
-            IRequestReservation *reservation = nullptr;
+            std::unique_ptr<IRequestReservation> reservation;
             {
                 std::lock_guard<std::recursive_mutex> guard(this->requestMutex);
-                for (auto i = this->requestReservations.begin(); i != this->requestReservations.end(); ++i)
+                auto i = this->requestReservations.find(reply);
+                if (i != this->requestReservations.end())
                 {
-                    if ((*i)->GetReservationid() == reply)
-                    {
-                        reservation = (*i);
-                        requestReservations.erase(i);
-                        break;
-                    }
+                    reservation = std::move(i->second);
+                    requestReservations.erase(i);
                 }
             }
             // be careful not to take down the whole server because of a client that's shutting down.
@@ -2170,7 +2408,6 @@ public:
                 {
                     Lv2Log::error("Socket: Invalid reply '%s'. (%s)", message.c_str(), e.what());
                 }
-                delete reservation;
             }
             else
             {
@@ -2334,6 +2571,11 @@ private:
         Send("onTone3000DownloadError", body);
     }
 
+    virtual void OnTone3000AuthStatusChanged(const Tone3000AuthStatus &status) override
+    {
+        Send("onT3kAuthStatusChanged", status);
+    }
+
     // virtual void OnPatchPropertyChanged(int64_t clientId, int64_t instanceId,const std::string& propertyUri,const json_variant& value)
     // {
     //     PatchPropertyChangedBody body;
@@ -2354,6 +2596,10 @@ private:
         Send("onFavoritesChanged", favorites);
     }
 
+    virtual void OnSuspendBypassedPluginsChanged(bool value)
+    {
+        Send("onSuspendBypassedPluginsChanged", value);
+    }
     virtual void OnShowStatusMonitorChanged(bool show)
     {
         Send("onShowStatusMonitorChanged", show);
@@ -2407,52 +2653,48 @@ private:
         Send("onLoadPluginPreset", body);
     }
 
-    int updateRequestOutstanding = 0;
-    bool vuUpdateDropped = false;
+    VuFlowControl vuFlowControl;
+    std::atomic<bool> vuUpdateDropped{false}; // OnVuMeterUpdate may run concurrently with itself across notifier threads.
 
     virtual void OnVuMeterUpdate(const std::vector<VuUpdateX> &updates)
     {
-        std::lock_guard<std::recursive_mutex> guard(subscriptionMutex);
-        if (updateRequestOutstanding < 1) // throttle to accomodate a web page that can't keep up.
+        std::vector<VuUpdateX> batch;
         {
-            vuUpdateDropped = false;
-            for (int i = 0; i < updates.size(); ++i)
-            {
-                const VuUpdateX &vuUpdate = updates[i];
-                bool interested = false;
-                for (int i = 0; i < this->activeVuSubscriptions.size(); ++i)
+            std::lock_guard<std::recursive_mutex> guard(subscriptionMutex);
+            batch = FilterVuUpdates(updates, [this](int64_t instanceId)
+                                    {
+                for (const auto &sub : this->activeVuSubscriptions)
                 {
-                    if (activeVuSubscriptions[i].instanceId == vuUpdate.instanceId_)
-                    {
-                        interested = true;
-                        break;
-                    }
+                    if (sub.instanceId == instanceId)
+                        return true;
                 }
-                if (interested)
-                {
-                    updateRequestOutstanding++;
-                    this->Request<bool, VuUpdateX>(
-                        "onVuUpdate",
-                        vuUpdate,
-                        [this](const bool &result)
-                        {
-                            this->updateRequestOutstanding--;
-                        },
-                        [this](const std::exception &)
-                        {
-                            this->updateRequestOutstanding--;
-                        });
-                }
-            }
+                return false; });
         }
-        else
+        if (batch.empty())
         {
-            if (!vuUpdateDropped)
+            return;
+        }
+        if (!vuFlowControl.TryBeginSend()) // throttle to accomodate a web page that can't keep up.
+        {
+            if (!vuUpdateDropped.exchange(true))
             {
-                vuUpdateDropped = true;
                 Lv2Log::debug("Vu Update(s) dropped.");
             }
+            return;
         }
+        vuUpdateDropped.store(false);
+        // One batched message, one ack. Both callbacks release the flow control.
+        this->Request<bool, std::vector<VuUpdateX>>(
+            "onVuUpdates",
+            batch,
+            [this](const bool &result)
+            {
+                this->vuFlowControl.EndSend();
+            },
+            [this](const std::exception &)
+            {
+                this->vuFlowControl.EndSend();
+            });
     }
 
     virtual void OnVst3ControlChanged(int64_t clientId, int64_t instanceId, const std::string &key, float value, const std::string &state)

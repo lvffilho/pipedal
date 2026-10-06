@@ -87,10 +87,12 @@ namespace pipedal
         tone3000_time_point created_at_;
         tone3000_time_point updated_at_;
         std::string gear_;
-        std::vector<std::string> images_;
+        // The API sends null for a tone without images (seen live; links likewise per its schema).
+        std::optional<std::vector<std::string>> images_;
         bool is_public_ = true;
-        std::vector<std::string> links_;
-        std::string platform_;
+        std::optional<std::vector<std::string>> links_;
+        std::string format_;   // nam | ir | aida-x | aa-snapshot | proteus
+        std::string platform_; // deprecated: replaced by format (no longer sent by the API).
         int64_t models_count_ = 0;
         int64_t favorites_count_ = 0;
         int64_t downloads_count_ = 0;
@@ -116,9 +118,12 @@ namespace pipedal
         JSON_GETTER_SETTER_REF(created_at)
         JSON_GETTER_SETTER_REF(updated_at)
         JSON_GETTER_SETTER_REF(gear)
-        JSON_GETTER_SETTER_REF(images)
+        const std::vector<std::string> &images() const { return images_ ? *images_ : EmptyList(); }
+        void images(const std::vector<std::string> &value) { images_ = value; }
         JSON_GETTER_SETTER(is_public)
-        JSON_GETTER_SETTER_REF(links)
+        const std::vector<std::string> &links() const { return links_ ? *links_ : EmptyList(); }
+        void links(const std::vector<std::string> &value) { links_ = value; }
+        JSON_GETTER_SETTER_REF(format)
         JSON_GETTER_SETTER_REF(platform)
         JSON_GETTER_SETTER(models_count)
         JSON_GETTER_SETTER(favorites_count)
@@ -134,6 +139,13 @@ namespace pipedal
         JSON_GETTER_SETTER_REF(models)
 
         DECLARE_JSON_MAP(Tone3000Download);
+
+    private:
+        static const std::vector<std::string> &EmptyList()
+        {
+            static const std::vector<std::string> empty;
+            return empty;
+        }
     };
 
 }

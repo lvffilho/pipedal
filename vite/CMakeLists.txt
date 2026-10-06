@@ -16,11 +16,14 @@ set(BUILD_DIRECTORY ${PROJECT_SOURCE_DIR}/vite/dist)
 
 add_custom_command(
     OUTPUT ${BUILD_DIRECTORY}/index.html
-    COMMAND ${BUILD_REACT}
+    # The web UI's TONE3000 client id is the daemon's (see PIPEDAL_T3K_PUBLISHABLE_KEY).
+    COMMAND ${CMAKE_COMMAND} -E env "VITE_T3K_PUBLISHABLE_KEY=${PIPEDAL_T3K_PUBLISHABLE_KEY}" ${BUILD_REACT}
     ARGS ${BUILD_REACT_ARGS}
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/vite
 
     DEPENDS
+    # Rewritten only when the key changes.
+    ${CMAKE_BINARY_DIR}/src/T3kConfig.h
         # find public src *.json *.ts  -type f >/tmp/tmp.txt                    
     public/css/modGui.css
     public/css/roboto.css

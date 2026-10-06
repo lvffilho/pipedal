@@ -71,9 +71,14 @@ namespace pipedal
 
             virtual void RemoveAllConnections() override;
 
-        private:
+            virtual uint64_t TakeMalformedEventCount() override
+            {
+                return malformedEvents.exchange(0, std::memory_order_relaxed);
+            }
 
-            bool IsChannelSelected(int32_t channel);
+        private:
+            std::atomic<uint64_t> malformedEvents{0};
+
             void ModifyConnection(int clientId, int portId, ConnectAction action);
 
             // Get the current queue ID (returns -1 if no queue is active)
@@ -90,13 +95,14 @@ namespace pipedal
             };
 
             int myClientId = -1;
-            int32_t midiChannel()  { 
-                std::lock_guard lock(connectionsMutex);
-                return midiChannel_;
+            // Read on the audio thread for every event (ReadMessage), so lock-free.
+            int32_t midiChannel() const noexcept
+            {
+                return midiChannel_.load(std::memory_order_relaxed);
             }
-            void midiChannel(uint32_t value) { 
-                std::lock_guard lock(connectionsMutex);
-                midiChannel_ = value; 
+            void midiChannel(int32_t value) noexcept
+            {
+                midiChannel_.store(value, std::memory_order_relaxed);
             }
 
             std::mutex connectionsMutex;
@@ -105,7 +111,7 @@ namespace pipedal
             snd_seq_t *seqHandle = nullptr;
             int inPort = -1;
             int queueId = -1; // Queue for real-time timestamps
-            int32_t midiChannel_ = -1;
+            std::atomic<int32_t> midiChannel_{-1};
         };
 
         class AlsaSequencerDeviceMonitorImpl : public AlsaSequencerDeviceMonitor
@@ -411,26 +417,282 @@ namespace pipedal
         }
     }
 
-    bool AlsaSequencerImpl::IsChannelSelected(int32_t channel) 
+    static bool ChannelSelected(int32_t selection, int32_t channel) noexcept
     {
-        auto selection = this->midiChannel();
-        if (selection < 0) return true;
+        if (selection < 0)
+            return true;
         return selection == channel;
-        
     }
+
+    AlsaSequencerDecodeResult DecodeAlsaSequencerEvent(
+        const snd_seq_event_t *event, int32_t channelSelection, AlsaMidiMessage &message) noexcept
+    {
+        // Extract timestamp information
+        message.timestamp = event->time.tick;
+        message.realtime_sec = event->time.time.tv_sec;
+        message.realtime_nsec = event->time.time.tv_nsec;
+
+        switch (event->type)
+        {
+        case SND_SEQ_EVENT_NOTEON:
+            if (!ChannelSelected(channelSelection, event->data.note.channel))
+            {
+                return AlsaSequencerDecodeResult::Skip;
+            }
+            message.Set(
+                (uint8_t)(0x90 | event->data.note.channel),
+                (uint8_t)(event->data.note.note),      // note
+                (uint8_t)(event->data.note.velocity)); // velocity
+            break;
+        case SND_SEQ_EVENT_NOTEOFF:
+            // handle note-off
+            if (!ChannelSelected(channelSelection, event->data.note.channel))
+            {
+                return AlsaSequencerDecodeResult::Skip;
+            }
+            message.Set(
+                uint8_t(0x80 | event->data.note.channel),
+                uint8_t(event->data.note.note),
+                uint8_t(event->data.note.off_velocity)); // off velocity
+            break;
+        case SND_SEQ_EVENT_KEYPRESS:
+            // handle note-off
+            if (!ChannelSelected(channelSelection, event->data.note.channel))
+            {
+                return AlsaSequencerDecodeResult::Skip;
+            }
+            message.Set(
+                (uint8_t)(0xA0 | event->data.note.channel), // polyphonic key pressure
+                (uint8_t)(event->data.note.note),           // note
+                (uint8_t)(event->data.note.velocity));      // pressure
+            break;
+        case SND_SEQ_EVENT_CONTROLLER:
+            // handle note-off
+            if (!ChannelSelected(channelSelection, event->data.control.channel))
+            {
+                return AlsaSequencerDecodeResult::Skip;
+            }
+            message.Set(
+                (uint8_t)(0xB0 | event->data.control.channel), // control change
+                (uint8_t)(event->data.control.param),          // controller number
+                (uint8_t)(event->data.control.value));         // controller value
+            break;
+        case SND_SEQ_EVENT_PGMCHANGE:
+                            // handle note-off
+            if (!ChannelSelected(channelSelection, event->data.control.channel))
+            {
+                return AlsaSequencerDecodeResult::Skip;
+            }
+
+            message.Set(
+                (uint8_t)(0xC0 | event->data.control.channel), // program change
+                (uint8_t)(event->data.control.value));
+            break;
+
+        case SND_SEQ_EVENT_CHANPRESS:
+            if (!ChannelSelected(channelSelection, event->data.control.channel))
+            {
+                return AlsaSequencerDecodeResult::Skip;
+            }
+            message.Set(
+                uint8_t(0xD0 | event->data.control.channel),
+                uint8_t(event->data.control.value));
+            break;
+        case SND_SEQ_EVENT_PITCHBEND:
+            if (!ChannelSelected(channelSelection, event->data.control.channel))
+            {
+                return AlsaSequencerDecodeResult::Skip;
+            }
+            message.Set(uint8_t(0xE0 | event->data.control.channel),
+                        uint8_t((event->data.control.value >> 7) & 0x7F),
+                        uint8_t(event->data.control.value & 0x7F));
+            break;
+        case SND_SEQ_EVENT_CONTROL14:
+            if (!ChannelSelected(channelSelection, event->data.control.channel))
+            {
+                return AlsaSequencerDecodeResult::Skip;
+            }
+            message.size = 6;
+            message.data = message.fixedBuffer;
+            message.fixedBuffer[0] = uint8_t(0xB0 | event->data.control.channel);    // Control Change 14-bit
+            message.fixedBuffer[1] = uint8_t(event->data.control.param);             // MSB
+            message.fixedBuffer[2] = uint8_t(event->data.control.param >> 7) & 0x7F; // MSB
+            message.fixedBuffer[3] = uint8_t(0xB0 | event->data.control.channel);
+            message.fixedBuffer[4] = uint8_t(event->data.control.value + 0x20);
+            message.fixedBuffer[5] = uint8_t(event->data.control.value) & 0x7F; // MSB value
+            break;
+
+        case SND_SEQ_EVENT_NONREGPARAM:
+            if (!ChannelSelected(channelSelection, event->data.control.channel))
+            {
+                return AlsaSequencerDecodeResult::Skip;
+            }
+            message.size = 12;
+            message.data = message.fixedBuffer;
+            message.fixedBuffer[0] = uint8_t(0xB0 | event->data.control.channel);    // Non-registered parameter
+            message.fixedBuffer[1] = 0x63;                                           // MSB
+            message.fixedBuffer[2] = uint8_t(event->data.control.param >> 7) & 0x7F; // MSB
+            message.fixedBuffer[3] = uint8_t(0xB0 | event->data.control.channel);
+            message.fixedBuffer[4] = 0x62;                                      // LSB
+            message.fixedBuffer[5] = uint8_t(event->data.control.param) & 0x7F; // LSB
+            message.fixedBuffer[6] = uint8_t(0xB0 | event->data.control.channel);
+            message.fixedBuffer[7] = uint8_t(0x06);                                  // Non-registered parameter value MSB
+            message.fixedBuffer[8] = uint8_t(event->data.control.value >> 7) & 0x7F; // MSB value
+            message.fixedBuffer[9] = uint8_t(0xB0 | event->data.control.channel);
+            message.fixedBuffer[10] = uint8_t(0x26);                             // Non-registered parameter value LSB
+            message.fixedBuffer[11] = uint8_t(event->data.control.value) & 0x7F; // LSb
+            break;
+        case SND_SEQ_EVENT_REGPARAM:
+            if (!ChannelSelected(channelSelection, event->data.control.channel))
+            {
+                return AlsaSequencerDecodeResult::Skip;
+            }
+            message.size = 12;
+            message.data = message.fixedBuffer;
+            message.fixedBuffer[0] = uint8_t(0xB0 | event->data.control.channel);    // Registered parameter
+            message.fixedBuffer[1] = uint8_t(0x65);                                  // MSB
+            message.fixedBuffer[2] = uint8_t(event->data.control.param >> 7) & 0x7F; // MSB
+            message.fixedBuffer[3] = uint8_t(0xB0 | event->data.control.channel);
+            message.fixedBuffer[4] = uint8_t(0x64);                             // LSB
+            message.fixedBuffer[5] = uint8_t(event->data.control.param) & 0x7F; // LSB
+            message.fixedBuffer[6] = uint8_t(0xB0 | event->data.control.channel);
+            message.fixedBuffer[7] = uint8_t(0x6);                                   // Registered parameter value MSB
+            message.fixedBuffer[8] = uint8_t(event->data.control.value >> 7) & 0x7F; // MSB value
+            message.fixedBuffer[9] = uint8_t(0xB0 | event->data.control.channel);
+            message.fixedBuffer[10] = uint8_t(0x26);                             // Registered parameter value LSB
+            message.fixedBuffer[11] = uint8_t(event->data.control.value) & 0x7F; // LSB value
+            break;
+        case SND_SEQ_EVENT_SONGPOS:
+            message.Set(
+                0xF2,
+                (uint8_t)((event->data.control.value >> 7) & 0x7F), // MSB
+                (uint8_t)(event->data.control.value & 0x7F)         // LSB
+            );
+            break;
+        case SND_SEQ_EVENT_SONGSEL:
+            message.Set(
+                0xF3,
+                (uint8_t)((event->data.control.value >> 7) & 0x7F), // MSB
+                (uint8_t)(event->data.control.value & 0x7F)         // LSB
+            );
+            break;
+        case SND_SEQ_EVENT_QFRAME:
+            message.Set(
+                0xF1,
+                (uint8_t)((event->data.control.value >> 7) & 0x7F), // MSB
+                (uint8_t)(event->data.control.value & 0x7F)         // LSB
+            );
+            break;
+        case SND_SEQ_EVENT_START:
+            message.Set(0xFA); // MIDI Real Time Start
+            break;
+        case SND_SEQ_EVENT_CONTINUE:
+            message.Set(0xFB); // MIDI Real Time Continue
+            break;
+        case SND_SEQ_EVENT_STOP:
+            message.Set(0xFC); // MIDI Real Time Stop
+            break;
+        case SND_SEQ_EVENT_TICK:
+            message.Set(0xF8); // MIDI Real Time Clock Tick
+            break;
+        case SND_SEQ_EVENT_SENSING:
+            message.Set(0xFE); // MIDI Real Time Active Sensing
+            break;
+        case SND_SEQ_EVENT_RESET:
+            message.Set(0xFF); // MIDI Real Time System Reset
+            break;
+        case SND_SEQ_EVENT_SYSEX:
+            // Handle SysEx messages
+            if (event->data.ext.len > 0 && event->data.ext.len + 2 <= sizeof(message.fixedBuffer))
+            {
+                message.size = event->data.ext.len + 1; // +1 for SysEx
+                message.data = message.fixedBuffer;
+                message.fixedBuffer[0] = 0xF0; // Start of SysEx
+                memcpy(message.fixedBuffer + 1, event->data.ext.ptr, event->data.ext.len);
+                message.fixedBuffer[event->data.ext.len + 1] = 0xF7; // End of SysEx
+            }
+            else
+            {
+                // Large SysEx: reference the event's own data. A continuation chunk of a
+                // split SysEx (or an empty one) does not start with 0xF0: skip it as
+                // malformed. Never throw here; this runs on the audio thread.
+                if (event->data.ext.len == 0 || event->data.ext.ptr == nullptr ||
+                    ((const uint8_t *)event->data.ext.ptr)[0] != 0xF0)
+                {
+                    return AlsaSequencerDecodeResult::Malformed;
+                }
+                message.size = event->data.ext.len;
+                message.data = (uint8_t *)event->data.ext.ptr;
+            }
+            break;
+        case SND_SEQ_EVENT_SETPOS_TICK:
+            message.size = 3 + sizeof(event->data.queue.param.value); // Tempo events are usually 3 bytes
+            message.data = message.fixedBuffer;
+            message.fixedBuffer[0] = 0xFF;                                    // Meta event type for tempo
+            message.fixedBuffer[1] = (uint8_t)MetaEventType::SetPositionTick; // Meta event subtype for tempo
+            message.fixedBuffer[2] = (uint8_t)(event->data.queue.queue);      // MSB
+            memcpy(message.fixedBuffer + 3, &event->data.queue.param.value, sizeof(event->data.queue.param.value));
+            break;
+        case SND_SEQ_EVENT_SETPOS_TIME:
+            message.size = 3 + sizeof(event->data.queue.param.time); // Tempo events are usually 3 bytes
+            message.data = message.fixedBuffer;
+            message.fixedBuffer[0] = 0xFF;                                    // Meta event type for tempo
+            message.fixedBuffer[1] = (uint8_t)MetaEventType::SetPositionTime; // Meta event subtype for tempo
+            message.fixedBuffer[2] = (uint8_t)(event->data.queue.queue);
+            memcpy(message.fixedBuffer + 3, &event->data.queue.param.time, sizeof(event->data.queue.param.time));
+            break;
+        case SND_SEQ_EVENT_TEMPO:
+            // Handle tempo events
+            message.size = sizeof(event->data.queue.param.value) + 3; // Tempo events are usually 3 bytes
+            if (message.size > sizeof(message.fixedBuffer))
+            {
+                return AlsaSequencerDecodeResult::Malformed;
+            }
+            message.data = message.fixedBuffer;
+            message.fixedBuffer[0] = 0xFF;                          // Meta event type for tempo
+            message.fixedBuffer[1] = (uint8_t)MetaEventType::Tempo; // Meta event subtype for tempo
+            message.fixedBuffer[2] = (uint8_t)(event->data.queue.queue);
+            memcpy(message.fixedBuffer + 3, &event->data.queue.param.value, sizeof(event->data.queue.param.value));
+            break;
+
+        case SND_SEQ_EVENT_CLOCK:
+            message.Set(0xF8); // MIDI Real Time Clock Tick
+            break;
+    // Sequencer system events (client/port start, exit, change, subscribed...)
+            // and a PASSEL of others are not MIDI: skipped by default below.
+            // (No logging here: this runs on the audio thread.)
+
+        case SND_SEQ_EVENT_KEYSIGN:
+        case SND_SEQ_EVENT_TIMESIGN:
+            // and a PASSEL of others!
+        default:
+            return AlsaSequencerDecodeResult::Skip;
+        }
+        return AlsaSequencerDecodeResult::Message;
+    }
+
     bool AlsaSequencerImpl::ReadMessage(AlsaMidiMessage &message, int timeoutMs)
     {
         // Event loop
         snd_seq_event_t *event = nullptr;
         while (true)
         {
-            bool success = false;
+            if (timeoutMs == 0)
+            {
+                // Non-blocking poll from the audio thread: one non-blocking fetch from the
+                // sequencer (or none, if events are already buffered) instead of
+                // event_input + EAGAIN + poll() every cycle. Never calls WaitForMessage.
+                if (snd_seq_event_input_pending(seqHandle, 1) <= 0)
+                {
+                    return false;
+                }
+            }
             int rc = snd_seq_event_input(seqHandle, &event);
             if (rc < 0)
             {
                 if (rc == -EAGAIN)
                 {
-                    if (!WaitForMessage(timeoutMs))
+                    if (timeoutMs == 0 || !WaitForMessage(timeoutMs))
                     {
                         return false;
                     }
@@ -445,265 +707,20 @@ namespace pipedal
             }
             else if (event)
             {
-                success = true;
-                // Extract timestamp information
-                message.timestamp = event->time.tick;
-                message.realtime_sec = event->time.time.tv_sec;
-                message.realtime_nsec = event->time.time.tv_nsec;
-
-                // Process MIDI event here, e.g. NOTEON, NOTEOFF, etc.
-
-                switch (event->type)
-                {
-                case SND_SEQ_EVENT_NOTEON:
-                    if (!IsChannelSelected(event->data.note.channel))
-                    {
-                        continue;
-                    }
-                    message.Set(
-                        (uint8_t)(0x90 | event->data.note.channel),
-                        (uint8_t)(event->data.note.note),      // note
-                        (uint8_t)(event->data.note.velocity)); // velocity
-                    break;
-                case SND_SEQ_EVENT_NOTEOFF:
-                    // handle note-off
-                    if (!IsChannelSelected(event->data.note.channel))
-                    {
-                        continue;
-                    }
-                    message.Set(
-                        uint8_t(0x80 | event->data.note.channel),
-                        uint8_t(event->data.note.note),
-                        uint8_t(event->data.note.off_velocity)); // off velocity
-                    break;
-                case SND_SEQ_EVENT_KEYPRESS:
-                    // handle note-off
-                    if (!IsChannelSelected(event->data.note.channel))
-                    {
-                        continue;
-                    }
-                    message.Set(
-                        (uint8_t)(0xA0 | event->data.note.channel), // polyphonic key pressure
-                        (uint8_t)(event->data.note.note),           // note
-                        (uint8_t)(event->data.note.velocity));      // pressure
-                    break;
-                case SND_SEQ_EVENT_CONTROLLER:
-                    // handle note-off
-                    if (!IsChannelSelected(event->data.control.channel))
-                    {
-                        continue;
-                    }
-                    message.Set(
-                        (uint8_t)(0xB0 | event->data.control.channel), // control change
-                        (uint8_t)(event->data.control.param),          // controller number
-                        (uint8_t)(event->data.control.value));         // controller value
-                    break;
-                case SND_SEQ_EVENT_PGMCHANGE:
-                                    // handle note-off
-                    if (!IsChannelSelected(event->data.control.channel))
-                    {
-                        continue;
-                    }
-
-                    message.Set(
-                        (uint8_t)(0xC0 | event->data.control.channel), // program change
-                        (uint8_t)(event->data.control.value));
-                    break;
-
-                case SND_SEQ_EVENT_CHANPRESS:
-                    if (!IsChannelSelected(event->data.control.channel))
-                    {
-                        continue;
-                    }
-                    message.Set(
-                        uint8_t(0xD0 | event->data.control.channel),
-                        uint8_t(event->data.control.value));
-                    break;
-                case SND_SEQ_EVENT_PITCHBEND:
-                    if (!IsChannelSelected(event->data.control.channel))
-                    {
-                        continue;
-                    }
-                    message.Set(uint8_t(0xE0 | event->data.control.channel),
-                                uint8_t((event->data.control.value >> 7) & 0x7F),
-                                uint8_t(event->data.control.value & 0x7F));
-                    break;
-                case SND_SEQ_EVENT_CONTROL14:
-                    if (!IsChannelSelected(event->data.control.channel))
-                    {
-                        continue;
-                    }
-                    message.size = 6;
-                    message.data = message.fixedBuffer;
-                    message.fixedBuffer[0] = uint8_t(0xB0 | event->data.control.channel);    // Control Change 14-bit
-                    message.fixedBuffer[1] = uint8_t(event->data.control.param);             // MSB
-                    message.fixedBuffer[2] = uint8_t(event->data.control.param >> 7) & 0x7F; // MSB
-                    message.fixedBuffer[3] = uint8_t(0xB0 | event->data.control.channel);
-                    message.fixedBuffer[4] = uint8_t(event->data.control.value + 0x20);
-                    message.fixedBuffer[5] = uint8_t(event->data.control.value) & 0x7F; // MSB value
-                    break;
-
-                case SND_SEQ_EVENT_NONREGPARAM:
-                    if (!IsChannelSelected(event->data.control.channel))
-                    {
-                        continue;
-                    }
-                    message.size = 12;
-                    message.data = message.fixedBuffer;
-                    message.fixedBuffer[0] = uint8_t(0xB0 | event->data.control.channel);    // Non-registered parameter
-                    message.fixedBuffer[1] = 0x63;                                           // MSB
-                    message.fixedBuffer[2] = uint8_t(event->data.control.param >> 7) & 0x7F; // MSB
-                    message.fixedBuffer[3] = uint8_t(0xB0 | event->data.control.channel);
-                    message.fixedBuffer[4] = 0x62;                                      // LSB
-                    message.fixedBuffer[5] = uint8_t(event->data.control.param) & 0x7F; // LSB
-                    message.fixedBuffer[6] = uint8_t(0xB0 | event->data.control.channel);
-                    message.fixedBuffer[7] = uint8_t(0x06);                                  // Non-registered parameter value MSB
-                    message.fixedBuffer[8] = uint8_t(event->data.control.value >> 7) & 0x7F; // MSB value
-                    message.fixedBuffer[9] = uint8_t(0xB0 | event->data.control.channel);
-                    message.fixedBuffer[10] = uint8_t(0x26);                             // Non-registered parameter value LSB
-                    message.fixedBuffer[11] = uint8_t(event->data.control.value) & 0x7F; // LSb
-                    break;
-                case SND_SEQ_EVENT_REGPARAM:
-                    if (!IsChannelSelected(event->data.control.channel))
-                    {
-                        continue;
-                    }
-                    message.size = 12;
-                    message.data = message.fixedBuffer;
-                    message.fixedBuffer[0] = uint8_t(0xB0 | event->data.control.channel);    // Registered parameter
-                    message.fixedBuffer[1] = uint8_t(0x65);                                  // MSB
-                    message.fixedBuffer[2] = uint8_t(event->data.control.param >> 7) & 0x7F; // MSB
-                    message.fixedBuffer[3] = uint8_t(0xB0 | event->data.control.channel);
-                    message.fixedBuffer[4] = uint8_t(0x64);                             // LSB
-                    message.fixedBuffer[5] = uint8_t(event->data.control.param) & 0x7F; // LSB
-                    message.fixedBuffer[6] = uint8_t(0xB0 | event->data.control.channel);
-                    message.fixedBuffer[7] = uint8_t(0x6);                                   // Registered parameter value MSB
-                    message.fixedBuffer[8] = uint8_t(event->data.control.value >> 7) & 0x7F; // MSB value
-                    message.fixedBuffer[9] = uint8_t(0xB0 | event->data.control.channel);
-                    message.fixedBuffer[10] = uint8_t(0x26);                             // Registered parameter value LSB
-                    message.fixedBuffer[11] = uint8_t(event->data.control.value) & 0x7F; // LSB value
-                    break;
-                case SND_SEQ_EVENT_SONGPOS:
-                    message.Set(
-                        0xF2,
-                        (uint8_t)((event->data.control.value >> 7) & 0x7F), // MSB
-                        (uint8_t)(event->data.control.value & 0x7F)         // LSB
-                    );
-                    break;
-                case SND_SEQ_EVENT_SONGSEL:
-                    message.Set(
-                        0xF3,
-                        (uint8_t)((event->data.control.value >> 7) & 0x7F), // MSB
-                        (uint8_t)(event->data.control.value & 0x7F)         // LSB
-                    );
-                    break;
-                case SND_SEQ_EVENT_QFRAME:
-                    message.Set(
-                        0xF1,
-                        (uint8_t)((event->data.control.value >> 7) & 0x7F), // MSB
-                        (uint8_t)(event->data.control.value & 0x7F)         // LSB
-                    );
-                    break;
-                case SND_SEQ_EVENT_START:
-                    message.Set(0xFA); // MIDI Real Time Start
-                    break;
-                case SND_SEQ_EVENT_CONTINUE:
-                    message.Set(0xFB); // MIDI Real Time Continue
-                    break;
-                case SND_SEQ_EVENT_STOP:
-                    message.Set(0xFC); // MIDI Real Time Stop
-                    break;
-                case SND_SEQ_EVENT_TICK:
-                    message.Set(0xF8); // MIDI Real Time Clock Tick
-                    break;
-                case SND_SEQ_EVENT_SENSING:
-                    message.Set(0xFE); // MIDI Real Time Active Sensing
-                    break;
-                case SND_SEQ_EVENT_RESET:
-                    message.Set(0xFF); // MIDI Real Time System Reset
-                    break;
-                case SND_SEQ_EVENT_SYSEX:
-                    // Handle SysEx messages
-                    if (event->data.ext.len > 0 && event->data.ext.len + 2 <= sizeof(message.fixedBuffer))
-                    {
-                        message.size = event->data.ext.len + 1; // +1 for SysEx
-                        message.data = message.fixedBuffer;
-                        message.fixedBuffer[0] = 0xF0; // Start of SysEx
-                        memcpy(message.fixedBuffer + 1, event->data.ext.ptr, event->data.ext.len);
-                        message.fixedBuffer[event->data.ext.len + 1] = 0xF7; // End of SysEx
-                    }
-                    else
-                    {
-                        message.size = event->data.ext.len;
-                        message.data = (uint8_t *)event->data.ext.ptr;
-                        if (message.data[0] != 0xF0)
-                        {
-                            throw std::logic_error("Invalid SysEx message: does not start with 0xF0");
-                        }
-                    }
-                    break;
-                case SND_SEQ_EVENT_SETPOS_TICK:
-                    message.size = 3 + sizeof(event->data.queue.param.value); // Tempo events are usually 3 bytes
-                    message.data = message.fixedBuffer;
-                    message.fixedBuffer[0] = 0xFF;                                    // Meta event type for tempo
-                    message.fixedBuffer[1] = (uint8_t)MetaEventType::SetPositionTick; // Meta event subtype for tempo
-                    message.fixedBuffer[2] = (uint8_t)(event->data.queue.queue);      // MSB
-                    memcpy(message.fixedBuffer + 3, &event->data.queue.param.value, sizeof(event->data.queue.param.value));
-                    break;
-                case SND_SEQ_EVENT_SETPOS_TIME:
-                    message.size = 3 + sizeof(event->data.queue.param.time); // Tempo events are usually 3 bytes
-                    message.data = message.fixedBuffer;
-                    message.fixedBuffer[0] = 0xFF;                                    // Meta event type for tempo
-                    message.fixedBuffer[1] = (uint8_t)MetaEventType::SetPositionTime; // Meta event subtype for tempo
-                    message.fixedBuffer[2] = (uint8_t)(event->data.queue.queue);
-                    memcpy(message.fixedBuffer + 3, &event->data.queue.param.time, sizeof(event->data.queue.param.time));
-                    break;
-                case SND_SEQ_EVENT_TEMPO:
-                    // Handle tempo events
-                    message.size = sizeof(event->data.queue.param.value) + 3; // Tempo events are usually 3 bytes
-                    if (message.size > sizeof(message.fixedBuffer))
-                    {
-                        throw std::logic_error("Tempo event size exceeds fixed buffer size");
-                    }
-                    message.data = message.fixedBuffer;
-                    message.fixedBuffer[0] = 0xFF;                          // Meta event type for tempo
-                    message.fixedBuffer[1] = (uint8_t)MetaEventType::Tempo; // Meta event subtype for tempo
-                    message.fixedBuffer[2] = (uint8_t)(event->data.queue.queue);
-                    memcpy(message.fixedBuffer + 3, &event->data.queue.param.value, sizeof(event->data.queue.param.value));
-                    break;
-
-                case SND_SEQ_EVENT_CLOCK:
-                    message.Set(0xF8); // MIDI Real Time Clock Tick
-                    break;
-#ifndef NDEBUG
-#define MSG_DEBUG_LOG(x)                            \
-    case x:                                         \
-        Lv2Log::debug("ALSA Sequencer Message " #x); \
-        break;
-#else
-#define MSG_DEBUG_LOG(x)
-#endif
-                    MSG_DEBUG_LOG(SND_SEQ_EVENT_CLIENT_START)
-                    MSG_DEBUG_LOG(SND_SEQ_EVENT_CLIENT_EXIT)
-                    MSG_DEBUG_LOG(SND_SEQ_EVENT_CLIENT_CHANGE)
-                    MSG_DEBUG_LOG(SND_SEQ_EVENT_PORT_START)
-                    MSG_DEBUG_LOG(SND_SEQ_EVENT_PORT_EXIT)
-                    MSG_DEBUG_LOG(SND_SEQ_EVENT_PORT_CHANGE)
-                    MSG_DEBUG_LOG(SND_SEQ_EVENT_PORT_SUBSCRIBED)
-                    MSG_DEBUG_LOG(SND_SEQ_EVENT_PORT_UNSUBSCRIBED)
-
-                case SND_SEQ_EVENT_KEYSIGN:
-                case SND_SEQ_EVENT_TIMESIGN:
-                    // and a PASSEL of others!
-                default:
-                    success = false;
-                    break;
-                }
+                int32_t channelSelection = midiChannel();
+                AlsaSequencerDecodeResult result = DecodeAlsaSequencerEvent(event, channelSelection, message);
                 snd_seq_free_event(event);
-            }
-            if (success)
-            {
-                return true;
+                switch (result)
+                {
+                case AlsaSequencerDecodeResult::Message:
+                    return true;
+                case AlsaSequencerDecodeResult::Malformed:
+                    malformedEvents.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                case AlsaSequencerDecodeResult::Skip:
+                default:
+                    continue;
+                }
             }
         }
     }

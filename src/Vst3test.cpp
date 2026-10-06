@@ -28,6 +28,8 @@
 #include <iostream>
 #include <cmath>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 using namespace pipedal;
 using namespace std;
@@ -127,22 +129,42 @@ void TestStateRoundTrip(const Vst3PluginInfo &info, Vst3Effect *plugin)
     // Compare input controls only. Output controls are meters that reflect the
     // live signal (mda SpecMeter is 35 of them), so they are not expected to
     // come back to a saved value.
-    size_t mismatches = 0, compared = 0;
-    for (size_t i = 0; i < controls.size(); ++i)
+    auto countMismatches = [&](bool report) -> size_t
     {
-        if (!controls[i].is_input())
-            continue;
-        ++compared;
-        float now = plugin->GetControlValue((int)i);
-        float tolerance = 1e-4f * (1.0f + std::fabs(before[i]));
-        if (std::fabs(now - before[i]) > tolerance)
+        size_t mismatches = 0;
+        for (size_t i = 0; i < controls.size(); ++i)
         {
-            ++mismatches;
-            cout << "            did not restore: [" << controls[i].symbol() << "] \""
-                 << controls[i].name() << "\" saved=" << before[i] << " now=" << now
-                 << (controls[i].is_bypass() ? " (bypass)" : "") << endl;
+            if (!controls[i].is_input())
+                continue;
+            float now = plugin->GetControlValue((int)i);
+            float tolerance = 1e-4f * (1.0f + std::fabs(before[i]));
+            if (std::fabs(now - before[i]) > tolerance)
+            {
+                ++mismatches;
+                if (report)
+                {
+                    cout << "            did not restore: [" << controls[i].symbol() << "] \""
+                         << controls[i].name() << "\" saved=" << before[i] << " now=" << now
+                         << (controls[i].is_bypass() ? " (bypass)" : "") << endl;
+                }
+            }
         }
+        return mismatches;
+    };
+    // JUCE plugins update their controller asynchronously after a state load
+    // and report it later with restartComponent(), which the control worker
+    // handles; give them a moment to settle.
+    for (int retry = 0; retry < 100 && countMismatches(false) != 0; ++retry)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    size_t compared = 0;
+    for (const auto &control : controls)
+    {
+        if (control.is_input())
+            ++compared;
+    }
+    size_t mismatches = countMismatches(true);
     if (mismatches == 0)
     {
         cout << "        state round-trip OK (" << perturbed << " perturbed, " << compared << " input controls restored)" << endl;

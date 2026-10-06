@@ -54,7 +54,9 @@ Worker::Worker(const std::shared_ptr<HostWorkerThread> &pHostWorker, LilvInstanc
       workerInterface(workerInterface_)
 {
 
-    responseBuffer.resize(16 * 1024);
+    // Any response that fits the response ring also fits here, so EmitResponses (audio
+    // thread) never has to grow this buffer.
+    responseBuffer.resize(RING_BUFFER_SIZE);
 }
 
 void Worker::Close()
@@ -86,7 +88,7 @@ LV2_Worker_Status Worker::WorkerRespond(uint32_t size, const void *data)
         ++outstandingResponses;
     }
     LV2_Worker_Status status;
-    if (responseRingBuffer.writeSpace() < sizeof(size) + size)
+    if (size > responseBuffer.size() || responseRingBuffer.writeSpace() < sizeof(size) + size)
     {
         {
             Lv2Log::warning(SS("LV2 Worker response too large: " << size << " bytes."));
@@ -98,13 +100,14 @@ LV2_Worker_Status Worker::WorkerRespond(uint32_t size, const void *data)
     }
     else
     {
-        if (!responseRingBuffer.write(sizeof(size), (uint8_t *)&size))
+        // One atomic message, so the realtime reader never sees a size without its body.
+        if (!responseRingBuffer.writeSegments({{sizeof(size), &size}, {size, data}}))
         {
-            throw std::logic_error("Response queue sync lost.");
-        }
-        if (!responseRingBuffer.write(size, (uint8_t *)data))
-        {
-            throw std::logic_error("Response queue sync lost.");
+            {
+                std::lock_guard lock(outstandingRequestMutex);
+                --outstandingResponses;
+            }
+            return LV2_WORKER_ERR_NO_SPACE;
         }
         return LV2_WORKER_SUCCESS;
     }
@@ -123,15 +126,25 @@ bool Worker::EmitResponses()
         emitted = true;
         uint32_t size;
         responseRingBuffer.read(sizeof(size), (uint8_t *)&size);
+        uint8_t *pResponse = &(responseBuffer[0]);
         if (size > responseBuffer.size())
         {
-            responseBuffer.resize(size); // allocation on the RT thread! But it's rare, and we have no choice.
+            // Unreachable: WorkerRespond rejects anything larger than responseBuffer. Never
+            // grow the buffer here (audio thread); discard the body to keep the ring in sync.
+            size_t remaining = size;
+            while (remaining != 0)
+            {
+                size_t chunk = std::min(remaining, responseBuffer.size());
+                responseRingBuffer.read(chunk, pResponse);
+                remaining -= chunk;
+            }
         }
-        uint8_t *pResponse = &(responseBuffer[0]);
+        else
+        {
+            responseRingBuffer.read(size, pResponse);
 
-        responseRingBuffer.read(size, pResponse);
-
-        workerInterface->work_response(lilvInstance->lv2_handle, size, pResponse);
+            workerInterface->work_response(lilvInstance->lv2_handle, size, pResponse);
+        }
         {
             std::lock_guard lock(outstandingRequestMutex);
             --outstandingResponses;
@@ -319,10 +332,13 @@ LV2_Worker_Status HostWorkerThread::ScheduleWorkNoLock(Worker *worker, size_t si
         return LV2_Worker_Status::LV2_WORKER_ERR_NO_SPACE;
     }
 
-    requestRingBuffer.write(sizeof(packetSize), (uint8_t *)&packetSize);
-    requestRingBuffer.write(sizeof(worker), (uint8_t *)&worker);
-    requestRingBuffer.write(size, (uint8_t *)data);
-    
+    // A single write publishes the whole packet and wakes the worker thread at most once.
+    if (!requestRingBuffer.writeSegments({{sizeof(packetSize), &packetSize},
+                                          {sizeof(worker), &worker},
+                                          {size, data}}))
+    {
+        return LV2_Worker_Status::LV2_WORKER_ERR_NO_SPACE;
+    }
     return LV2_Worker_Status::LV2_WORKER_SUCCESS;
 }
 

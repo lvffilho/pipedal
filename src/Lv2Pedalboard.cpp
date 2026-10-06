@@ -20,8 +20,11 @@
 #include "pch.h"
 #include "Lv2Pedalboard.hpp"
 #include "Lv2Effect.hpp"
+#include "PresetInstanceReuse.hpp"
 
 #include "SplitEffect.hpp"
+#include "BypassSuspend.hpp"
+#include <algorithm>
 #include "RingBufferReader.hpp"
 #include "VuUpdate.hpp"
 #include "AudioHost.hpp"
@@ -53,7 +56,7 @@ int Lv2Pedalboard::GetControlIndex(uint64_t instanceId, const std::string &symbo
     for (int i = 0; i < realtimeEffects.size(); ++i)
     {
         auto item = realtimeEffects[i];
-        if (item->GetInstanceId() == instanceId)
+        if (realtimeEffectInstanceIds[i] == instanceId)
         {
             return item->GetControlIndex(symbol);
         }
@@ -61,11 +64,35 @@ int Lv2Pedalboard::GetControlIndex(uint64_t instanceId, const std::string &symbo
     return -1;
 }
 
+Lv2Pedalboard::BorrowedEffect *Lv2Pedalboard::FindBorrowedEffect(const IEffect *effect)
+{
+    for (auto &borrowedEffect : borrowedEffects)
+    {
+        if ((const IEffect *)borrowedEffect.effect == effect)
+        {
+            return &borrowedEffect;
+        }
+    }
+    return nullptr;
+}
+
+float *Lv2Pedalboard::GetPreparedOutputBuffer(IEffect *effect, int index)
+{
+    // the output buffer the effect will have in this pedalboard (borrowed effects: staged until the swap).
+    BorrowedEffect *borrowedEffect = FindBorrowedEffect(effect);
+    if (borrowedEffect)
+    {
+        return borrowedEffect->outputBuffers.at(index);
+    }
+    return effect->GetAudioOutputBuffer(index);
+}
+
 std::vector<float *> Lv2Pedalboard::PrepareItems(
     std::vector<PedalboardItem> &items,
     std::vector<float *> inputBuffers,
     Lv2PedalboardErrorList &errorList,
-    ExistingEffectMap *existingEffects)
+    ExistingEffectMap *existingEffects,
+    BorrowMode borrowMode)
 {
     for (int i = 0; i < items.size(); ++i)
     {
@@ -90,8 +117,27 @@ std::vector<float *> Lv2Pedalboard::PrepareItems(
 
                 this->processActions.push_back(preMixAction);
 
-                std::vector<float *> topResult = PrepareItems(item.topChain(), topInputs, errorList, existingEffects);
-                std::vector<float *> bottomResult = PrepareItems(item.bottomChain(), bottomInputs, errorList, existingEffects);
+                size_t topBegin = this->processActions.size();
+                size_t topEffectBegin = this->realtimeEffects.size();
+                std::vector<float *> topResult = PrepareItems(item.topChain(), topInputs, errorList, existingEffects, borrowMode);
+                size_t bottomBegin = this->processActions.size();
+                size_t bottomEffectBegin = this->realtimeEffects.size();
+                std::vector<float *> bottomResult = PrepareItems(item.bottomChain(), bottomInputs, errorList, existingEffects, borrowMode);
+                size_t bottomEnd = this->processActions.size();
+                size_t bottomEffectEnd = this->realtimeEffects.size();
+
+                // record the branch ranges so that a silent branch can be skipped (suspendBypassedPlugins).
+                SplitBranchGate topGate{topBegin, bottomBegin, topEffectBegin, bottomEffectBegin, pSplit, true};
+                SplitBranchGate bottomGate{bottomBegin, bottomEnd, bottomEffectBegin, bottomEffectEnd, pSplit, false};
+                // a branch containing an already-connected sidechain source is never skipped.
+                PinGateIfContainsAny(topGate, this->sidechainSourceEffectIndices);
+                PinGateIfContainsAny(bottomGate, this->sidechainSourceEffectIndices);
+                this->splitBranchGates.push_back(topGate);
+                this->splitBranchGates.push_back(bottomGate);
+                std::stable_sort(
+                    this->splitBranchGates.begin(), this->splitBranchGates.end(),
+                    [](const SplitBranchGate &left, const SplitBranchGate &right)
+                    { return left.begin < right.begin; });
 
                 this->processActions.push_back(
                     [pSplit](uint32_t frames)
@@ -115,13 +161,65 @@ std::vector<float *> Lv2Pedalboard::PrepareItems(
             else
             {
                 std::shared_ptr<IEffect> pLv2Effect;
+                // borrowed effects are left untouched (they are still running in the current pedalboard): their
+                // wiring is staged in borrowedEffects[borrowedIndex] and applied when this pedalboard is swapped in.
+                int borrowedIndex = -1;
 
-                if (existingEffects && existingEffects->contains(item.instanceId()))
+                if (existingEffects && existingEffects->contains(item.instanceId()) &&
+                    existingEffects->at(item.instanceId())->IsLv2Effect())
                 {
-                    pLv2Effect = existingEffects->at(item.instanceId());
-                    ((Lv2Effect *)pLv2Effect.get())->SetBorrowedEffect(true);
+                    // Instance ids are only unique within a pedalboard lineage. Only borrow an instance of the
+                    // same plugin, instantiated for the current sample rate and buffer size, whose buffer layout
+                    // doesn't change at this position (it keeps running on the audio thread until this
+                    // pedalboard is swapped in); otherwise create a new one.
+                    Lv2Effect *existing = (Lv2Effect *)existingEffects->at(item.instanceId()).get();
+                    if (existing->PluginUri() == item.uri() &&
+                        existing->InstantiatedSampleRate() == pHost->GetSampleRate() &&
+                        existing->InstantiatedMaxBufferSize() == pHost->GetMaxAudioBufferSize() &&
+                        existing->BorrowKeepsBufferLayout(inputBuffers.size(), pHost->GetMaxAudioBufferSize()))
+                    {
+                        pLv2Effect = existingEffects->at(item.instanceId());
+                        // each effect can be borrowed only once.
+                        existingEffects->erase(item.instanceId());
+
+                        BorrowedEffect settings;
+                        settings.effect = existing;
+                        // Sized like the effect's vectors, null-filled: the wiring below sets every entry this
+                        // position uses, as for a new instance. (Not a copy of the live vectors: their pointers
+                        // belong to the running pedalboard, whose buffers are freed after the swap.)
+                        settings.inputBuffers.assign((size_t)existing->GetNumberOfInputAudioBuffers(), nullptr);
+                        settings.sidechainBuffers.assign((size_t)existing->GetNumberOfSidechainAudioBuffers(), nullptr);
+                        settings.outputBuffers.assign((size_t)existing->GetNumberOfOutputAudioBuffers(), nullptr);
+                        settings.instanceId = item.instanceId();
+
+                        if (borrowMode == BorrowMode::ReusedForNewItem)
+                        {
+                            // Reused for an item of another pedalboard (preset switch). Note that the instance keeps
+                            // its runtime DSP state (e.g. delay or reverb tails); only persisted state is matched.
+                            settings.reusedForNewItem = true;
+                            settings.enabled = item.isEnabled();
+                            settings.controlValues = ResolveItemControlValues(
+                                item,
+                                existing->GetMaxInputControl(),
+                                [existing](uint64_t index)
+                                { return existing->IsInputControl(index); },
+                                [existing](uint64_t index)
+                                { return existing->GetDefaultInputControlValue(index); },
+                                [existing](const std::string &symbol)
+                                { return existing->GetControlIndex(symbol); });
+                            // the plugin's enable port follows the item's enabled state (SetBypass), as it
+                            // does for a new instance (Lv2Effect::Activate).
+                            int bypassControlIndex = existing->BypassControlIndex();
+                            std::erase_if(
+                                settings.controlValues,
+                                [bypassControlIndex](const std::pair<int, float> &value)
+                                { return value.first == bypassControlIndex; });
+                        }
+                        borrowedIndex = (int)this->borrowedEffects.size();
+                        this->borrowedEffects.push_back(std::move(settings));
+                    }
                 }
-                else
+                if (!pLv2Effect)
                 {
                     try
                     {
@@ -145,33 +243,59 @@ std::vector<float *> Lv2Pedalboard::PrepareItems(
 
                     pEffect = pLv2Effect;
 
-                    uint64_t instanceId = pEffect->GetInstanceId();
-                    pLv2Effect->PrepareNoInputEffect(inputBuffers.size(), pHost->GetMaxAudioBufferSize());
+                    if (borrowedIndex == -1)
+                    {
+                        // (a borrowed effect's layout is already right: see BorrowKeepsBufferLayout.)
+                        pLv2Effect->PrepareNoInputEffect(inputBuffers.size(), pHost->GetMaxAudioBufferSize());
+                    }
+                    IEffect *pTarget = pLv2Effect.get();
+                    auto setInputBuffer = [this, borrowedIndex, pTarget](int index, float *buffer)
+                    {
+                        if (borrowedIndex != -1)
+                        {
+                            this->borrowedEffects[borrowedIndex].inputBuffers.at(index) = buffer;
+                        }
+                        else
+                        {
+                            pTarget->SetAudioInputBuffer(index, buffer);
+                        }
+                    };
+                    auto setSidechainBuffer = [this, borrowedIndex, pTarget](int index, float *buffer)
+                    {
+                        if (borrowedIndex != -1)
+                        {
+                            this->borrowedEffects[borrowedIndex].sidechainBuffers.at(index) = buffer;
+                        }
+                        else
+                        {
+                            pTarget->SetAudioSidechainBuffer(index, buffer);
+                        }
+                    };
 
                     if (inputBuffers.size() == 1)
                     {
                         if (pLv2Effect->GetNumberOfInputAudioBuffers() == 1)
                         {
-                            pLv2Effect->SetAudioInputBuffer(0, inputBuffers[0]);
+                            setInputBuffer(0, inputBuffers[0]);
                         }
                         else if (pLv2Effect->GetNumberOfInputAudioBuffers() >= 2)
                         {
-                            pLv2Effect->SetAudioInputBuffer(0, inputBuffers[0]);
-                            pLv2Effect->SetAudioInputBuffer(1, inputBuffers[0]);
+                            setInputBuffer(0, inputBuffers[0]);
+                            setInputBuffer(1, inputBuffers[0]);
                         }
                     }
                     else
                     {
                         if (pLv2Effect->GetNumberOfInputAudioBuffers() == 1)
                         {
-                            pLv2Effect->SetAudioInputBuffer(0, inputBuffers[0]);
+                            setInputBuffer(0, inputBuffers[0]);
 
                             auto inputBuffer = inputBuffers[0];
                         }
                         else if (pLv2Effect->GetNumberOfInputAudioBuffers() >= 2)
                         {
-                            pLv2Effect->SetAudioInputBuffer(0, inputBuffers[0]);
-                            pLv2Effect->SetAudioInputBuffer(1, inputBuffers[1]);
+                            setInputBuffer(0, inputBuffers[0]);
+                            setInputBuffer(1, inputBuffers[1]);
 
                             auto bufferL = inputBuffers[0];
                             auto bufferR = inputBuffers[1];
@@ -187,12 +311,12 @@ std::vector<float *> Lv2Pedalboard::PrepareItems(
                             {
                                 if (i < this->pedalboardInputBuffers.size())
                                 {
-                                    pLv2Effect->SetAudioSidechainBuffer(i, this->pedalboardInputBuffers[i]);
+                                    setSidechainBuffer(i, this->pedalboardInputBuffers[i]);
                                 }
                                 else
                                 {
                                     // just use the first output buffer for all sidechain inputs.
-                                    pLv2Effect->SetAudioSidechainBuffer(i, this->pedalboardInputBuffers[0]);
+                                    setSidechainBuffer(i, this->pedalboardInputBuffers[0]);
                                 }
                             }
                         }
@@ -202,16 +326,28 @@ std::vector<float *> Lv2Pedalboard::PrepareItems(
 
                             if (pSideChainInput)
                             {
+                                // never skip a split branch that contains the sidechain source (suspendBypassedPlugins).
+                                int sourceIndex = GetIndexOfInstanceId(item.sideChainInputId());
+                                if (sourceIndex >= 0)
+                                {
+                                    // several effects may share a sidechain source: record it once.
+                                    if (std::find(this->sidechainSourceEffectIndices.begin(), this->sidechainSourceEffectIndices.end(), (size_t)sourceIndex) ==
+                                        this->sidechainSourceEffectIndices.end())
+                                    {
+                                        this->sidechainSourceEffectIndices.push_back((size_t)sourceIndex);
+                                    }
+                                    PinGatesContainingEffect(this->splitBranchGates, (size_t)sourceIndex);
+                                }
                                 for (size_t i = 0; i < pLv2Effect->GetNumberOfSidechainAudioBuffers(); ++i)
                                 {
                                     if (i < pSideChainInput->GetNumberOfOutputAudioBuffers())
                                     {
-                                        pLv2Effect->SetAudioSidechainBuffer(i, pSideChainInput->GetAudioOutputBuffer(i));
+                                        setSidechainBuffer(i, GetPreparedOutputBuffer(pSideChainInput, (int)i));
                                     }
                                     else
                                     {
                                         // just use the first output buffer for all sidechain inputs.
-                                        pLv2Effect->SetAudioSidechainBuffer(i, pSideChainInput->GetAudioOutputBuffer(0));
+                                        setSidechainBuffer(i, GetPreparedOutputBuffer(pSideChainInput, 0));
                                     }
                                 }
                             }
@@ -231,7 +367,7 @@ std::vector<float *> Lv2Pedalboard::PrepareItems(
                                 {
                                     this->pedalboardSidechainBuffer = CreateNewAudioBuffer();
                                 }
-                                pLv2Effect->SetAudioSidechainBuffer(i, this->pedalboardSidechainBuffer);
+                                setSidechainBuffer(i, this->pedalboardSidechainBuffer);
                             }
                         }
                     }
@@ -255,11 +391,24 @@ std::vector<float *> Lv2Pedalboard::PrepareItems(
 
                     if (!requiresBufferStaging)
                     {
-                        this->processActions.push_back(
-                            [pLv2Effect, this](uint32_t frames)
-                            {
-                                pLv2Effect->Run(frames, this->ringBufferWriter);
-                            });
+                        if (pLv2Effect->IsLv2Effect())
+                        {
+                            // may skip lilv_instance_run() once fully bypassed (suspendBypassedPlugins).
+                            Lv2Effect *lv2Effect = (Lv2Effect *)pLv2Effect.get();
+                            this->processActions.push_back(
+                                [lv2Effect, this](uint32_t frames)
+                                {
+                                    lv2Effect->Run(frames, this->ringBufferWriter, this->suspendBypassedPlugins);
+                                });
+                        }
+                        else
+                        {
+                            this->processActions.push_back(
+                                [pLv2Effect, this](uint32_t frames)
+                                {
+                                    pLv2Effect->Run(frames, this->ringBufferWriter);
+                                });
+                        }
                     }
 
                     // reset any trigger controls to default state after processing
@@ -295,6 +444,7 @@ std::vector<float *> Lv2Pedalboard::PrepareItems(
                 this->effects.push_back(pEffect); // for ownership.
 
                 this->realtimeEffects.push_back(pEffect.get()); // because std::shared_ptr is not threadsafe.
+                this->realtimeEffectInstanceIds.push_back(item.instanceId());
 
                 std::vector<float *> effectOutput;
 
@@ -307,9 +457,17 @@ std::vector<float *> Lv2Pedalboard::PrepareItems(
                     effectOutput.push_back(CreateNewAudioBuffer());
                     effectOutput.push_back(CreateNewAudioBuffer());
                 }
+                BorrowedEffect *borrowedEffect = FindBorrowedEffect(pEffect.get());
                 for (size_t i = 0; i < effectOutput.size(); ++i)
                 {
-                    pEffect->SetAudioOutputBuffer(i, effectOutput[i]);
+                    if (borrowedEffect)
+                    {
+                        borrowedEffect->outputBuffers.at(i) = effectOutput[i];
+                    }
+                    else
+                    {
+                        pEffect->SetAudioOutputBuffer(i, effectOutput[i]);
+                    }
                 }
                 inputBuffers = effectOutput;
             }
@@ -318,7 +476,12 @@ std::vector<float *> Lv2Pedalboard::PrepareItems(
     return inputBuffers;
 }
 
-void Lv2Pedalboard::Prepare(IHost *pHost, Pedalboard &pedalboard, Lv2PedalboardErrorList &errorList, ExistingEffectMap *existingEffects)
+void Lv2Pedalboard::Prepare(
+    IHost *pHost,
+    Pedalboard &pedalboard,
+    Lv2PedalboardErrorList &errorList,
+    ExistingEffectMap *existingEffects,
+    BorrowMode borrowMode)
 {
     this->pHost = pHost;
 
@@ -337,7 +500,7 @@ void Lv2Pedalboard::Prepare(IHost *pHost, Pedalboard &pedalboard, Lv2PedalboardE
         this->pedalboardInputBuffers.push_back(bufferPool.AllocateBuffer<float>(pHost->GetMaxAudioBufferSize()));
     }
 
-    auto outputs = PrepareItems(pedalboard.items(), this->pedalboardInputBuffers, errorList, existingEffects);
+    auto outputs = PrepareItems(pedalboard.items(), this->pedalboardInputBuffers, errorList, existingEffects, borrowMode);
     size_t nOutputs = GetNumberOfAudioOutputChannels();
     if (nOutputs == 1)
     {
@@ -475,6 +638,28 @@ void Lv2Pedalboard::PrepareMidiMap(const Pedalboard &pedalboard)
 
 void Lv2Pedalboard::UpdateAudioPorts()
 {
+    // Called on the audio thread when this pedalboard is swapped in: the outgoing pedalboard no longer runs.
+    // Hand the borrowed effects over to this pedalboard (no allocation).
+    bool applyingBorrowedEffects = !borrowedEffectsApplied;
+    if (applyingBorrowedEffects)
+    {
+        borrowedEffectsApplied = true;
+        for (auto &borrowed : borrowedEffects)
+        {
+            Lv2Effect *effect = borrowed.effect;
+            effect->SetBorrowedEffect(true); // connect its ports below (Lv2Effect::UpdateAudioPorts).
+            effect->SetBorrowedAudioBuffers(borrowed.inputBuffers, borrowed.sidechainBuffers, borrowed.outputBuffers);
+            if (borrowed.reusedForNewItem)
+            {
+                effect->SetInstanceId(borrowed.instanceId);
+                for (const auto &controlValue : borrowed.controlValues)
+                {
+                    effect->SetControl(controlValue.first, controlValue.second);
+                }
+                effect->SetBypass(borrowed.enabled);
+            }
+        }
+    }
     for (int i = 0; i < this->effects.size(); ++i)
     {
         IEffect *effect = this->realtimeEffects[i];
@@ -482,6 +667,15 @@ void Lv2Pedalboard::UpdateAudioPorts()
         {
             Lv2Effect *lv2Effect = (Lv2Effect *)effect;
             lv2Effect->UpdateAudioPorts();
+        }
+    }
+    if (applyingBorrowedEffects)
+    {
+        // Their ports are now connected to this pedalboard's buffers: from here on they are ordinary
+        // effects of this pedalboard (a later borrow stages its wiring again).
+        for (auto &borrowed : borrowedEffects)
+        {
+            borrowed.effect->SetBorrowedEffect(false);
         }
     }
 }
@@ -521,21 +715,56 @@ bool Lv2Pedalboard::Run(float **inputBuffers, float **outputBuffers, uint32_t sa
         }
     }
 
-    for (size_t i = 0; i < samples; ++i)
+    const size_t nInputs = this->pedalboardInputBuffers.size();
+    if (this->inputVolume.IsIdle())
     {
-        float volume = this->inputVolume.Tick();
-        for (int c = 0; c < this->pedalboardInputBuffers.size(); ++c)
+        // Steady state: one gain for the whole block, so walk each channel
+        // contiguously (channel loop outside, sample loop inside).
+        const float volume = this->inputVolume.Tick(); // idle: returns the current gain, no state change.
+        for (size_t c = 0; c < nInputs; ++c)
         {
-            this->pedalboardInputBuffers[c][i] = inputBuffers[c][i] * volume;
+            const float *restrict input = inputBuffers[c];
+            float *restrict output = this->pedalboardInputBuffers[c];
+            for (size_t i = 0; i < samples; ++i)
+            {
+                output[i] = input[i] * volume;
+            }
         }
     }
-    for (int i = 0; i < this->processActions.size(); ++i)
+    else
     {
-        processActions[i](samples);
+        // Ramping: the dezipper must tick exactly once per sample, shared by all channels.
+        for (size_t i = 0; i < samples; ++i)
+        {
+            float volume = this->inputVolume.Tick();
+            for (size_t c = 0; c < nInputs; ++c)
+            {
+                this->pedalboardInputBuffers[c][i] = inputBuffers[c][i] * volume;
+            }
+        }
     }
-    for (size_t i = 0; i < this->effects.size(); ++i)
+    if (!this->suspendBypassedPlugins || this->splitBranchGates.empty())
     {
-        IEffect *effect = effects[i].get();
+        for (int i = 0; i < this->processActions.size(); ++i)
+        {
+            processActions[i](samples);
+        }
+    }
+    else
+    {
+        // skip split branches that are silent (blend exactly 0, transition complete).
+        RunGatedActions(
+            this->processActions.size(),
+            this->splitBranchGates.data(),
+            this->splitBranchGates.size(),
+            [this, samples](size_t i)
+            { this->processActions[i](samples); },
+            [this](const SplitBranchGate &gate)
+            { return this->TrySkipBranch(gate); });
+    }
+    for (size_t i = 0; i < this->realtimeEffects.size(); ++i)
+    {
+        IEffect *effect = realtimeEffects[i];
         if (effect->HasErrorMessage())
         {
             ringBufferWriter->WriteLv2ErrorMessage(effect->GetInstanceId(), effect->TakeErrorMessage());
@@ -555,6 +784,46 @@ bool Lv2Pedalboard::Run(float **inputBuffers, float **outputBuffers, uint32_t sa
     this->currentFrameOffset += samples;
 
     return true;
+}
+
+bool Lv2Pedalboard::TrySkipBranch(const SplitBranchGate &gate)
+{
+    // RT thread.
+    if (gate.containsSidechainSource)
+    {
+        return false;
+    }
+    bool hasPendingAtomInput = false;
+    for (size_t i = gate.effectBegin; i < gate.effectEnd; ++i)
+    {
+        IEffect *effect = this->realtimeEffects[i];
+        if (effect->IsLv2Effect() && ((Lv2Effect *)effect)->HasPendingAtomInput())
+        {
+            // run the branch this cycle so that patch/MIDI messages aren't lost.
+            hasPendingAtomInput = true;
+            break;
+        }
+    }
+    bool skip = BypassSuspendPolicy::ShouldSuspendBranch(
+        this->suspendBypassedPlugins,
+        gate.split->IsBranchSilent(gate.topBranch),
+        hasPendingAtomInput,
+        gate.containsSidechainSource);
+    if (skip)
+    {
+        // The skipped plugins won't write their atom outputs, which ResetAtomBuffers() left as
+        // full-capacity Chunks; make them empty sequences so nothing walks stale bytes.
+        // (The range includes the effects of any nested splits.)
+        for (size_t i = gate.effectBegin; i < gate.effectEnd; ++i)
+        {
+            IEffect *effect = this->realtimeEffects[i];
+            if (effect->IsLv2Effect())
+            {
+                ((Lv2Effect *)effect)->WriteEmptyOutputAtomBuffers();
+            }
+        }
+    }
+    return skip;
 }
 
 float Lv2Pedalboard::GetControlOutputValue(int effectIndex, int portIndex)
@@ -647,20 +916,22 @@ void Lv2Pedalboard::ComputeVus(RealtimeVuBuffers *realtimeVuBuffers, uint32_t sa
 
 void Lv2Pedalboard::ResetAtomBuffers()
 {
-    for (size_t i = 0; i < this->effects.size(); ++i)
+    // Audio thread: use the raw pointer list. Copying the shared_ptr here cost an
+    // atomic refcount increment/decrement per effect per cycle.
+    for (size_t i = 0; i < this->realtimeEffects.size(); ++i)
     {
-        auto effect = this->effects[i];
+        IEffect *effect = this->realtimeEffects[i];
         effect->ResetAtomBuffers();
     }
 }
 
 void Lv2Pedalboard::GatherPathPatchProperties(IPatchWriterCallback *cbPatchWriter)
 {
-    for (auto &pEffect : this->effects)
+    for (IEffect *pEffect : this->realtimeEffects)
     {
         if (pEffect->IsLv2Effect())
         {
-            Lv2Effect *pLv2Effect = (Lv2Effect *)pEffect.get();
+            Lv2Effect *pLv2Effect = (Lv2Effect *)pEffect;
             pLv2Effect->GatherPathPatchProperties(cbPatchWriter);
         }
     }
@@ -673,7 +944,13 @@ void Lv2Pedalboard::ProcessParameterRequests(RealtimePatchPropertyRequest *pPara
         pParameterRequests->sampleTimeout -= samplesThisTime;
         IEffect *pEffect = this->GetEffect(pParameterRequests->instanceId);
 
-        if (pEffect == nullptr)
+        if (pParameterRequests->instanceIdLineage != this->instanceIdLineage)
+        {
+            // addressed to the instance ids of a pedalboard that was replaced by an unrelated one (e.g. a preset
+            // switch) before the audio thread received the request: the id may name a different plugin here.
+            pParameterRequests->errorMessage = "The pedalboard has changed.";
+        }
+        else if (pEffect == nullptr)
         {
             pParameterRequests->errorMessage = "No such effect.";
         }
@@ -714,7 +991,8 @@ void Lv2Pedalboard::GatherPatchProperties(RealtimePatchPropertyRequest *pParamet
 {
     while (pParameterRequests != nullptr)
     {
-        if (pParameterRequests->requestType == RealtimePatchPropertyRequest::RequestType::PatchGet)
+        if (pParameterRequests->requestType == RealtimePatchPropertyRequest::RequestType::PatchGet &&
+            pParameterRequests->instanceIdLineage == this->instanceIdLineage) // (else rejected by ProcessParameterRequests)
         {
             IEffect *effect = this->GetEffect(pParameterRequests->instanceId);
             if (effect == nullptr)

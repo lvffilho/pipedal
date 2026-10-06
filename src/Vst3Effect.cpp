@@ -53,10 +53,16 @@
 #include "public.sdk/samples/vst-hosting/audiohost/source/media/iparameterclient.h"
 #include "public.sdk/samples/vst-hosting/audiohost/source/media/imediaserver.h"
 
+#include <algorithm>
 #include <array>
 
 #include <sstream>
 #include "LiteralVersion.hpp"
+#include <cerrno>
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "Vst3MidiToEvent.hpp"
 
@@ -185,6 +191,7 @@ Vst3EffectImpl::Vst3EffectImpl()
 //------------------------------------------------------------------------
 Vst3EffectImpl::~Vst3EffectImpl()
 {
+	StopControlWorker(); // before the controller goes away.
 	delete[] buffers.inputs;
 	delete[] buffers.outputs;
 	terminate();
@@ -192,23 +199,166 @@ Vst3EffectImpl::~Vst3EffectImpl()
 
 //------------------------------------------------------------------------
 
+// True while this thread is inside IAudioProcessor::process(), i.e. on the
+// audio thread. Lets host callbacks that a non-conforming plugin makes from
+// process() (restartComponent()) avoid controller work there.
+static thread_local bool tlsInVst3Process = false;
+
+namespace
+{
+	// Scoped tlsInVst3Process, so that a process() that throws cannot leave
+	// the flag set on this thread. Restores the previous value (nesting).
+	class InVst3ProcessScope
+	{
+	public:
+		InVst3ProcessScope() : previous(tlsInVst3Process) { tlsInVst3Process = true; }
+		~InVst3ProcessScope() { tlsInVst3Process = previous; }
+		InVst3ProcessScope(const InVst3ProcessScope &) = delete;
+		InVst3ProcessScope &operator=(const InVst3ProcessScope &) = delete;
+
+	private:
+		bool previous;
+	};
+}
+
 void Vst3EffectImpl::SetControl(int index, float value)
 {
-	this->parameterValues[index] = value;
-	ParamID paramId = lv2ToVstParam[index];
-
-	double normalizedValue = controller->plainParamToNormalized(paramId, value);
-	this->controller->setParamNormalized(paramId, normalizedValue);
-
+	// Called on the audio thread (ring buffer SetValue, MIDI bindings), so no
+	// IEditController calls and no locks here: IEditController is not
+	// realtime-safe per the VST3 spec (plainParamToNormalized is plugin code
+	// that may allocate or lock). Record the plain value and let the control
+	// worker normalize it; the normalized value comes back to the audio thread
+	// through pendingNormalizedValues, picked up in preprocess().
+	if (index < 0 || (size_t)index >= parameterValues.size())
 	{
-		// RtInversionGuard (priority boost) was retired in RtInversionGuard.hpp.
-		std::lock_guard guard{parameterMutex};
-
-		paramTransferrer.addChange(paramId, normalizedValue, 0);
+		return;
 	}
-	if (!isProcessing)
+	this->parameterValues[index] = value;
+	pendingPlainValues.Set((size_t)index, value);
+	controlWorkerWake.Post();
+}
+
+void Vst3EffectImpl::FlushControlChanges()
+{
+	std::lock_guard lock{controllerMutex};
+	auto deliver = [this](size_t index, float plainValue)
 	{
-		Run(0, nullptr); // pump parameter changes on UI thread.
+		ParamID paramId = lv2ToVstParam[index];
+		// The plugin may call restartComponent() from inside either call
+		// (re-entering on this thread). Mark the slot so that the nested
+		// refresh doesn't overwrite parameterValues[index] -- the value we are
+		// delivering -- with the controller's not-yet-updated value. A count,
+		// not a flag: a nested pass may deliver a newer value for the same
+		// index, and must not clear the outer pass's mark when it finishes.
+		++controlFlushInFlight[index];
+		ParamValue normalizedValue = controller->plainParamToNormalized(paramId, plainValue);
+		controller->setParamNormalized(paramId, normalizedValue);
+		--controlFlushInFlight[index];
+		pendingNormalizedValues.Set(index, normalizedValue);
+	};
+	++controlFlushDepth;
+	try
+	{
+		if (controlFlushDepth == 1)
+		{
+			pendingPlainValues.ForEachPending(deliver);
+		}
+		else
+		{
+			// Nested inside an outer pass, which has already claimed the
+			// summary flag: scan every slot so that the values it hasn't
+			// reached yet are delivered now (the outer pass then skips them).
+			pendingPlainValues.ForEachPendingScanAll(deliver);
+		}
+	}
+	catch (...)
+	{
+		if (--controlFlushDepth == 0)
+		{
+			std::fill(controlFlushInFlight.begin(), controlFlushInFlight.end(), 0);
+		}
+		throw;
+	}
+	--controlFlushDepth;
+}
+
+// The control worker is non-realtime, but parameter changes sit in
+// pendingPlainValues until it runs, so its wake-up latency is the latency of
+// every VST3 control change. Run it SCHED_OTHER (it must not inherit a
+// realtime policy from whichever thread loaded the plugin), nudged to nice -5
+// when permitted so that ordinary load does not starve it. EPERM/EACCES (no
+// CAP_SYS_NICE, RLIMIT_NICE too low) just leaves it where it is. An inherited
+// nice value that is already higher priority is kept.
+static constexpr int VST3_CONTROL_WORKER_NICE = -5;
+
+static void SetControlWorkerScheduling()
+{
+#ifdef __linux__
+	sched_param param{};
+	param.sched_priority = 0;
+	if (sched_setscheduler(0, SCHED_OTHER, &param) != 0)
+	{
+		Lv2Log::debug(SS("VST3 control worker: failed to set SCHED_OTHER. (" << strerror(errno) << ")"));
+	}
+
+	pid_t tid = (pid_t)syscall(SYS_gettid);
+	errno = 0;
+	int currentNice = getpriority(PRIO_PROCESS, (id_t)tid);
+	if (errno == 0 && currentNice > VST3_CONTROL_WORKER_NICE)
+	{
+		if (setpriority(PRIO_PROCESS, (id_t)tid, VST3_CONTROL_WORKER_NICE) != 0)
+		{
+			Lv2Log::debug(SS("VST3 control worker left at nice " << currentNice << ". (" << strerror(errno) << ")"));
+		}
+	}
+#endif
+}
+
+void Vst3EffectImpl::ControlWorkerProc()
+{
+	SetControlWorkerScheduling();
+	while (true)
+	{
+		controlWorkerWake.Wait();
+		if (controlWorkerStopping.load())
+		{
+			break;
+		}
+		try
+		{
+			FlushControlChanges();
+			// At most one restart per wake-up: requests that land while it
+			// runs coalesce into the one flag (and one outstanding Post()),
+			// so they cost exactly one more pass. A plugin that re-requests a
+			// restart from every process() call therefore keeps the worker
+			// doing one restart per wake-up, but no faster than the requests
+			// arrive and without unbounded queueing; there is no correct
+			// point at which to stop honouring the plugin's requests.
+			if (deferredParamValuesRestart.exchange(false))
+			{
+				RestartParamValues();
+			}
+		}
+		catch (const std::exception &e)
+		{
+			Lv2Log::error(SS(info.pluginInfo_.name() << ": " << e.what()));
+		}
+	}
+}
+
+void Vst3EffectImpl::StartControlWorker()
+{
+	controlWorkerStopping = false;
+	controlWorkerThread = std::thread([this]() { ControlWorkerProc(); });
+}
+
+void Vst3EffectImpl::StopControlWorker()
+{
+	if (controlWorkerThread.joinable())
+	{
+		controlWorkerStopping = true;
+		controlWorkerWake.Post();
+		controlWorkerThread.join();
 	}
 }
 
@@ -231,6 +381,9 @@ void Vst3EffectImpl::Load(uint64_t instanceId, const Vst3PluginInfo &info, IHost
 
 	lv2ToVstParam.resize(nControls);
 	parameterValues.resize(nControls);
+	pendingPlainValues.Resize(nControls);
+	pendingNormalizedValues.Resize(nControls);
+	controlFlushInFlight.assign(nControls, 0);
 	for (size_t i = 0; i < nControls; ++i)
 	{
 		const auto &control = info.pluginInfo_.controls()[i];
@@ -283,13 +436,27 @@ void Vst3EffectImpl::Load(uint64_t instanceId, const Vst3PluginInfo &info, IHost
 
 	plugProvider = owned(NEW PlugProvider(factory, myClassInfo, true));
 
-	this->component = plugProvider->getComponent();
+	// component and controller are borrowed pointers, kept alive by
+	// plugProvider. getComponent()/getController() addRef() for the caller,
+	// so adopt and drop those references here. (They used to be kept, and
+	// never released, so the plugin objects outlived the module. JUCE plugins
+	// keep their message and timer threads running while their objects are
+	// alive, and those threads crashed in unmapped code once the module was
+	// dlclose()d.)
+	{
+		OPtr<IComponent> ownedComponent = plugProvider->getComponent(); // also sets the plugin up
+		OPtr<IEditController> ownedController = plugProvider->getController();
+		this->component = ownedComponent.get();
+		this->controller = ownedController.get();
+	}
+	if (!component || !controller)
+	{
+		throw Vst3Exception(SS(info.pluginInfo_.name() << ": failed to create the component or edit controller."));
+	}
 	this->processor = component;
 
-	this->controller = plugProvider->getController();
 	controller->queryInterface(IMidiMapping::iid, (void **)&midiMapping);
 
-	paramTransferrer.setMaxParameters(1000);
 	if (midiMapping)
 		midiCCMapping = initMidiCtrlerAssignment(component, midiMapping);
 
@@ -323,8 +490,6 @@ void Vst3EffectImpl::Load(uint64_t instanceId, const Vst3PluginInfo &info, IHost
 
 	controller->setComponentHandler(&componentHandler);
 
-	paramTransferrer.setMaxParameters(1000);
-
 	if (midiMapping)
 		midiCCMapping = initMidiCtrlerAssignment(component, midiMapping);
 
@@ -335,6 +500,8 @@ void Vst3EffectImpl::Load(uint64_t instanceId, const Vst3PluginInfo &info, IHost
 	{
 		fireControlChanged(i, (float)(controller->getParamNormalized(lv2ToVstParam[i])));
 	}
+	// Last: SetControl() may be called as soon as Load() returns.
+	StartControlWorker();
 }
 //------------------------------------------------------------------------
 //------------------------------------------------------------------------
@@ -461,11 +628,20 @@ void Vst3EffectImpl::preprocess(Buffers &buffers, int64_t continousFrames)
 	processContext.continousTimeSamples = continousFrames;
 	assignBusBuffers(buffers, processData);
 
-	{
-		std::lock_guard guard{parameterMutex};
-
-		paramTransferrer.transferChangesTo(inputParameterChanges);
-	}
+	// Lock-free: values were normalized off the audio thread by the control
+	// worker. inputParameterChanges was sized to the parameter count in
+	// Load(), so this does not allocate.
+	pendingNormalizedValues.ForEachPending(
+		[this](size_t index, double normalizedValue)
+		{
+			int32 queueIndex = 0;
+			IParamValueQueue *queue = inputParameterChanges.addParameterData(lv2ToVstParam[index], queueIndex);
+			if (queue)
+			{
+				int32 pointIndex = 0;
+				queue->addPoint(0, normalizedValue, pointIndex);
+			}
+		});
 	outputParameterChanges.clearQueue();
 }
 
@@ -477,7 +653,12 @@ bool Vst3EffectImpl::process(Buffers &buffers, int64_t continousFrames)
 	buffers.numSamples = continousFrames;
 	preprocess(buffers, continousFrames);
 
-	if (processor->process(processData) != kResultOk)
+	tresult processResult;
+	{
+		InVst3ProcessScope inProcess;
+		processResult = processor->process(processData);
+	}
+	if (processResult != kResultOk)
 	{
 		// Previously this failure was swallowed: the plugin stopped producing
 		// audio and nothing was reported. Surface it through the same
@@ -646,6 +827,7 @@ void Vst3EffectImpl::Deactivate()
 {
 	if (isProcessing)
 	{
+		FlushControlChanges();
 		Run(0, nullptr); // make sure all pending events have been processed.
 		isProcessing = false;
 	}
@@ -680,6 +862,33 @@ tresult Vst3EffectImpl::beginEdit(ParamID id)
 }
 tresult Vst3EffectImpl::performEdit(ParamID id, ParamValue valueNormalized)
 {
+	// Called by the plugin, from whatever thread it likes: re-entrantly from
+	// inside one of our own controller calls (already holding controllerMutex
+	// on this thread; the mutex is recursive, so try_lock succeeds), or from a
+	// plugin-owned thread. fireControlChanged() calls back into the
+	// controller, so it must be serialized with every other controller call.
+	//
+	// try_lock, never a blocking lock: a non-conforming plugin may call
+	// performEdit() from process(), and the audio thread must never wait
+	// behind a long setState()/setComponentState() holding controllerMutex.
+	// Not blocking also removes the lock-ordering hazard of a plugin thread
+	// that holds a plugin-internal lock while calling performEdit(). If the
+	// lock is busy the edit is dropped: performEdit() is advisory (it tells
+	// the host about an edit the plugin made itself, normally from its GUI),
+	// and PiPedal is headless, so plugin-GUI edits do not occur.
+	//
+	// From inside process() (the audio thread) the edit is dropped outright:
+	// even an uncontended try_lock would then run controller code
+	// (normalizedParamToPlain()) and the control-changed handler there.
+	if (tlsInVst3Process)
+	{
+		return kResultFalse;
+	}
+	std::unique_lock lock{controllerMutex, std::try_to_lock};
+	if (!lock.owns_lock())
+	{
+		return kResultFalse;
+	}
 	int ix = ParamIdToLv2Id(id);
 	if (ix != -1)
 	{
@@ -698,10 +907,14 @@ void Vst3EffectImpl::transferControllerStateToComponent()
 	OPtr<IRtStream> bStream = this->streamPool.AllocateBStream();
 	assert(GetRefCount(bStream.get()) == 1);
 
-	// RtInversionGuard (priority boost) was retired in RtInversionGuard.hpp.
-	std::lock_guard guard{parameterMutex};
+	// Non-RT. No lock is shared with the audio thread any more; this only
+	// serializes against the control worker's IEditController calls.
+	std::lock_guard guard{controllerMutex};
 
-	paramTransferrer.removeChanges();
+	// pendingPlainValues is deliberately not cleared here: anything still
+	// queued is at least as new as the values read below, so the control
+	// worker must still deliver it to the controller. (SetState() discards
+	// values queued *before* the state load itself.)
 
 	// assume that parameters are straightforward and uncomplicated if they
 	// didn't provide BStream-based state management
@@ -710,9 +923,9 @@ void Vst3EffectImpl::transferControllerStateToComponent()
 	for (int index = 0; index < this->lv2ToVstParam.size(); ++index)
 	{
 		ParamID paramId = lv2ToVstParam[index];
-		paramTransferrer.addChange(paramId,
-									controller->plainParamToNormalized(paramId, parameterValues[index]),
-									0);
+		pendingNormalizedValues.Set(
+			(size_t)index,
+			controller->plainParamToNormalized(paramId, parameterValues[index]));
 	}
 	if (!this->isProcessing)
 	{
@@ -725,11 +938,46 @@ tresult Vst3EffectImpl::restartComponent(int32 flags)
 {
 	if (flags & (RestartFlags::kParamValuesChanged))
 	{
-		refreshControlValues();
-		transferControllerStateToComponent();
+		// Called by the plugin from whatever thread it likes, possibly the
+		// audio thread (a non-conforming plugin calling it from process()),
+		// so never block here, and never run the restart on the audio thread:
+		// it calls into the edit controller and fires control-changed
+		// notifications. Re-entrant calls from inside one of our own
+		// controller calls already hold controllerMutex on this thread (it is
+		// recursive), so try_lock succeeds and the restart runs inline. If
+		// the lock is busy, hand the restart to the control worker: an
+		// atomic store and an RT-safe sem_post().
+		if (!tlsInVst3Process)
+		{
+			std::unique_lock lock{controllerMutex, std::try_to_lock};
+			if (lock.owns_lock())
+			{
+				RestartParamValues();
+				return kResultOk;
+			}
+		}
+		deferredParamValuesRestart.store(true);
+		controlWorkerWake.Post();
 	}
 
 	return kResultOk;
+}
+
+void Vst3EffectImpl::RestartParamValues()
+{
+	std::lock_guard lock{controllerMutex};
+	// Deliver values queued by SetControl() to the controller first, so
+	// they are part of the state we read back, rather than discarding
+	// them. If this is a re-entrant call from inside a controller call made
+	// by FlushControlChanges() itself, the nested flush scans every slot
+	// (the outer pass has already claimed the summary flag), so values the
+	// outer pass hasn't reached yet are delivered before the refresh, and
+	// the value the outer pass is delivering right now is excluded from the
+	// refresh (see refreshControlValues()). Nothing is delivered twice or
+	// lost.
+	FlushControlChanges();
+	refreshControlValues();
+	transferControllerStateToComponent();
 }
 
 static std::vector<uint8_t> StreamToVec(IBStream *stream)
@@ -750,6 +998,13 @@ static std::vector<uint8_t> StreamToVec(IBStream *stream)
 
 void Vst3EffectImpl::CheckSync()
 {
+	// Test-only, and never with the audio thread running this effect:
+	// deliver anything SetControl() queued to both controller and processor
+	// before comparing them.
+	FlushControlChanges();
+	Run(0, nullptr);
+
+	std::lock_guard lock{controllerMutex};
 	OPtr<IBStream> stream{new MemoryStream()};
 
 	if (this->controller->getState(stream) == kResultOk)
@@ -829,6 +1084,13 @@ void Vst3EffectImpl::SetState(const std::vector<uint8_t> state)
 		// carries nothing to restore, so there is nothing to do.
 		return;
 	}
+	std::lock_guard lock{controllerMutex};
+
+	// Values queued by SetControl() before the state load are superseded by
+	// it; don't let them land on top of the restored state afterwards.
+	pendingPlainValues.Clear();
+	pendingNormalizedValues.Clear();
+
 	OPtr<IBStream> stream{new MemoryStream((void *)(&state[0]), state.size())};
 
 	if (controller->setComponentState(stream) != kResultOk)
@@ -845,8 +1107,16 @@ void Vst3EffectImpl::SetState(const std::vector<uint8_t> state)
 
 void Vst3EffectImpl::refreshControlValues()
 {
+	std::lock_guard lock{controllerMutex};
 	for (size_t i = 0; i < lv2ToVstParam.size(); ++i)
 	{
+		// A value FlushControlChanges() is handing to the controller further
+		// up this thread's stack: the controller may not have stored it yet,
+		// and parameterValues[i] already holds it.
+		if (i < controlFlushInFlight.size() && controlFlushInFlight[i])
+		{
+			continue;
+		}
 		fireControlChanged(i, controller->getParamNormalized(lv2ToVstParam[i]));
 	}
 }
@@ -854,6 +1124,7 @@ std::vector<Vst3ProgramList> Vst3EffectImpl::GetProgramList(int32_t programListI
 {
 	std::vector<Vst3ProgramList> result;
 
+	std::lock_guard lock{controllerMutex};
 	FUnknownPtr<IUnitInfo> iUnitInfo(controller);
 	if (!iUnitInfo)
 		throw Vst3Exception("Invalid unit info");
@@ -891,6 +1162,9 @@ std::vector<Vst3ProgramList> Vst3EffectImpl::GetProgramList(int32_t programListI
 
 void Vst3EffectImpl::fireControlChanged(int control, float normalizedValue)
 {
+	// Non-RT. Usually already held by the caller (recursive); taken here so
+	// that no path reaches normalizedParamToPlain() unserialized.
+	std::lock_guard lock{controllerMutex};
 	normalizedValue = NaNGuard(normalizedValue);
 	float plainValue = NaNGuard(this->controller->normalizedParamToPlain(this->lv2ToVstParam[control], normalizedValue));
 	if (parameterValues[control] != plainValue)
@@ -903,6 +1177,7 @@ void Vst3EffectImpl::fireControlChanged(int control, float normalizedValue)
 
 const Lv2PluginUiInfo& Vst3EffectImpl::GetCurrentPluginInfo()
 {
+	std::lock_guard lock{controllerMutex};
 	Vst3Host::Private::UpdateControlInfo(this->controller,this->info.pluginInfo_);
 	return this->info.pluginInfo_;
 }

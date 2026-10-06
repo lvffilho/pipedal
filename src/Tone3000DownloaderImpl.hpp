@@ -33,6 +33,7 @@
 #include <functional>
 #include "ThreadedQueue.hpp"
 #include "Tone3000Download.hpp"
+#include "Curl.hpp"
 
 namespace pipedal
 {
@@ -194,6 +195,8 @@ namespace pipedal
             const Tone3000PkceParams &pkce);
 
         std::atomic<bool> closed = false;
+        // Close() aborts the TONE3000 API requests in flight (Tone3000GetText, Post).
+        CurlCancellation curlCancellation;
         handle_t nextHandle = 1;
         handle_t NextHandle();
 

@@ -292,6 +292,11 @@ void TestIlleglUtf8Sequences()
 }   
 TEST_CASE("json variants", "[json_variants][Build][Dev]")
 {
+    // Compare against the counts at entry rather than zero: static tables in
+    // other translation units (e.g. unitsMap in ModGui.cpp) legitimately hold
+    // json_objects for the life of the process.
+    const int64_t initialObjectCount = json_object::allocation_count();
+    const int64_t initialArrayCount = json_array::allocation_count();
     {
         TestIlleglUtf8Sequences();
 
@@ -330,6 +335,6 @@ TEST_CASE("json variants", "[json_variants][Build][Dev]")
             x[0] = "def";
         }
     }
-    REQUIRE(json_object::allocation_count() == 0);
-    REQUIRE(json_array::allocation_count() == 0);
+    REQUIRE(json_object::allocation_count() == initialObjectCount);
+    REQUIRE(json_array::allocation_count() == initialArrayCount);
 }

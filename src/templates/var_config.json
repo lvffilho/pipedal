@@ -35,9 +35,11 @@
 
     // "logLevel": 3,
 
-// Maximum filesize to allow when uploading
+// Maximum filesize to allow when uploading, in bytes. The installed default
+// (/etc/pipedal/config/config.json) is 64MiB. Larger limits are allowed (e.g. 536870912 for 512MiB),
+// but slow clients are still cut off by the upload rate policy.
 
-    // "maxUploadSize": 536870912  // 512MiB
+    // "maxUploadSize": 67108864  // 64MiB
 
 
 // does nothing. avoids chasing ','s.

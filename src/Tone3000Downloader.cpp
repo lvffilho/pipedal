@@ -43,9 +43,10 @@ using namespace pipedal;
 namespace fs = std::filesystem;
 
 
-// Pulls in the define for T3kConfig.h
+// Bounds each TONE3000 API request (tone info, token exchange); Close() aborts them sooner.
+static constexpr int API_MAX_TIME_SECONDS = 30;
 
-#define PIPEDAL_T3K_PUBLISHABLE_KEY "t3k_pub_bHrH8btdwXXTtxz5ryEU8sNLF-2TGRT9"
+// PIPEDAL_T3K_PUBLISHABLE_KEY comes from T3kConfig.h, via Tone3000Downloader.hpp (shared with Tone3000Auth).
 
 
 
@@ -227,6 +228,7 @@ void Tone3000DownloaderImpl::Close()
         }
     }
     this->requestQueue.CloseAndClear();
+    curlCancellation.Cancel();
 }
 Tone3000DownloadProgress Tone3000DownloaderImpl::GetDownloadStatus()
 {
@@ -500,7 +502,7 @@ std::string Tone3000DownloaderImpl::Tone3000GetText(
     std::vector<std::string> inputHeaders {
         SS("Authorization: Bearer " << this->GetBearerToken())  
     };
-    int httpCode = CurlGet(requestedUri.str(),tempFile.Path(),nullptr,&inputHeaders);
+    int httpCode = CurlGet(requestedUri.str(), tempFile.Path(), nullptr, &inputHeaders, API_MAX_TIME_SECONDS, &curlCancellation);
     if (httpCode != 200)
     {
         throw std::runtime_error(
@@ -530,9 +532,9 @@ Tone3000DownloaderImpl::PostResult Tone3000DownloaderImpl::Post(
             body,
             result.body,
             nullptr,
-            &headers
-
-        );
+            &headers,
+            API_MAX_TIME_SECONDS,
+            &curlCancellation);
         result.errorCode = response;
         if (response != 200)
         {

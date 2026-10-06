@@ -36,6 +36,7 @@ namespace pipedal
     // 4. Responses that are found while a property notification is in flight are coaslesced.
 
     class IPatchWriterCallback;
+    class IEffect;
 
     class PatchPropertyWriter
     {
@@ -50,12 +51,16 @@ namespace pipedal
         };
 
     public:
-        PatchPropertyWriter(int64_t instanceId, LV2_URID patchPropertyUrid)
+        // capacity: the largest atom (header included) the realtime thread may copy into a
+        // buffer. Reserved up front so the realtime thread never grows the buffer.
+        PatchPropertyWriter(int64_t instanceId, LV2_URID patchPropertyUrid, size_t capacity = DEFAULT_CAPACITY)
             : instanceId(instanceId), patchPropertyUrid(patchPropertyUrid),
-              buffer0(new Buffer(instanceId, patchPropertyUrid)),
-              buffer1(new Buffer(instanceId, patchPropertyUrid))
+              buffer0(new Buffer(instanceId, patchPropertyUrid, capacity)),
+              buffer1(new Buffer(instanceId, patchPropertyUrid, capacity)),
+              capacity(capacity)
         {
         }
+        static constexpr size_t DEFAULT_CAPACITY = 1024;
         // no copy.
         PatchPropertyWriter(const PatchPropertyWriter&) = delete;
         // move
@@ -65,6 +70,7 @@ namespace pipedal
             this->currentWriteBuffer = nullptr;
             this->instanceId = other.instanceId;
             this->patchPropertyUrid = other.patchPropertyUrid;
+            this->capacity = other.capacity;
 
         }
 
@@ -78,10 +84,10 @@ namespace pipedal
         public:
             std::atomic<StateT> state{StateT::Empty};
 
-            Buffer(int64_t instanceId, LV2_URID propertyUrid)
+            Buffer(int64_t instanceId, LV2_URID propertyUrid, size_t capacity = DEFAULT_CAPACITY)
                 : instanceId(instanceId), patchPropertyUrid(propertyUrid)
             {
-                memory.reserve(1024);
+                memory.reserve(capacity);
             }
 
             void OnBufferWriteStarted()
@@ -119,6 +125,8 @@ namespace pipedal
                 state = StateT::Empty;
             }
             int64_t instanceId;
+            // The instance that wrote the buffer (it owns it, so it outlives the buffer's trip to the reader).
+            const IEffect *sourceEffect = nullptr;
             LV2_URID patchPropertyUrid;
 
             std::vector<uint8_t> memory;
@@ -159,6 +167,8 @@ namespace pipedal
         {
             return currentWriteBuffer;
         }
+        // Largest atom a buffer can hold without reallocating.
+        size_t Capacity() const { return capacity; }
 
         void FlushWrites(IPatchWriterCallback*cbWrite);
 
@@ -169,6 +179,7 @@ namespace pipedal
         Buffer *buffer0 = 0;
         Buffer *buffer1 = 0;
         Buffer *currentWriteBuffer = nullptr;
+        size_t capacity = DEFAULT_CAPACITY;
     };
 
     class IPatchWriterCallback {

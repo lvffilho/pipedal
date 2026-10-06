@@ -35,6 +35,12 @@ import {
     PiPedalModel, PiPedalModelFactory, MonitorPortHandle, State,
     ListenHandle, FileRequestResult
 } from './PiPedalModel';
+import { Pedalboard } from './Pedalboard';
+import { CustomSelectControl } from './ModGuiCustomSelect';
+import {
+    ModGuiScriptHost, ModGuiScriptCallback, ModGuiScriptPort,
+    compileModGuiScript, decodePatchValue, BYPASS_SYMBOL
+} from './ModGuiScript';
 
 
 const RANGE_SCALE = 120; // 120 pixels to move from 0 to 1.
@@ -59,12 +65,12 @@ function HtmlEncode(value: string): string {
 }
 
 function htmlEncodeTest() {
-    let testString = "&<>'\"\\";
+    const testString = "&<>'\"\\";
 
-    let encoded = HtmlEncode(testString);
-    let div = document.createElement("div");
+    const encoded = HtmlEncode(testString);
+    const div = document.createElement("div");
     div.innerHTML = `<div data-text='${encoded}'>${encoded}</div>`;
-    let innerDiv = div.children[0] as HTMLDivElement;
+    const innerDiv = div.children[0] as HTMLDivElement;
     if (innerDiv.getAttribute("data-text") !== testString) {
         throw new Error("HtmlEncode failed to encode properly: " + encoded);
     }
@@ -73,8 +79,8 @@ function htmlEncodeTest() {
 
 htmlEncodeTest();
 
-function PathToString(json: any): string {
-    let t = new JsonAtom(json);
+function PathToString(json: unknown): string {
+    const t = new JsonAtom(json);
     if (t.isPath()) {
         return t.asPath();
     }
@@ -85,7 +91,7 @@ function PathToString(json: any): string {
 }
 
 
-function StringToPath(path: string): any {
+function StringToPath(path: string): unknown {
     return JsonAtom._Path(path).asAny();
 }
 
@@ -102,15 +108,6 @@ export interface ModGuiHostProps {
 
 
 }
-export interface ModGuiJs {
-    set_port_value: (symbol: string, value: number) => void;
-    patch_get: (uri: string) => any;
-    patch_set: (uri: string, valuetype: string, value: any) => void;
-    get_custom_resource_filename: (filename: string) => string;
-    get_port_index_for_symbol: (symbol: string) => number;
-    get_port_symbol_for_index: (index: number) => string | null;
-};
-
 export interface ModGuiControl {
 
     //setControlValue: (value: number) => void;
@@ -158,7 +155,7 @@ class CustomSelectPathControl implements ModGuiControl {
         }
     }
     cancelRequestUpdate() {
-        let animationFrameId = this.animationFrameId;
+        const animationFrameId = this.animationFrameId;
         if (animationFrameId !== null) {
             window.cancelAnimationFrame(animationFrameId);
             this.animationFrameId = null;
@@ -166,7 +163,7 @@ class CustomSelectPathControl implements ModGuiControl {
     }
 
     private getFileProperty(): UiFileProperty | null {
-        for (let property of this.props.plugin.fileProperties) {
+        for (const property of this.props.plugin.fileProperties) {
             if (property.patchProperty === this.props.propertyUri) {
                 return property;
             }
@@ -177,14 +174,14 @@ class CustomSelectPathControl implements ModGuiControl {
     navBreadcrumbText(breadcrumbs: { pathname: string, displayName: string }[]): string {
         let breadcrumbText = "";
         for (let i = 0; i < breadcrumbs.length - 1; ++i) {
-            let breadcrumb = breadcrumbs[i];
+            const breadcrumb = breadcrumbs[i];
             breadcrumbText += "<div mod-role='enumeration-option' mod-filetype='directory'"
                 + " mod-parameter-value='" + HtmlEncode(breadcrumb.pathname) + "'"
                 + " class='ppmod-dotdot-breadcrumb_link'>"
                 + HtmlEncode(breadcrumb.displayName)
                 + "</div> / ";
         }
-        let breadcrumb = breadcrumbs[breadcrumbs.length - 1];
+        const breadcrumb = breadcrumbs[breadcrumbs.length - 1];
         breadcrumbText += "<div class='ppmod-dotdot-breadcrumb_current'>"
             + HtmlEncode(breadcrumb.displayName)
             + "</div>";
@@ -202,13 +199,13 @@ class CustomSelectPathControl implements ModGuiControl {
         if (encodebaseName !== false) {
             basename = HtmlEncode(basename);
         }
-        let itemHtml = this.enumeratedListItemTemplate
+        const itemHtml = this.enumeratedListItemTemplate
             .replace(/{{basename}}/g, basename)
             .replace(/{{filetype}}/g, type)
             .replace(/{{fullname}}/g, fullname);
-        let t = document.createElement("div");
+        const t = document.createElement("div");
         t.innerHTML = itemHtml;
-        let itemElement = t.firstElementChild as HTMLElement;
+        const itemElement = t.firstElementChild as HTMLElement;
         return itemElement;
 
     }
@@ -216,13 +213,13 @@ class CustomSelectPathControl implements ModGuiControl {
     fileRequestResult: FileRequestResult | null = null;
 
     async requestDirectoryUpdate() {
-        let model = PiPedalModelFactory.getInstance();
-        let fileProperty = this.getFileProperty();
+        const model = PiPedalModelFactory.getInstance();
+        const fileProperty = this.getFileProperty();
         if (!fileProperty) {
             return;
         }
 
-        let files = await model.requestFileList2(this.navDirectory || "", fileProperty);
+        const files = await model.requestFileList2(this.navDirectory || "", fileProperty);
         this.fileRequestResult = files;
         if (!this.mounted) {
             return;
@@ -231,9 +228,9 @@ class CustomSelectPathControl implements ModGuiControl {
             this.enumeratedListContainerElement.innerHTML = ""; // remove all children.
 
             if (files.breadcrumbs.length >= 2) {
-                let parentDirectory = files.breadcrumbs[files.breadcrumbs.length - 2].pathname;
+                const parentDirectory = files.breadcrumbs[files.breadcrumbs.length - 2].pathname;
 
-                let dotdotHtml = "<div class='ppmod-dotdot-flex'>"
+                const dotdotHtml = "<div class='ppmod-dotdot-flex'>"
                     + "<div mod-role='enumeration-option' mod-filetype='directory'"
                     + " mod-parameter-value='" + HtmlEncode(parentDirectory) + "'"
                     + " class='ppmod-dotdot-text'>[ ../ ]</div>"
@@ -241,7 +238,7 @@ class CustomSelectPathControl implements ModGuiControl {
                     + this.navBreadcrumbText(files.breadcrumbs)
                     + "</div>";
 
-                let dotdotElement = this.makeEnumeratedListItem(
+                const dotdotElement = this.makeEnumeratedListItem(
                     "directory",
                     dotdotHtml,
                     parentDirectory,
@@ -252,13 +249,13 @@ class CustomSelectPathControl implements ModGuiControl {
             } else {
 
                 // mod-role="enumeration-option" mod-filetype="{{filetype}}" mod-parameter-value="{{fullname}}"
-                let dotdotHtml = "<div class='ppmod-dotdot-flex'>"
+                const dotdotHtml = "<div class='ppmod-dotdot-flex'>"
                     + "<div class='ppmod-dotdot-text'>&nbsp;</div>"
                     + "<div class='ppmod-dotdot-path'>"
                     + this.navBreadcrumbText(files.breadcrumbs)
                     + "</div>";
 
-                let dotdotElement = this.makeEnumeratedListItem(
+                const dotdotElement = this.makeEnumeratedListItem(
                     "directory",
                     dotdotHtml,
                     "",
@@ -269,13 +266,13 @@ class CustomSelectPathControl implements ModGuiControl {
 
             }
 
-            for (let file of files.files) {
+            for (const file of files.files) {
                 let displayName = file.displayName;
                 if (file.isDirectory) {
                     displayName = '[ ' + displayName + '/ ]';
                 }
-                let fileType = file.isDirectory ? "directory" : "file";
-                let itemElement = this.makeEnumeratedListItem(
+                const fileType = file.isDirectory ? "directory" : "file";
+                const itemElement = this.makeEnumeratedListItem(
                     fileType,
                     displayName,
                     file.pathname
@@ -300,7 +297,7 @@ class CustomSelectPathControl implements ModGuiControl {
         if (this.pathValue !== value) {
             this.pathValue = value;
             if (this.pathValue !== "" || this.navDirectory === null) {
-                let browsePath = pathParentDirectory(value);
+                const browsePath = pathParentDirectory(value);
                 this.setNavDirectory(browsePath);
             }
             this.requestUpdate();
@@ -339,8 +336,8 @@ class CustomSelectPathControl implements ModGuiControl {
 
     }
 
-    handlePropertyValueChange(value: any) {
-        let path: string = PathToString(value);
+    handlePropertyValueChange(value: unknown) {
+        const path: string = PathToString(value);
         this.setPathValue(path);
     }
     private mounted: boolean = false;
@@ -354,14 +351,14 @@ class CustomSelectPathControl implements ModGuiControl {
             }
         );
         this.props.hostSite.getPatchProperty(this.props.instanceId, this.props.propertyUri)
-            .then((value: any) => {
+            .then((value: unknown) => {
                 this.handlePropertyValueChange(value);
             }).
-            catch((error: any) => {
+            catch((error: unknown) => {
                 if (error instanceof Error) {
-                    console.error((error as Error).message);
+                    console.error(error.message);
                 } else {
-                    console.error(error.toString());
+                    console.error(String(error));
                 }
                 this.handlePropertyValueChange("");
             });
@@ -384,7 +381,7 @@ class CustomSelectPathControl implements ModGuiControl {
 
     toggleVisibility(element: HTMLElement) {
         element.classList.toggle("hidden");
-        let display = element.style.display;
+        const display = element.style.display;
         if (display === "none" || display === "") {
             element.style.display = "block";
         } else {
@@ -401,7 +398,7 @@ class CustomSelectPathControl implements ModGuiControl {
         if (!this.frameElement) {
             return;
         }
-        let valueElement = this.getValueElement();
+        const valueElement = this.getValueElement();
         if (valueElement) {
             if (this.pathValue === null || this.pathValue === "") {
                 valueElement.textContent = "No file selected";
@@ -411,9 +408,9 @@ class CustomSelectPathControl implements ModGuiControl {
         }
         if (this.isInlineList && this.enumeratedListContainerElement) {
             for (let i = 0; i < this.enumeratedListContainerElement.children.length; i++) {
-                let child = this.enumeratedListContainerElement.children[i];
-                let strValue = child.getAttribute("mod-parameter-value");
-                let strType = child.getAttribute("mod-filetype");
+                const child = this.enumeratedListContainerElement.children[i];
+                const strValue = child.getAttribute("mod-parameter-value");
+                const strType = child.getAttribute("mod-filetype");
                 if (strValue === null) return;
                 if (strValue === this.pathValue && strType !== "directory") {
                     child.classList.add("selected");
@@ -430,7 +427,7 @@ class CustomSelectPathControl implements ModGuiControl {
         event.preventDefault();
         event.stopPropagation();
 
-        let valueElement = this.getValueElement();
+        const valueElement = this.getValueElement();
 
         if (event.target === valueElement) {
             // A click on the value element, so launch the file browser. hooboy!
@@ -439,10 +436,10 @@ class CustomSelectPathControl implements ModGuiControl {
         if (!event.target) {
             return;
         }
-        let target = event.target as HTMLElement;
+        const target = event.target as HTMLElement;
         if (target.getAttribute("mod-role") === "enumeration-option") {
-            let strValue = target.getAttribute("mod-parameter-value");
-            if (strValue === null) return; let strType = target.getAttribute("mod-filetype");
+            const strValue = target.getAttribute("mod-parameter-value");
+            if (strValue === null) return; const strType = target.getAttribute("mod-filetype");
             if (strType === "directory") {
                 this.setNavDirectory(strValue);
                 return;
@@ -486,11 +483,11 @@ class CustomSelectPathControl implements ModGuiControl {
 
         // swipe the enumeraation-option generated by the template. 
         // We'll use it as a template to create new file entries.
-        let enumeratedList = this.frameElement.querySelector(".mod-enumerated-list");
+        const enumeratedList = this.frameElement.querySelector(".mod-enumerated-list");
         if (enumeratedList) {
             this.enumeratedListContainerElement = enumeratedList as HTMLElement;
             if (this.enumeratedListContainerElement.children.length === 1) {
-                let firstChild = this.enumeratedListContainerElement.children[0];
+                const firstChild = this.enumeratedListContainerElement.children[0];
                 if (firstChild) {
                     this.enumeratedListItemTemplate = firstChild.outerHTML;
                     this.enumeratedListContainerElement.removeChild(firstChild);
@@ -508,171 +505,6 @@ class CustomSelectPathControl implements ModGuiControl {
 
 
 
-    }
-};
-
-
-interface CustomSelectControlProps {
-    instanceId: number;
-    pluginControl: UiControl;
-    onValueChanged: (instanceId: number, symbol: string, value: number) => void;
-    monitorPort: (
-        instanceId: number,
-        symbol: string,
-        interval: number,
-        callback: (value: number) => void) => MonitorPortHandle;
-    unmonitorPort: (handle: MonitorPortHandle) => void;
-};
-
-class CustomSelectControl implements ModGuiControl {
-
-    private props: CustomSelectControlProps;
-    private frameElement?: HTMLElement;
-
-    private value: number = -1.038327E-15
-    private animationFrameId: number | null = null;
-
-    constructor(props: CustomSelectControlProps) {
-        this.props = props;
-    }
-
-
-    requestUpdate() {
-        if (!this.mounted) return;
-        if (!this.frameElement) {
-            return;
-        }
-
-
-        if (this.animationFrameId === null) {
-            this.animationFrameId = window.requestAnimationFrame(() => {
-                this.animationFrameId = null;
-                this.updateImage();
-            });
-        }
-    }
-    cancelRequestUpdate() {
-        let animationFrameId = this.animationFrameId;
-        if (animationFrameId !== null) {
-            window.cancelAnimationFrame(animationFrameId);
-            this.animationFrameId = null;
-        }
-    }
-    setControlValue(value: number) {
-        if (this.value !== value) {
-            this.value = value;
-            this.requestUpdate();
-        }
-    }
-
-    private updateImage() {
-        if (!this.frameElement || !this.mounted) {
-            return;
-        }
-        let text: string = "";
-        let bestError = 1E308;
-        for (let scalePoint of this.props.pluginControl.scale_points) {
-            let error = Math.abs(scalePoint.value - this.value);
-            if (error < bestError) {
-                bestError = error;
-                text = scalePoint.label;
-            }
-        }
-
-        this.frameElement.querySelectorAll('[mod-role=input-control-value]')
-            .forEach((inputControl: Element) => {
-
-                (inputControl as HTMLElement).textContent = text;
-            });
-        this.frameElement.querySelectorAll('[mod-role=enumeration-option]')
-            .forEach((inputControl: Element) => {
-                let strValue = inputControl.getAttribute("mod-port-value");
-                let value = parseFloat(strValue || "");
-                inputControl.classList.remove("selected");
-                if (value === this.value) {
-                    inputControl.classList.add("selected");
-                }
-
-                (inputControl as HTMLElement).textContent = text;
-            });
-        //this.frameElement.textContent = text;
-
-    }
-    private mounted: boolean = false;
-
-    private monitorHandle: MonitorPortHandle | null = null;
-    onMounted() {
-        this.mounted = true;
-        this.monitorHandle = this.props.monitorPort(
-            this.props.instanceId,
-            this.props.pluginControl.symbol,
-            1.0 / 15,
-            (value: number) => {
-                if (value != this.value) {
-                    this.setControlValue(value);
-                }
-            }
-        );
-        this.requestUpdate();
-    }
-
-    onUnmount() {
-        if (this.monitorHandle) {
-            this.props.unmonitorPort(this.monitorHandle);
-            this.monitorHandle = null;
-        }
-        this.mounted = false;
-        this.cancelRequestUpdate();
-    }
-
-
-    render(): HTMLElement | null {
-        return null;
-    }
-
-    toggleVisibility(element: HTMLElement) {
-        element.classList.toggle("hidden");
-        let display = element.style.display;
-        if (display === "none" || display === "") {
-            element.style.display = "block";
-        } else {
-            element.style.display = "none";
-        }
-    }
-    handleClick(event: MouseEvent) {
-        if (!this.frameElement) {
-            return;
-        }
-        event.preventDefault();
-        event.stopPropagation();
-        let enumeratedList = this.frameElement.querySelector(".mod-enumerated-list");
-        if (enumeratedList) {
-            let element = enumeratedList as HTMLElement;
-            this.toggleVisibility(element)
-        }
-        if (event.target) {
-            let target = event.target as HTMLElement;
-            let role = target.getAttribute("mod-role");
-            if (role === "enumeration-option")  // a click in the drop-down list?
-            {
-                let strValue = target.getAttribute("mod-port-value");
-                if (strValue && strValue !== "") {
-                    let value = parseFloat(strValue);
-                    if (!isNaN(value)) {
-                        this.setControlValue(value);
-                        this.props.onValueChanged(this.props.instanceId, this.props.pluginControl.symbol, value);
-                    }
-                }
-
-            }
-        }
-    }
-
-    attach(frameElement: HTMLElement) {
-
-        this.frameElement = frameElement;
-        this.requestUpdate();
-        this.frameElement.onclick = (event: MouseEvent) => { this.handleClick(event); }
     }
 };
 
@@ -714,7 +546,7 @@ class BypassLightControl implements ModGuiControl {
         }
     }
     cancelRequestUpdate() {
-        let animationFrameId = this.animationFrameId;
+        const animationFrameId = this.animationFrameId;
         if (animationFrameId !== null) {
             window.cancelAnimationFrame(animationFrameId);
             this.animationFrameId = null;
@@ -747,7 +579,7 @@ class BypassLightControl implements ModGuiControl {
         this.listenHandle = this.props.model.addPedalboardItemEnabledChangeListener(
             this.props.instanceId,
             (instanceId: number, isEnabled: boolean) => {
-                let bypass = isEnabled ? 1.0: 0.0;
+                const bypass = isEnabled ? 1.0: 0.0;
                 if (bypass !== this.value) {
                     this.setControlValue(bypass);
                 }
@@ -822,7 +654,7 @@ class FilmstripControl implements ModGuiControl {
         }
     }
     cancelRequestUpdate() {
-        let animationFrameId = this.animationFrameId;
+        const animationFrameId = this.animationFrameId;
         if (animationFrameId !== null) {
             window.cancelAnimationFrame(animationFrameId);
             this.animationFrameId = null;
@@ -840,8 +672,8 @@ class FilmstripControl implements ModGuiControl {
             throw new Error("Logic  error: frameElement is not set.");
         }
 
-        let bgImage = getComputedStyle(this.frameElement).backgroundImage;
-        let urlMatch = bgImage.match(FilmstripControl.urlRegex);
+        const bgImage = getComputedStyle(this.frameElement).backgroundImage;
+        const urlMatch = bgImage.match(FilmstripControl.urlRegex);
         if (urlMatch && urlMatch.length > 1) {
             return urlMatch[1];
         }
@@ -855,19 +687,19 @@ class FilmstripControl implements ModGuiControl {
             return;
         }
 
-        let rotationAttr = this.frameElement.getAttribute('mod-widget-rotation');
+        const rotationAttr = this.frameElement.getAttribute('mod-widget-rotation');
         if (rotationAttr && rotationAttr !== "") {
-            let rotation = parseFloat(rotationAttr);
+            const rotation = parseFloat(rotationAttr);
             if (isNaN(rotation)) {
                 console.error("pipedal: Invalid mod-widget-rotation value: " + rotationAttr);
                 return;
             }
-            let range = this.props.pluginControl.valueToRange(this.value);
+            const range = this.props.pluginControl.valueToRange(this.value);
             this.frameElement.style.transform = `rotate(${rotation * range - rotation / 2}deg)`;
             return;
 
         }
-        let imageUrl = this.getImageUrl();
+        const imageUrl = this.getImageUrl();
         if (!imageUrl) {
             return;
         }
@@ -876,24 +708,24 @@ class FilmstripControl implements ModGuiControl {
 
             this.currentImageUrl = imageUrl;
             this.imgElement = new Image();
-            let img = this.imgElement;
+            const img = this.imgElement;
             img.onload = () => {
                 if (!this.frameElement) {
                     return;
                 }
-                let computedStyle = window.getComputedStyle(this.frameElement);
-                let strWidth = computedStyle.getPropertyValue('width') || "0";
+                const computedStyle = window.getComputedStyle(this.frameElement);
+                const strWidth = computedStyle.getPropertyValue('width') || "0";
                 let frameWidth = parseFloat(strWidth);
                 if (isNaN(frameWidth) || frameWidth <= 0) { frameWidth = 0; }
 
-                let strHeight = computedStyle.getPropertyValue("height") || "0";
+                const strHeight = computedStyle.getPropertyValue("height") || "0";
                 let frameHeight = parseFloat(strHeight);
                 if (isNaN(frameHeight) || frameHeight <= 0) { frameHeight = 0; }
 
                 let iHeight = 0;
-                let bgSize = computedStyle.getPropertyValue('background-size');
+                const bgSize = computedStyle.getPropertyValue('background-size');
                 if (bgSize) {
-                    let bgSizeParts = bgSize.split(' ');
+                    const bgSizeParts = bgSize.split(' ');
                     if (bgSizeParts.length === 2) {
                         iHeight = parseFloat(bgSizeParts[1]);
                     }
@@ -901,8 +733,8 @@ class FilmstripControl implements ModGuiControl {
                 if (iHeight === 0) {
                     iHeight = frameHeight;
                 }
-                let imgFrameWidth = Math.round(frameWidth / iHeight * img.naturalHeight);
-                let nFrames = Math.round(img.naturalWidth / imgFrameWidth);
+                const imgFrameWidth = Math.round(frameWidth / iHeight * img.naturalHeight);
+                const nFrames = Math.round(img.naturalWidth / imgFrameWidth);
 
                 this.filmstripInfo = {
                     width: img.naturalWidth,
@@ -923,12 +755,12 @@ class FilmstripControl implements ModGuiControl {
 
         let xOffset = 0;
         let yOffset = 0;
-        let pluginControl = this.props.pluginControl;
+        const pluginControl = this.props.pluginControl;
 
         let value = this.isPointerDown ? this.pointerDownValue : this.value;
         value = this.props.pluginControl.clampValue(value);
 
-        let isHorizontalStrip =
+        const isHorizontalStrip =
             this.filmstripInfo.frameWidth / this.filmstripInfo.frameHeight
             < this.filmstripInfo.width / this.filmstripInfo.height;
         if (isHorizontalStrip) {
@@ -940,7 +772,7 @@ class FilmstripControl implements ModGuiControl {
             if (range > 1) {
                 range = 1;
             }
-            let nFrame = Math.round(range * (this.filmstripInfo.nFrames - 1));
+            const nFrame = Math.round(range * (this.filmstripInfo.nFrames - 1));
             xOffset = -nFrame * this.filmstripInfo.frameWidth;
             yOffset = 0;
 
@@ -1055,7 +887,7 @@ class FilmstripControl implements ModGuiControl {
         }
         event.preventDefault();
         event.stopPropagation();
-        let dy = event.pageY - this.lastY;
+        const dy = event.pageY - this.lastY;
         this.lastY = event.pageY;
         this.lastX = event.pageX;
 
@@ -1070,19 +902,19 @@ class FilmstripControl implements ModGuiControl {
             rate = FINE_RANGE_SCALE;
         }
 
-        let dRange = -dy / rate;
+        const dRange = -dy / rate;
 
         let range = this.props.pluginControl.valueToRange(this.pointerDownValue);
         range += dRange;
         if (range < 0) range = 0;
         if (range > 1) range = 1;
-        let newValue = this.props.pluginControl.rangeToValue(range);
+        const newValue = this.props.pluginControl.rangeToValue(range);
         this.pointerDownValue = newValue;
         this.setControlValue(newValue);
         this.props.onValueChanged(this.props.instanceId, this.props.pluginControl.symbol, this.props.pluginControl.clampValue(newValue));
     }
     handlePointerUp(event: PointerEvent) {
-        let index = this.pointerIds.indexOf(event.pointerId);
+        const index = this.pointerIds.indexOf(event.pointerId);
         if (index >= 0) {
             this.pointerIds.splice(index, 1);
         } else {
@@ -1105,7 +937,7 @@ class FilmstripControl implements ModGuiControl {
         if (!this.frameElement) {
             return; // Not mounted yet
         }
-        let index = this.pointerIds.indexOf(event.pointerId);
+        const index = this.pointerIds.indexOf(event.pointerId);
         if (index >= 0) {
             this.pointerIds.splice(index, 1);
         }
@@ -1132,13 +964,13 @@ class FilmstripControl implements ModGuiControl {
         } else if (event.shiftKey) {
             rate = FINE_WHEEL_RANGE_SCALE;
         }
-        let dRange = event.deltaY / rate;
+        const dRange = event.deltaY / rate;
 
         let range = this.props.pluginControl.valueToRange(this.value);
         range += dRange;
         if (range < 0) range = 0;
         if (range > 1) range = 1;
-        let newValue = this.props.pluginControl.rangeToValue(range);
+        const newValue = this.props.pluginControl.rangeToValue(range);
         this.setControlValue(newValue);
         this.props.onValueChanged(this.props.instanceId, this.props.pluginControl.symbol, newValue);
     }
@@ -1181,8 +1013,93 @@ class FilmstripControl implements ModGuiControl {
 };
 
 
+// mod-role="input-control-value" elements outside a custom-select (which keeps its own):
+// show the port's value, formatted, or its scale point label, as mod-ui does.
+class ValueFieldsControl implements ModGuiControl {
+    private model: PiPedalModel;
+    private instanceId: number;
+    private fields: { control: UiControl, element: HTMLElement }[] = [];
+    private pedalboardHandler = (pedalboard: Pedalboard) => { this.update(pedalboard); };
+
+    constructor(model: PiPedalModel, instanceId: number, plugin: UiPlugin, frameElement: Element) {
+        this.model = model;
+        this.instanceId = instanceId;
+        frameElement.querySelectorAll('[mod-role=input-control-value][mod-port-symbol]')
+            .forEach((element) => {
+                if (element.closest('[mod-widget=custom-select]')) {
+                    return;
+                }
+                const control = plugin.getControl(element.getAttribute("mod-port-symbol") ?? "");
+                if (control && control.is_input) {
+                    this.fields.push({ control: control, element: element as HTMLElement });
+                }
+            });
+    }
+    get isEmpty(): boolean { return this.fields.length === 0; }
+
+    private update(pedalboard: Pedalboard) {
+        const item = pedalboard.tryGetItem(this.instanceId);
+        if (!item) return;
+        for (const field of this.fields) {
+            const text = field.control.formatDisplayValue(item.getControlValue(field.control.symbol));
+            if (field.element.textContent !== text) {
+                field.element.textContent = text;
+            }
+        }
+    }
+    onMounted() {
+        this.model.pedalboard.addOnChangedHandler(this.pedalboardHandler);
+        this.update(this.model.pedalboard.get());
+    }
+    onUnmount() {
+        this.model.pedalboard.removeOnChangedHandler(this.pedalboardHandler);
+    }
+    render(): HTMLElement | null {
+        return null;
+    }
+}
+
+// jQuery is only needed by ModGUIs that have a modgui:javascript, so it's loaded on
+// first use, in its own chunk. The npm module doesn't set window.$; scripts get $ and
+// jQuery as parameters (see compileModGuiScript).
+let jqueryPromise: Promise<JQueryStatic> | null = null;
+function loadJQuery(): Promise<JQueryStatic> {
+    if (!jqueryPromise) {
+        jqueryPromise = import('jquery').then((module) => module.default);
+        jqueryPromise.catch(() => { jqueryPromise = null; });
+    }
+    return jqueryPromise;
+}
+
+// Compiled modgui:javascript callbacks, by URL (which includes the plugin's version):
+// like mod-ui, each script is evaluated once, however many instances are shown.
+const modGuiScripts = new Map<string, Promise<ModGuiScriptCallback | null>>();
+
+function loadModGuiScript(url: string): Promise<ModGuiScriptCallback | null> {
+    let result = modGuiScripts.get(url);
+    if (!result) {
+        result = (async () => {
+            try {
+                const [response, jquery] = await Promise.all([fetch(url), loadJQuery()]);
+                if (!response.ok) {
+                    console.warn("pipedal: Failed to load ModGUI javascript " + url + ": " + response.statusText);
+                    modGuiScripts.delete(url);
+                    return null;
+                }
+                return compileModGuiScript(await response.text(), jquery);
+            } catch (error) {
+                console.warn("pipedal: Failed to load ModGUI javascript " + url, error);
+                modGuiScripts.delete(url); // e.g. a network error: try again next time.
+                return null;
+            }
+        })();
+        modGuiScripts.set(url, result);
+    }
+    return result;
+}
+
 function ModGuiHost(props: ModGuiHostProps) {
-    let model: PiPedalModel = PiPedalModelFactory.getInstance();
+    const model: PiPedalModel = PiPedalModelFactory.getInstance();
     const { plugin, onClose } = props;
     const [hostDivRef, setHostDivRef] = React.useState<HTMLDivElement | null>(null);
     const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
@@ -1199,33 +1116,25 @@ function ModGuiHost(props: ModGuiHostProps) {
         }
     }
 
-    if (!plugin.modGui) {
-        return (
-            <div>
-                <Typography variant="h6">No Mod GUI</Typography>
-            </div>
-        );
-    }
-
     
     function addPortClass(element: Element, selector: string, className: string) {
-        let children = element.querySelectorAll(selector);
+        const children = element.querySelectorAll(selector);
         // call addClass to each element that matches the selector
         children.forEach((child) => {
             child.classList.add(className);
         });
     }
 
-    function createCustomSelectControl(control: Element, symbol: string, pluginControl: UiControl) {
-        let customSelectControl = new CustomSelectControl(
+    function createCustomSelectControl(control: Element, symbol: string) {
+        const customSelectControl = new CustomSelectControl(
             {
                 instanceId: props.instanceId,
-                pluginControl: pluginControl,
+                symbol: symbol,
                 onValueChanged: (instanceId: number, symbol: string, value: number) => {
                     try {
                         model.setPedalboardControl(instanceId, symbol, value);
                     } catch (error) {
-
+                        console.warn("pipedal: " + String(error));
                     }
                 },
                 monitorPort: model.monitorPort.bind(model),
@@ -1234,7 +1143,7 @@ function ModGuiHost(props: ModGuiHostProps) {
         );
         customSelectControl.attach(control as HTMLElement);
         modGuiControls.push(customSelectControl);
-        let modGuiElement = customSelectControl.render();
+        const modGuiElement = customSelectControl.render();
         if (modGuiElement !== null) {
             control.appendChild(modGuiElement);
         }
@@ -1255,7 +1164,7 @@ function ModGuiHost(props: ModGuiHostProps) {
         model.removePedalboardItemEnabledChangeListener(handle as ListenHandle);
     }
     function createFootswitchControl(control: Element, symbol: string, controlType: ControlType) {
-        let uiControl = new UiControl();
+        const uiControl = new UiControl();
         uiControl.symbol = symbol;
         uiControl.controlType = controlType;
         uiControl.min_value = 0;
@@ -1263,7 +1172,7 @@ function ModGuiHost(props: ModGuiHostProps) {
         uiControl.is_logarithmic = false;
         uiControl.integer_property = true;
 
-        let filmstripControl = new FilmstripControl(
+        const filmstripControl = new FilmstripControl(
             {
                 instanceId: props.instanceId,
                 pluginControl: uiControl,
@@ -1276,7 +1185,7 @@ function ModGuiHost(props: ModGuiHostProps) {
                         try {
                             model.setPedalboardControl(instanceId, symbol, value);
                         } catch (error) {
-
+                            console.warn("pipedal: " + String(error));
                         }
                     }
                 },
@@ -1292,19 +1201,19 @@ function ModGuiHost(props: ModGuiHostProps) {
         );
         filmstripControl.attach(control as HTMLElement);
         modGuiControls.push(filmstripControl);
-        let modGuiElement = filmstripControl.render();
+        const modGuiElement = filmstripControl.render();
         if (modGuiElement !== null) {
             control.appendChild(modGuiElement);
         }
         filmstripControl.onMounted();
     }
     function createCustomSelectPathControl(control: Element) {
-        let pathUri = control.getAttribute("mod-parameter-uri");
+        const pathUri = control.getAttribute("mod-parameter-uri");
         if (!pathUri) {
             setModError("No mod-parameter-uri attribute found on control element.");
             return;
         }
-        let selectPathControl = new CustomSelectPathControl({
+        const selectPathControl = new CustomSelectPathControl({
             instanceId: props.instanceId,
             propertyUri: pathUri,
             plugin: props.plugin,
@@ -1320,7 +1229,7 @@ function ModGuiHost(props: ModGuiHostProps) {
 
     function createBypassLightControl(control: Element) {
 
-        let bypassLightControl = new BypassLightControl(
+        const bypassLightControl = new BypassLightControl(
             {
                 instanceId: props.instanceId,
                 model: model
@@ -1328,14 +1237,14 @@ function ModGuiHost(props: ModGuiHostProps) {
         );
         bypassLightControl.attach(control as HTMLElement);
         modGuiControls.push(bypassLightControl);
-        let modGuiElement = bypassLightControl.render();
+        const modGuiElement = bypassLightControl.render();
         if (modGuiElement !== null) {
             control.appendChild(modGuiElement);
         }
         bypassLightControl.onMounted();
     }
     function createDialControl(control: Element, pluginControl: UiControl) {
-        let modGui = plugin.modGui;
+        const modGui = plugin.modGui;
         if (!modGui) {
             alert("Logic error");
             return;
@@ -1344,7 +1253,7 @@ function ModGuiHost(props: ModGuiHostProps) {
         if (modGui.knob !== "") {
             knobUrl = modGui.knob;
         }
-        let modGuiControl = new FilmstripControl(
+        const modGuiControl = new FilmstripControl(
             {
                 instanceId: props.instanceId,
                 pluginControl: pluginControl,
@@ -1354,7 +1263,7 @@ function ModGuiHost(props: ModGuiHostProps) {
                     try {
                         model.setPedalboardControl(instanceId, symbol, value);
                     } catch (error) {
-
+                        console.warn("pipedal: " + String(error));
                     }
                 },
                 monitorPort: model.monitorPort.bind(model),
@@ -1365,7 +1274,7 @@ function ModGuiHost(props: ModGuiHostProps) {
         modGuiControls.push(modGuiControl);
         modGuiControl.attach(control as HTMLElement);
 
-        let modGuiElement = modGuiControl.render();
+        const modGuiElement = modGuiControl.render();
         if (modGuiElement !== null) {
             control.appendChild(modGuiElement);
         }
@@ -1383,15 +1292,15 @@ function ModGuiHost(props: ModGuiHostProps) {
 
         element.querySelectorAll('[mod-role=input-control-port]')
             .forEach((control) => {
-                let symbol = control.getAttribute("mod-port-symbol");
+                const symbol = control.getAttribute("mod-port-symbol");
 
                 if (symbol) {
-                    let pluginControl: UiControl | undefined = plugin.getControl(symbol);
+                    const pluginControl: UiControl | undefined = plugin.getControl(symbol);
                     if (!pluginControl) {
                         setModError(`No plugin info found for symbol ${symbol}`);
                         return;
                     }
-                    let widgetType = control.getAttribute("mod-widget") || "";
+                    const widgetType = control.getAttribute("mod-widget") || "";
                     // 'film': 'film',
                     // 'switch': 'switchWidget',
                     // 'bypass': 'bypassWidget',
@@ -1409,7 +1318,7 @@ function ModGuiHost(props: ModGuiHostProps) {
                             createFootswitchControl(control, symbol, ControlType.OnOffSwitch);
                             break;
                         case "custom-select":
-                            createCustomSelectControl(control, symbol, pluginControl);
+                            createCustomSelectControl(control, symbol);
                             break;
                         case "custom-select-path":
                         case "bypass":
@@ -1423,8 +1332,8 @@ function ModGuiHost(props: ModGuiHostProps) {
             });
         element.querySelectorAll('[mod-role=bypass]')
             .forEach((control) => {
-                let symbol = "_bypass";
-                let controlType = ControlType.OnOffSwitch;
+                const symbol = "_bypass";
+                const controlType = ControlType.OnOffSwitch;
                 createFootswitchControl(control, symbol, controlType);
             });
         element.querySelectorAll('[mod-role=bypass-light]')
@@ -1436,14 +1345,149 @@ function ModGuiHost(props: ModGuiHostProps) {
                 // stub: mod-widget="custom-select-path".  Are there other widgets for this?
                 createCustomSelectPathControl(control);
             });
+        const valueFields = new ValueFieldsControl(model, props.instanceId, plugin, element);
+        if (!valueFields.isEmpty) {
+            modGuiControls.push(valueFields);
+            valueFields.onMounted();
+        }
     }
+
+    // Run the ModGUI's modgui:javascript against the rendered icon (see ModGuiScript.ts).
+    function bindModGuiScript(
+        element: HTMLElement, callback: ModGuiScriptCallback, jquery: JQueryStatic,
+        resourceUrl: string, queryParams: string) {
+        const instanceId = props.instanceId;
+        const ports: ModGuiScriptPort[] = plugin.controls
+            .filter((control) => control.symbol !== "")
+            .map((control) => ({
+                symbol: control.symbol,
+                index: control.index,
+                isInput: control.is_input,
+                minValue: control.min_value,
+                maxValue: control.max_value
+            }));
+        const inputSymbols = new Set<string>(ports.filter((port) => port.isInput).map((port) => port.symbol));
+
+        const scriptHost: ModGuiScriptHost = new ModGuiScriptHost(callback, {
+            ports: ports,
+            setPortValue: (symbol: string, value: number) => {
+                // The same path as a widget's change.
+                if (symbol === BYPASS_SYMBOL) {
+                    model.setPedalboardItemEnabled(instanceId, value === 0);
+                } else {
+                    model.setPedalboardControl(instanceId, symbol, value);
+                }
+            },
+            patchGet: (uri: string) => {
+                // As in mod-ui, the reply reaches the script through the patch monitor
+                // below, not from here (which would deliver it twice).
+                model.getPatchProperty(instanceId, uri)
+                    .catch((error) => { console.warn("pipedal: ModGUI javascript: patch_get failed. " + String(error)); });
+            },
+            patchSet: (uri: string, atomJson: unknown) => {
+                model.setPatchProperty(instanceId, uri, atomJson)
+                    .catch((error) => { console.warn("pipedal: ModGUI javascript: patch_set failed. " + String(error)); });
+            },
+            customResourceUrl: (filename: string) => {
+                const path = filename.split('/').filter((segment) => segment !== "").map(encodeURIComponent).join('/');
+                return resourceUrl + path + queryParams;
+            }
+        }, jquery(element));
+
+        // Control port changes from widgets, the script and MIDI, synchronously.
+        const controlValueHandle = model.addControlValueChangeListener(instanceId, (key: string, value: number) => {
+            if (inputSymbols.has(key)) {
+                scriptHost.portChanged(key, value);
+            }
+        });
+        // Bypass, and control values replaced wholesale with the pedalboard (plugin
+        // presets, snapshots, pedalboard loads), which the listener above doesn't see.
+        // The script host passes on actual changes only, so nothing is sent twice.
+        const pedalboardHandler = (pedalboard: Pedalboard) => {
+            const item = pedalboard.tryGetItem(instanceId);
+            if (!item) return;
+            scriptHost.portChanged(BYPASS_SYMBOL, item.isEnabled ? 0 : 1);
+            for (const controlValue of item.controlValues) {
+                if (inputSymbols.has(controlValue.key)) {
+                    scriptHost.portChanged(controlValue.key, controlValue.value);
+                }
+            }
+        };
+
+        const item = model.pedalboard.get().tryGetItem(instanceId);
+        const startPorts: { symbol: string, value: number }[] = [
+            { symbol: BYPASS_SYMBOL, value: item && !item.isEnabled ? 1 : 0 }
+        ];
+        for (const control of plugin.controls) {
+            if (control.is_input && control.symbol !== "") {
+                const value = item ? item.getControlValue(control.symbol) : control.default_value;
+                startPorts.push({ symbol: control.symbol, value: value });
+            }
+        }
+        const parameters: { uri: string, value: unknown }[] = [];
+        const seen = new Set<string>();
+        if (item) {
+            for (const uri of Object.keys(item.pathProperties)) {
+                try {
+                    parameters.push({ uri: uri, value: decodePatchValue(JSON.parse(item.pathProperties[uri])) });
+                    seen.add(uri);
+                } catch {
+                    // not JSON: leave it out.
+                }
+            }
+        }
+        for (const patchProperty of plugin.patchProperties) {
+            if (!seen.has(patchProperty.uri)) {
+                // Other properties' current values aren't known here; mod-ui also starts with the default.
+                parameters.push({ uri: patchProperty.uri, value: patchProperty.isNumeric() ? patchProperty.defaultValue : "" });
+            }
+        }
+
+        scriptHost.start(startPorts, parameters);
+
+        model.pedalboard.addOnChangedHandler(pedalboardHandler);
+        const outputMonitors: MonitorPortHandle[] = [];
+        for (const control of plugin.controls) {
+            if (!control.is_input && control.symbol !== "") {
+                const symbol = control.symbol;
+                outputMonitors.push(model.monitorPort(instanceId, symbol, 1.0 / 15, (value: number) => {
+                    scriptHost.portChanged(symbol, value);
+                }));
+            }
+        }
+        // "": every patch:Set the plugin sends.
+        const patchListenHandle = model.monitorPatchProperty(instanceId, "", (_instanceId, uri, value) => {
+            scriptHost.parameterChanged(uri, decodePatchValue(value));
+        });
+
+        modGuiControls.push({
+            onMounted: () => { },
+            onUnmount: () => {
+                scriptHost.dispose();
+                model.removeControlValueChangeListener(controlValueHandle);
+                model.pedalboard.removeOnChangedHandler(pedalboardHandler);
+                for (const handle of outputMonitors) {
+                    model.unmonitorPort(handle);
+                }
+                model.cancelMonitorPatchProperty(patchListenHandle);
+                try {
+                    // Drops the jQuery data and event handlers the script attached.
+                    jquery(element).remove();
+                } catch (error) {
+                    console.warn("pipedal: ModGUI javascript: cleanup failed.", error);
+                }
+            },
+            render: () => null
+        });
+    }
+
     function setModError(message: string) {
         setErrorMessage(ModMessage(message));
     }
-    async function requestContent() {
+    async function requestContent(cancelled: { value: boolean }) {
         updateContentReady(false);
         try {
-            let modGui = plugin.modGui;
+            const modGui = plugin.modGui;
             if (!modGui) {
                 setModError("No MOD GUI declared for this plugin.");
                 return;
@@ -1457,53 +1501,71 @@ function ModGuiHost(props: ModGuiHostProps) {
                 return;
             }
 
-            let encodedUri = encodeURIComponent(props.plugin.uri);
-            let version = props.plugin.minorVersion * 1000 + props.plugin.microVersion;
+            const encodedUri = encodeURIComponent(props.plugin.uri);
+            const version = props.plugin.minorVersion * 1000 + props.plugin.microVersion;
 
-            let resourceUrl = model.modResourcesUrl;
-            let queryParams = "?ns=" + encodedUri + "&v=" + version.toString();
-            let templateUri = resourceUrl + "_/iconTemplate" + queryParams;
-            let cssUri = resourceUrl + "_/stylesheet" + queryParams;
+            const resourceUrl = model.modResourcesUrl;
+            const queryParams = "?ns=" + encodedUri + "&v=" + version.toString();
+            const templateUri = resourceUrl + "_/iconTemplate" + queryParams;
+            const cssUri = resourceUrl + "_/stylesheet" + queryParams;
 
-            let fetchResult = await fetch(templateUri);
+            // Loads concurrently with the template. Never rejects.
+            const scriptPromise: Promise<ModGuiScriptCallback | null> | null = modGui.javascript
+                ? loadModGuiScript(resourceUrl + "_/javascript" + queryParams)
+                : null;
+
+            const fetchResult = await fetch(templateUri);
             if (!fetchResult.ok) {
                 setModError("Failed to load template: " + fetchResult.statusText);
                 return;
             }
-            let parser = new DOMParser();
-            let docText = await fetchResult.text();
-            let doc = parser.parseFromString(docText, "text/html");
-            let element = doc.body.firstElementChild;
+            const parser = new DOMParser();
+            const docText = await fetchResult.text();
+            const doc = parser.parseFromString(docText, "text/html");
+            const element = doc.body.firstElementChild;
             if (!element) {
                 setModError("No root element found in template.");
                 return;
             }
-            let cssResult = await fetch(cssUri);
+            const cssResult = await fetch(cssUri);
             if (!cssResult.ok) {
                 setModError("Failed to load stylesheet: " + cssResult.statusText);
                 return;
             }
-            if (hostDivRef === null) {
+            if (hostDivRef === null || cancelled.value) {
                 return; // cancelled.
             }
 
-            let t = await cssResult.text();
-            let cssText = "<style id='mod-gui-style'>" + t + "</style>";
-            let cssDoc = parser.parseFromString(cssText, "text/html");
-            let cssElement = cssDoc.getElementById('mod-gui-style');
+            const t = await cssResult.text();
+            const cssText = "<style id='mod-gui-style'>" + t + "</style>";
+            const cssDoc = parser.parseFromString(cssText, "text/html");
+            const cssElement = cssDoc.getElementById('mod-gui-style');
             if (!cssElement) {
                 setModError("No style element found.");
                 return;
             }
-            if (hostDivRef === null) {
+            let scriptCallback: ModGuiScriptCallback | null = null;
+            let jquery: JQueryStatic | null = null;
+            if (scriptPromise) {
+                scriptCallback = await scriptPromise;
+                if (scriptCallback) {
+                    jquery = await loadJQuery();
+                }
+            }
+            if (hostDivRef === null || cancelled.value) {
                 return; // cancelled.
             }
             prepareElement(element);
             // add element to the hostDivRef
             hostDivRef.appendChild(cssElement);
             hostDivRef.appendChild(element);
-            let width = element.clientWidth;
-            let height = element.clientHeight;
+            if (scriptCallback && jquery) {
+                // After the controls are bound, and before measuring: the script may
+                // change the layout (e.g. select a tab).
+                bindModGuiScript(element as HTMLElement, scriptCallback, jquery, resourceUrl, queryParams);
+            }
+            const width = element.clientWidth;
+            const height = element.clientHeight;
             hostDivRef.style.width = width + "px";
             hostDivRef.style.height = height + "px";
             updateContentReady(true);
@@ -1514,40 +1576,51 @@ function ModGuiHost(props: ModGuiHostProps) {
     }
 
     React.useEffect(() => {
-        let tHostDivRef = hostDivRef;
-        if (ready) {
+        const tHostDivRef = hostDivRef;
+        const cancelled = { value: false };
+        if (ready && plugin.modGui) {
             if (hostDivRef !== null) {
-                requestContent();
+                requestContent(cancelled);
             }
         }
-        let stateHandler = (state: State) => {
+        const stateHandler = (state: State) => {
             setReady(state === State.Ready);
         }
         model.state.addOnChangedHandler(stateHandler)
 
 
         return () => {
+            cancelled.value = true;
             model.state.removeOnChangedHandler(stateHandler);
             
             if (tHostDivRef !== null) {
                 // unmount the custom content.
-                let children = tHostDivRef.children;
+                const children = tHostDivRef.children;
                 for (let i = children.length - 1; i >= 0; i--) {
-                    let child = children[i];
+                    const child = children[i];
                     if (child instanceof HTMLElement) {
                         child.remove();
                     }
                 }
             }
             updateContentReady(false);
-            let mc = modGuiControls;
+            const mc = modGuiControls;
             for (let i = 0; i < mc.length; i++) {
-                let modGuiControl = mc[i];
+                const modGuiControl = mc[i];
                 modGuiControl.onUnmount();
             }
             mc.length = 0; // Clear the controls array
         };
     }, [hostDivRef, plugin, ready]);
+
+    // After the hooks, which must run on every render.
+    if (!plugin.modGui) {
+        return (
+            <div>
+                <Typography variant="h6">No Mod GUI</Typography>
+            </div>
+        );
+    }
 
 
     return (
@@ -1607,7 +1680,7 @@ let modGuiPluginPreferences: ModGuiPluginPreference[] | null = null;
 
 function loadModGuiPreferences() {
     if (modGuiPluginPreferences === null) {
-        let prefs = window.localStorage.getItem("modGuiPluginPreferences");
+        const prefs = window.localStorage.getItem("modGuiPluginPreferences");
         try {
             if (prefs) {
                 modGuiPluginPreferences = JSON.parse(prefs);
@@ -1627,7 +1700,7 @@ export function getDefaultModGuiPreference(pluginUri: string) {
         modGuiPluginPreferences = [];
     }
     if (modGuiPluginPreferences) {
-        let preference = modGuiPluginPreferences.find(p => p.pluginUri === pluginUri);
+        const preference = modGuiPluginPreferences.find(p => p.pluginUri === pluginUri);
         if (preference) {
             return preference.useModGui;
         }
@@ -1642,7 +1715,7 @@ export function setDefaultModGuiPreference(pluginUri: string, useModGui: boolean
         modGuiPluginPreferences = [];
     }
 
-    let preference = modGuiPluginPreferences.find(p => p.pluginUri === pluginUri);
+    const preference = modGuiPluginPreferences.find(p => p.pluginUri === pluginUri);
     if (preference) {
         preference.useModGui = useModGui;
     } else {

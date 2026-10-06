@@ -127,6 +127,7 @@ namespace pipedal::impl {
         std::unique_ptr<SQLite::Statement> deleteFileQuery;
         std::unique_ptr<SQLite::Statement> updateThumbnailInfoQueryByName;
         std::unique_ptr<SQLite::Statement> updateThumbnailInfoQueryById;
+        std::unique_ptr<SQLite::Statement> deleteThumbnailsQuery;
         std::unique_ptr<SQLite::Statement> updatePositionQuery;
         std::filesystem::path path;
     };

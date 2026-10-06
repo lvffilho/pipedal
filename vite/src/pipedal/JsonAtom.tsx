@@ -19,22 +19,22 @@
 
 
 // Utility class for constructing Json atoms.
+// It wraps arbitrary JSON, so 'any' is the honest type here.
+/* eslint-disable @typescript-eslint/no-explicit-any */
 class JsonAtom {
 
-    static _Bool(value: boolean): any
+    // An atom:Bool is a plain JSON boolean (see AtomConverter::ToJson/ToForge).
+    static _Bool(value: boolean): JsonAtom
     {
-        return new JsonAtom({
-            "otype_": "Bool",
-            "value": value
-        });
+        return new JsonAtom(value);
     }
     isBool(): boolean
     {
-        return this.isObject() && this.json.otype_ === "Bool";
+        return typeof this.json === 'boolean';
     }
     asBool(): boolean {
         if (this.isBool()) {
-            return this.json.value as boolean;
+            return this.json as boolean;
         }
         throw new Error("JsonAtom is not a Bool");
     }
@@ -164,9 +164,9 @@ class JsonAtom {
         }
         return false;
     }
-    asObject(type?: string): Object {
+    asObject(type?: string): object {
         if (this.isObject(type)) {
-            return this.json as Object;
+            return this.json as object;
         }
         throw new Error(`JsonAtom is not an Object of type ${type}`);
     }   

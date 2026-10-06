@@ -24,8 +24,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
-#include <mutex>
+#include <cstddef>
+#include <cstdint>
 
 namespace pipedal
 {
@@ -33,140 +35,156 @@ namespace pipedal
     enum ProfileCategory
     {
         Init,
-        Read,
-        Driver,
-        Execute,
-        Write,
+        Read,    // time from the previous sample until PCM read returns (includes blocking wait).
+        Driver,  // driver-side processing (format conversion, mixing, VU). Counted once.
+        Execute, // DSP (AudioDriverHost::OnProcess).
+        Write,   // PCM write (where blocking occurs). Not counted as load.
 
         MaxCategory
     };
     constexpr size_t NUM_PROFILE_CATEGORIES = (size_t)ProfileCategory::MaxCategory;
 
-    class CpuUse
+    // Audio-thread-only writer; any thread may call GetCpuUse()/GetCpuOverhead()/GetSnapshot()
+    // (lock-free). Both values are published together in one atomic word, so a reader never
+    // sees the CPU use from one cycle paired with the overhead from another.
+    //
+    // DSP load = (Driver + Execute) time, i.e. PCM-read-return to write-start, as a percentage
+    // of the period duration (nframes / sampleRate). Overhead = Driver time as a percentage of
+    // the period. If no period has been set, the measured wall time of the cycles is used.
+    //
+    // A cycle with no samples at all (e.g. an input xrun that skipped the cycle) is ignored:
+    // it neither enters the average window nor changes the published values. The time spent
+    // recovering lands in the next Read sample, which is not counted as load.
+    template <typename ClockT = std::chrono::steady_clock>
+    class CpuUseT
     {
+    public:
+        using TimeT = typename ClockT::time_point;
+        using DurationT = typename ClockT::duration;
+        using SampleT = typename DurationT::rep;
 
     private:
-        using ClockT = std::chrono::steady_clock;
-        using TimeT = ClockT::time_point;
-        using DurationT = ClockT::duration;
-        using SampleT = DurationT::rep;
+        static constexpr size_t NUM_SAMPLES = 20; // average over N cycles.
 
-    public:
-        class CpuUseAverager
+        class Averager
         {
-        private:
-            static constexpr size_t NUM_SAMPLES = 20; // average over N samples.
-            SampleT sampleTotal = 0;
-            SampleT samples[NUM_SAMPLES];
-            size_t sampleIndex = 0;
+            SampleT total = 0;
+            SampleT samples[NUM_SAMPLES] = {};
+            size_t index = 0;
 
         public:
-
-            CpuUseAverager();
-
-            SampleT GetAverage() const
+            SampleT GetTotal() const { return total; }
+            void AddSample(SampleT sample)
             {
-                return sampleTotal / NUM_SAMPLES;
-            }
-            SampleT GetTotal() const {
-                return sampleTotal;
-            }
-            void AddSample(DurationT duration)
-            {
-                SampleT sample = duration.count();
-                sampleTotal = sampleTotal + sample-samples[sampleIndex];
-                samples[sampleIndex] = sample;
-                ++sampleIndex;
-                if (sampleIndex >= NUM_SAMPLES)
-                {
-                    sampleIndex = 0;
-                }
+                total += sample - samples[index];
+                samples[index] = sample;
+                if (++index >= NUM_SAMPLES)
+                    index = 0;
             }
         };
-    private:
 
-        std::mutex sync;
+        TimeT lastSample{};
+        DurationT period{}; // zero: unknown
+        Averager cycleTimes[NUM_PROFILE_CATEGORIES];
+        SampleT pending[NUM_PROFILE_CATEGORIES] = {}; // accumulated for the current cycle.
+        size_t cyclesCounted = 0;
 
-        TimeT lastSample;
+        // Two 16.16 fixed-point percentages: CPU use in the high 32 bits, overhead in the low 32.
+        static constexpr float FIXED_SCALE = 65536.0f;
+        static constexpr float MAX_PERCENT = 65535.0f;
+        std::atomic<uint64_t> currentSnapshot{0};
+        static_assert(std::atomic<uint64_t>::is_always_lock_free, "CpuUse snapshot must be lock-free on the audio thread");
 
-        CpuUseAverager profileTimes[NUM_PROFILE_CATEGORIES];
-        float currentCpuUse = 0;
-        float currentOverhead = 0;
-
-        CpuUseAverager &GetCategory(ProfileCategory category) {
-            return profileTimes[(size_t)category];
-        }
-        
-    public:
-
-        TimeT Now() {
-            return ClockT::now();
-        }
-        void SetStartTime(TimeT time)
+        static uint32_t ToFixed(float percent)
         {
-            lastSample = time;
+            if (!(percent > 0.0f)) // also catches NaN.
+                return 0;
+            if (percent >= MAX_PERCENT)
+                percent = MAX_PERCENT;
+            return (uint32_t)(percent * FIXED_SCALE + 0.5f);
         }
+        static float FromFixed(uint32_t value) { return (float)value / FIXED_SCALE; }
+
+    public:
+        struct Snapshot
+        {
+            float cpuUse = 0;
+            float overhead = 0;
+        };
+
+        static TimeT Now() { return ClockT::now(); }
+
+        // Duration of one audio period (nframes / sampleRate).
+        void SetPeriod(DurationT periodDuration) { period = periodDuration; }
+
+        void SetStartTime(TimeT time) { lastSample = time; }
+
         void AddSample(ProfileCategory category, TimeT time)
         {
-            profileTimes[(size_t)category].AddSample((time-lastSample));
+            pending[(size_t)category] += (SampleT)(time - lastSample).count();
             lastSample = time;
         }
-        void AddSample(ProfileCategory category) 
-        {
-            AddSample(category,Now());
-        }
+        void AddSample(ProfileCategory category) { AddSample(category, Now()); }
         void AddSample(ProfileCategory category, TimeT startTime, TimeT endTime)
         {
-            profileTimes[(size_t)category].AddSample((endTime-startTime));
+            pending[(size_t)category] += (SampleT)(endTime - startTime).count();
         }
 
-        void UpdateCpuUse() {
-            
-            SampleT readTime = GetCategory(ProfileCategory::Read).GetTotal();
-            SampleT writeTime = GetCategory(ProfileCategory::Driver).GetTotal();
-
-            SampleT processingTime = GetCategory(ProfileCategory::Execute).GetTotal() + GetCategory(ProfileCategory::Driver).GetTotal();
-
-            // most of the waiting occurs in the write. Assume that the difference between readTime and write Time is how long we spent waiting (i.e. free time)
-
-            SampleT waitTime;
-            SampleT overheadTime;
-            if (readTime > writeTime)
-            {
-                waitTime = readTime-writeTime;
-                overheadTime = writeTime;
-            } else {
-                waitTime = writeTime-readTime;
-                overheadTime = readTime;
-            }
-
-            SampleT totalTime = writeTime + readTime + processingTime;
-            SampleT maxTime = waitTime + processingTime;
-
-            float result = 0.0f;
-            float overhead = 0.0f;
-            if (maxTime != 0 && totalTime != 0)
-            {
-                result = 100.0f * (processingTime) / (maxTime);
-                overhead = 100.0f * (overheadTime * 2) / totalTime;
-            }
-
-            {
-                std::lock_guard lock{sync};
-                currentCpuUse = result;
-                currentOverhead = overhead;
-            }
-        }
-        float GetCpuUse() 
+        // Call once per audio cycle (e.g. at the top of the loop).
+        void UpdateCpuUse()
         {
-            std::lock_guard lock { sync};
-            return currentCpuUse;
+            bool any = false;
+            for (size_t i = 0; i < NUM_PROFILE_CATEGORIES; ++i)
+            {
+                if (pending[i] != 0)
+                {
+                    any = true;
+                    break;
+                }
+            }
+            if (!any)
+                return; // skipped cycle (xrun, or nothing measured yet).
+            for (size_t i = 0; i < NUM_PROFILE_CATEGORIES; ++i)
+            {
+                cycleTimes[i].AddSample(pending[i]);
+                pending[i] = 0;
+            }
+            if (cyclesCounted < NUM_SAMPLES)
+                ++cyclesCounted;
+
+            SampleT driver = cycleTimes[ProfileCategory::Driver].GetTotal();
+            SampleT processing = cycleTimes[ProfileCategory::Execute].GetTotal() + driver;
+
+            SampleT available;
+            if (period.count() > 0)
+            {
+                available = (SampleT)period.count() * (SampleT)cyclesCounted;
+            }
+            else
+            {
+                available = 0;
+                for (size_t i = 0; i < NUM_PROFILE_CATEGORIES; ++i)
+                    available += cycleTimes[i].GetTotal();
+            }
+            float result = 0.0f, overhead = 0.0f;
+            if (available > 0)
+            {
+                result = 100.0f * (float)processing / (float)available;
+                overhead = 100.0f * (float)driver / (float)available;
+            }
+            currentSnapshot.store(((uint64_t)ToFixed(result) << 32) | (uint64_t)ToFixed(overhead),
+                                  std::memory_order_relaxed);
         }
-        float GetCpuOverhead() 
+        // CPU use and overhead from the same cycle.
+        Snapshot GetSnapshot() const
         {
-            std::lock_guard lock { sync};
-            return currentOverhead;
+            uint64_t value = currentSnapshot.load(std::memory_order_relaxed);
+            return Snapshot{FromFixed((uint32_t)(value >> 32)), FromFixed((uint32_t)value)};
         }
+        float GetCpuUse() const { return GetSnapshot().cpuUse; }
+        float GetCpuOverhead() const { return GetSnapshot().overhead; }
     };
+
+    using CpuUse = CpuUseT<std::chrono::steady_clock>;
 
 }

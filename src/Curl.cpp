@@ -32,10 +32,28 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <cerrno>
 #include <signal.h>
 #include <algorithm>
 #include "Finally.hpp"
 #include "Lv2Log.hpp"
+#include <spawn.h>
+#include <cstring>
+
+extern char **environ;
+
+// posix_spawn_file_actions_addclosefrom_np() arrived in glibc 2.34. Without it (older glibc, or
+// another libc), curl inherits whatever descriptors the process holds without O_CLOEXEC; it
+// neither knows nor uses them, so that is a hygiene issue only.
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 34)
+#define PIPEDAL_HAVE_SPAWN_CLOSEFROM 1
+#endif
+#endif
+#ifndef PIPEDAL_HAVE_SPAWN_CLOSEFROM
+#define PIPEDAL_HAVE_SPAWN_CLOSEFROM 0
+#endif
 
 static const std::filesystem::path WEB_TEMP_DIR{"/var/pipedal/web_temp"};
 
@@ -43,15 +61,175 @@ static bool enableLogging = true;
 
 namespace pipedal
 {
+    static std::mutex tempDirectoryMutex;
+    static std::filesystem::path tempDirectory{WEB_TEMP_DIR};
+
+    void SetCurlTempDirectory(const std::filesystem::path &directory)
+    {
+        std::lock_guard<std::mutex> lock(tempDirectoryMutex);
+        tempDirectory = directory;
+    }
+    std::filesystem::path GetCurlTempDirectory()
+    {
+        std::lock_guard<std::mutex> lock(tempDirectoryMutex);
+        return tempDirectory;
+    }
+
+    // Runs curl as its own process (not popen, no shell) so that a CurlCancellation can kill it.
+    // `args` are curl's arguments, one per element.
+    class CurlProcess
+    {
+    public:
+        static SysExecOutput Run(const std::vector<std::string> &args, CurlCancellation *cancellation)
+        {
+            // Uncancellable requests take the same path (with a private cancellation nobody can
+            // reach), so that they too get the descriptor hygiene below.
+            CurlCancellation uncancellable;
+            CurlCancellation &c = cancellation != nullptr ? *cancellation : uncancellable;
+            std::vector<char *> argv;
+            argv.push_back((char *)"/usr/bin/curl");
+            for (const std::string &arg : args)
+            {
+                argv.push_back((char *)arg.c_str());
+            }
+            argv.push_back(nullptr);
+
+            int fds[2];
+            if (::pipe2(fds, O_CLOEXEC) != 0)
+            {
+                throw std::runtime_error("Unable to exec curl.");
+            }
+            pid_t pid = -1;
+            {
+                // Spawn under the lock: a concurrent Cancel() either sees this pid or happened first.
+                std::lock_guard<std::mutex> lock(c.mutex);
+                if (c.cancelled)
+                {
+                    ::close(fds[0]);
+                    ::close(fds[1]);
+                    throw std::runtime_error("Request cancelled.");
+                }
+                posix_spawn_file_actions_t actions;
+                int rc = posix_spawn_file_actions_init(&actions);
+                if (rc == 0)
+                {
+                    // stdout and stderr into the pipe (the dup2'd copies lose O_CLOEXEC).
+                    rc = posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+                    if (rc == 0)
+                        rc = posix_spawn_file_actions_adddup2(&actions, fds[1], STDERR_FILENO);
+#if PIPEDAL_HAVE_SPAWN_CLOSEFROM
+                    // Then close everything else, so curl doesn't inherit descriptors that other
+                    // threads opened without O_CLOEXEC (the web server's listening sockets, ...).
+                    // After the dup2s, so stdout/stderr survive; fds[1] (>= 3) is closed here.
+                    if (rc == 0)
+                        rc = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+#endif
+                    if (rc == 0)
+                        rc = posix_spawn(&pid, "/usr/bin/curl", &actions, nullptr, argv.data(), environ);
+                    posix_spawn_file_actions_destroy(&actions);
+                }
+                ::close(fds[1]);
+                if (rc != 0)
+                {
+                    ::close(fds[0]);
+                    throw std::runtime_error(SS("Unable to exec curl. (" << strerror(rc) << ")"));
+                }
+                c.pids.push_back((int)pid);
+            }
+            std::string output;
+            char buffer[512];
+            while (true)
+            {
+                ssize_t n = ::read(fds[0], buffer, sizeof(buffer));
+                if (n < 0 && errno == EINTR)
+                    continue;
+                if (n <= 0)
+                    break;
+                output.append(buffer, (size_t)n);
+            }
+            ::close(fds[0]);
+            // Wait without reaping, so that the pid can't be reused while Cancel() may still signal it.
+            siginfo_t info;
+            while (::waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT) != 0 && errno == EINTR)
+            {
+            }
+            bool cancelled;
+            {
+                std::lock_guard<std::mutex> lock(c.mutex);
+                c.pids.erase(std::remove(c.pids.begin(), c.pids.end(), (int)pid), c.pids.end());
+                cancelled = c.cancelled;
+            }
+            int status = 0;
+            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR)
+            {
+            }
+            if (cancelled)
+            {
+                throw std::runtime_error("Request cancelled.");
+            }
+            return SysExecOutput{.exitCode = status, .output = std::move(output)};
+        }
+    };
+
+    void CurlCancellation::Cancel()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        cancelled = true;
+        for (int pid : pids)
+        {
+            ::kill((pid_t)pid, SIGTERM);
+        }
+    }
+
+    bool CurlCancellation::IsCancelled()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return cancelled;
+    }
+
 
     static void logHeaders(const std::vector<std::string> &headers)
     {
         if (enableLogging)
         {
-            std::ofstream os{"/tmp/PipedalCurl.log"};
+            // The headers may carry a bearer token: owner-only file, never through a symlink,
+            // and never into a file someone else pre-created in /tmp.
+            int fd = ::open("/tmp/PipedalCurl.log", O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+            if (fd < 0)
+            {
+                return;
+            }
+            Finally closeFd{[fd]()
+                            { ::close(fd); }};
+            struct stat st;
+            if (::fstat(fd, &st) != 0 || st.st_uid != ::geteuid() || !S_ISREG(st.st_mode) || st.st_nlink != 1)
+            {
+                return;
+            }
+            ::fchmod(fd, 0600); // in case it already existed with wider permissions.
+            if (::ftruncate(fd, 0) != 0)
+            {
+                return;
+            }
+            std::string text;
             for (const auto &header : headers)
             {
-                os << header << "\n";
+                text += header;
+                text += "\n";
+            }
+            const char *p = text.data();
+            size_t remaining = text.size();
+            while (remaining > 0)
+            {
+                ssize_t n = ::write(fd, p, remaining);
+                if (n < 0)
+                {
+                    if (errno == EINTR)
+                        continue;
+                    break;
+                }
+                p += n;
+                remaining -= (size_t)n;
             }
         }
     }
@@ -302,7 +480,7 @@ namespace pipedal
         std::vector<std::string> *outputHeadersOpt,
         const std::vector<std::string> *inputHeadersOpt)
     {
-        TemporaryFile tempFile{WEB_TEMP_DIR};
+        TemporaryFile tempFile{GetCurlTempDirectory()};
         int rc = CurlGet(url, tempFile.Path(), outputHeadersOpt, inputHeadersOpt);
         if (rc == 200)
         {
@@ -328,7 +506,7 @@ namespace pipedal
         std::vector<std::string> *outputHeadersOpt,
         const std::vector<std::string> *inputHeadersOpt)
     {
-        TemporaryFile tempFile{WEB_TEMP_DIR};
+        TemporaryFile tempFile{GetCurlTempDirectory()};
         int rc = CurlGet(url, tempFile.Path(), outputHeadersOpt, inputHeadersOpt);
 
         std::ifstream inputStream(tempFile.Path(), std::ios::binary);
@@ -349,14 +527,35 @@ namespace pipedal
         return rc;
     }
 
-    int CurlGet(
+    static void WriteHeadersFile(const std::filesystem::path &path, const std::vector<std::string> &headers)
+    {
+        std::ofstream f{path}; // TemporaryFile created it 0600; truncating keeps the mode.
+        if (!f)
+        {
+            throw std::runtime_error(SS("Can't open file " << path));
+        }
+        for (const std::string &header : headers)
+        {
+            if (header.find_first_of("\r\n") != std::string::npos)
+            {
+                throw std::runtime_error("Invalid HTTP header.");
+            }
+            f << header << "\n";
+        }
+    }
+
+    // A body-less request (GET, or the method given) whose response body goes to outputPath.
+    static int CurlNoBodyRequest(
+        const char *method, // nullptr: GET.
         const std::string &url,
         const std::filesystem::path &outputPath,
         std::vector<std::string> *outputHeadersOpt,
-        const std::vector<std::string> *inputHeadersOpt)
+        const std::vector<std::string> *inputHeadersOpt,
+        int maxTimeSeconds,
+        CurlCancellation *cancellation)
     {
 
-        TemporaryFile headersFile{WEB_TEMP_DIR};
+        TemporaryFile headersFile{GetCurlTempDirectory()};
 
         std::vector<std::string> defaultHeaders;
         if (outputHeadersOpt == nullptr)
@@ -366,22 +565,29 @@ namespace pipedal
 
         bool bResult = true;
 
-        std::stringstream ssArgs;
+        std::vector<std::string> args;
 
-        if (inputHeadersOpt)
+        // Request headers go through a 0600 file (-H @file), not argv, so that
+        // credentials (Authorization: Bearer ...) don't show up in ps.
+        TemporaryFile inputHeadersFile;
+        if (inputHeadersOpt && !inputHeadersOpt->empty())
         {
-            for (const std::string &header : *inputHeadersOpt)
-            {
-                ssArgs << "-H " << ShellEscape(header) << " ";
-            }
+            inputHeadersFile = TemporaryFile{GetCurlTempDirectory()};
+            WriteHeadersFile(inputHeadersFile.Path(), *inputHeadersOpt);
+            args.insert(args.end(), {"-H", SS("@" << inputHeadersFile.Path().string())});
+        }
+        if (maxTimeSeconds > 0)
+        {
+            args.insert(args.end(), {"--max-time", std::to_string(maxTimeSeconds)});
         }
 
-        ssArgs << "-s -L -D " << ShellEscape(headersFile.Path().c_str())
-               << " " << ShellEscape(url)
-               << " -o " << ShellEscape(outputPath.c_str());
+        if (method != nullptr)
+        {
+            args.insert(args.end(), {"-X", method});
+        }
+        args.insert(args.end(), {"-s", "-L", "-D", headersFile.Path().string(), url, "-o", outputPath.string()});
 
-        std::string args = ssArgs.str();
-        auto curlOutput = sysExecForOutput("/usr/bin/curl", args);
+        auto curlOutput = CurlProcess::Run(args, cancellation);
 
         if (outputHeadersOpt != nullptr)
         {
@@ -431,6 +637,38 @@ namespace pipedal
         int errorCode = checkCurlHttpResponse(*outputHeadersOpt);
 
         return errorCode;
+    }
+
+    int CurlGet(
+        const std::string &url,
+        const std::filesystem::path &outputPath,
+        std::vector<std::string> *outputHeadersOpt,
+        const std::vector<std::string> *inputHeadersOpt,
+        int maxTimeSeconds,
+        CurlCancellation *cancellation)
+    {
+        return CurlNoBodyRequest(nullptr, url, outputPath, outputHeadersOpt, inputHeadersOpt, maxTimeSeconds, cancellation);
+    }
+
+    int CurlRequest(
+        const std::string &method,
+        const std::string &url,
+        const std::filesystem::path &outputPath,
+        std::vector<std::string> *outputHeadersOpt,
+        const std::vector<std::string> *inputHeadersOpt,
+        int maxTimeSeconds,
+        CurlCancellation *cancellation)
+    {
+        // Fixed set: the method is pasted into the curl command line.
+        static const char *const METHODS[] = {"GET", "PUT", "DELETE"};
+        for (const char *m : METHODS)
+        {
+            if (method == m)
+            {
+                return CurlNoBodyRequest(method == "GET" ? nullptr : m, url, outputPath, outputHeadersOpt, inputHeadersOpt, maxTimeSeconds, cancellation);
+            }
+        }
+        throw std::invalid_argument(SS("Unsupported HTTP method: " << method));
     }
 
     static int curlExec(
@@ -670,7 +908,7 @@ namespace pipedal
         int lastStatusCode = 200;
 
         // Create temporary file for curl config
-        TemporaryFile configFile{WEB_TEMP_DIR};
+        TemporaryFile configFile{GetCurlTempDirectory()};
 
         // Write curl config file with URL and output pairs
         {
@@ -812,9 +1050,11 @@ namespace pipedal
         const std::filesystem::path &inputPath,
         const std::filesystem::path &outputPath,
         std::vector<std::string> *outputHeadersOpt,
-        std::vector<std::string> *inputHeadersOpt)
+        std::vector<std::string> *inputHeadersOpt,
+        int maxTimeSeconds,
+        CurlCancellation *cancellation)
     {
-        TemporaryFile headersFile{WEB_TEMP_DIR};
+        TemporaryFile headersFile{GetCurlTempDirectory()};
 
         std::vector<std::string> defaultHeaders;
         if (outputHeadersOpt == nullptr)
@@ -824,26 +1064,27 @@ namespace pipedal
 
         bool bResult = true;
 
-        std::stringstream ssArgs;
+        std::vector<std::string> args;
 
-        if (inputHeadersOpt)
+        // Request headers go through a 0600 file (-H @file), not argv, so that
+        // credentials (Authorization: Bearer ...) don't show up in ps.
+        TemporaryFile inputHeadersFile;
+        if (inputHeadersOpt && !inputHeadersOpt->empty())
         {
-            for (const std::string &header : *inputHeadersOpt)
-            {
-                ssArgs << "-H " << ShellEscape(header) << " ";
-            }
+            inputHeadersFile = TemporaryFile{GetCurlTempDirectory()};
+            WriteHeadersFile(inputHeadersFile.Path(), *inputHeadersOpt);
+            args.insert(args.end(), {"-H", SS("@" << inputHeadersFile.Path().string())});
         }
-        ssArgs << "-s -L -X POST --data-binary "
-               << SS("@" << inputPath.c_str()).c_str()
-               << " -D " << ShellEscape(headersFile.Path().c_str());
+        if (maxTimeSeconds > 0)
+        {
+            args.insert(args.end(), {"--max-time", std::to_string(maxTimeSeconds)});
+        }
+        args.insert(args.end(), {"-s", "-L", "-X", "POST",
+                                 "--data-binary", SS("@" << inputPath.string()),
+                                 "-D", headersFile.Path().string(),
+                                 url, "-o", outputPath.string()});
 
-        std::string args = ssArgs.str();
-
-
-        args += SS(" " << ShellEscape(url)
-                       << " -o " << ShellEscape(outputPath.c_str()));
-
-        auto curlOutput = sysExecForOutput("/usr/bin/curl", args);
+        auto curlOutput = CurlProcess::Run(args, cancellation);
 
         if (outputHeadersOpt != nullptr)
         {
@@ -900,9 +1141,11 @@ namespace pipedal
         const std::string &body,
         std::string &outputBody,
         std::vector<std::string> *outputHeadersOpt,
-        std::vector<std::string> *inputHeadersOpt)
+        std::vector<std::string> *inputHeadersOpt,
+        int maxTimeSeconds,
+        CurlCancellation *cancellation)
     {
-        TemporaryFile inputFile(WEB_TEMP_DIR);
+        TemporaryFile inputFile(GetCurlTempDirectory());
         {
             std::ofstream f{inputFile.Path()};
             if (!f.is_open())
@@ -911,8 +1154,8 @@ namespace pipedal
             }
             f << body;
         }
-        TemporaryFile outputFile(WEB_TEMP_DIR);
-        int result = CurlPostFile(url, inputFile.Path(), outputFile.Path(), outputHeadersOpt, inputHeadersOpt);
+        TemporaryFile outputFile(GetCurlTempDirectory());
+        int result = CurlPostFile(url, inputFile.Path(), outputFile.Path(), outputHeadersOpt, inputHeadersOpt, maxTimeSeconds, cancellation);
 
         std::ifstream outputStream(outputFile.Path());
         if (outputStream)

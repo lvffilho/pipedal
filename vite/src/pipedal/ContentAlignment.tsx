@@ -30,7 +30,13 @@ const CONTENT_ALIGNMENT_STORAGE_KEY = "com.twoplay.pipedal.content_alignment";
 const DEFAULT_CONTENT_ALIGNMENT = ContentAlignment.Center;
 
 function readStoredContentAlignment(): ContentAlignment {
-    switch (localStorage.getItem(CONTENT_ALIGNMENT_STORAGE_KEY)) {
+    let stored: string | null = null;
+    try {
+        stored = localStorage.getItem(CONTENT_ALIGNMENT_STORAGE_KEY);
+    } catch (e) {
+        // storage unavailable (privacy mode, etc.): use default.
+    }
+    switch (stored) {
         case ContentAlignment.Start:
             return ContentAlignment.Start;
         case ContentAlignment.Center:
@@ -49,6 +55,10 @@ export function getContentAlignment(): ContentAlignment {
 }
 
 export function setContentAlignment(value: ContentAlignment): void {
-    localStorage.setItem(CONTENT_ALIGNMENT_STORAGE_KEY, value);
+    try {
+        localStorage.setItem(CONTENT_ALIGNMENT_STORAGE_KEY, value);
+    } catch (e) {
+        // storage unavailable: preference lasts for this session only.
+    }
     contentAlignmentProperty.set(value);
 }

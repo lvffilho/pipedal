@@ -19,6 +19,7 @@
 
 #include "HtmlHelper.hpp"
 #include <sstream>
+#include <iterator>
 #include <string>
 #include <cstring>
 #include "ss.hpp"
@@ -165,7 +166,7 @@ std::string HtmlHelper::decode_url_segment(const char *pStart, const char *pEnd,
         }
         else
         {
-            if (pStart + 2 < pEnd)
+            if (pEnd - p >= 2)
             {
                 char c1 = *p;
                 ++p;
@@ -180,6 +181,132 @@ std::string HtmlHelper::decode_url_segment(const char *pStart, const char *pEnd,
         }
     }
     return s.str();
+}
+
+bool HtmlHelper::IsSafePathSegment(const std::string &segment)
+{
+    if (segment.empty() || segment == "." || segment == "..")
+    {
+        return false;
+    }
+    for (char c : segment)
+    {
+        if (c == '/' || c == '\\' || c == '\0')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool HtmlHelper::IsPathUnderRoot(
+    const std::filesystem::path &root,
+    const std::filesystem::path &path)
+{
+    try
+    {
+        return IsPathUnderCanonicalRoot(std::filesystem::weakly_canonical(root), path);
+    }
+    catch (const std::exception &)
+    {
+        return false;
+    }
+}
+
+bool HtmlHelper::IsPathUnderCanonicalRoot(
+    const std::filesystem::path &canonicalRoot,
+    const std::filesystem::path &path)
+{
+    try
+    {
+        std::filesystem::path canonicalPath = std::filesystem::weakly_canonical(path);
+        if (canonicalPath != canonicalRoot)
+        {
+            // must be strictly inside the root (component-wise, not string prefix).
+            auto iRoot = canonicalRoot.begin();
+            auto iPath = canonicalPath.begin();
+            for (; iRoot != canonicalRoot.end(); ++iRoot, ++iPath)
+            {
+                if (iPath == canonicalPath.end() || *iRoot != *iPath)
+                {
+                    if (*iRoot == "" && std::next(iRoot) == canonicalRoot.end())
+                    {
+                        break; // root had a trailing slash
+                    }
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    catch (const std::exception &)
+    {
+        return false;
+    }
+}
+
+bool HtmlHelper::IsParentDirectoryUnderRoot(
+    const std::filesystem::path &root,
+    const std::filesystem::path &path)
+{
+    auto name = path.filename();
+    if (name.empty() || name == "." || name == "..")
+    {
+        return false;
+    }
+    return IsPathUnderRoot(root, path.parent_path());
+}
+
+static bool ResolveSegments(
+    const std::filesystem::path &root,
+    const std::vector<std::string> &segments,
+    std::filesystem::path *result,
+    bool rootIsCanonical)
+{
+    for (const auto &segment : segments)
+    {
+        if (!HtmlHelper::IsSafePathSegment(segment))
+        {
+            return false;
+        }
+    }
+    try
+    {
+        std::filesystem::path path = root;
+        for (const auto &segment : segments)
+        {
+            path /= segment;
+        }
+        bool inside = rootIsCanonical
+                          ? HtmlHelper::IsPathUnderCanonicalRoot(root, path)
+                          : HtmlHelper::IsPathUnderRoot(root, path);
+        if (!inside)
+        {
+            return false;
+        }
+        *result = std::move(path);
+        return true;
+    }
+    catch (const std::exception &)
+    {
+        return false;
+    }
+}
+
+bool HtmlHelper::TryResolveUnderRoot(
+    const std::filesystem::path &root,
+    const std::vector<std::string> &segments,
+    std::filesystem::path *result)
+{
+    return ResolveSegments(root, segments, result, false);
+}
+
+bool HtmlHelper::TryResolveUnderCanonicalRoot(
+    const std::filesystem::path &canonicalRoot,
+    const std::vector<std::string> &segments,
+    std::filesystem::path *result)
+{
+    return ResolveSegments(canonicalRoot, segments, result, true);
 }
 
 std::string HtmlHelper::decode_url_segment(const char *text, bool isQuery)

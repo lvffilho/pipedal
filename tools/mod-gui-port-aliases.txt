@@ -1,0 +1,46 @@
+# Port aliases for tools/install-mod-guis.sh.
+#
+# MOD's GUIs were written for MOD's builds of the plugins. When a GUI refers to a
+# port that the installed plugin doesn't have (a typo in MOD's description that was
+# fixed since, or a port that was renamed between plugin versions), the installer
+# looks here for the installed port to use instead:
+#
+#     <plugin URI> <symbol in the MOD GUI> <installed symbol, or - to hide the control>  # reason
+#
+# Without an entry here, the installer maps a port only when the match is
+# unambiguous (see docs/ModUiSupport.md), and otherwise hides the control. Each
+# entry below was checked against MOD's description of the plugin (mod-lv2-data
+# 3c6ebef7) and that of the Ubuntu 26.04 packages (fomp 1.2.4, x42-plugins
+# 20251025, guitarix-lv2 0.47.0): index, name and range of the port, and the GUI's
+# label for it.
+
+# fomp: typos in MOD's description; index, name and range are the same.
+http://drobilla.net/plugins/fomp/mvchpf1 exp_gm_gain exp_fm_gain  # typo: index 6 "Exp FM gain", 0..10
+http://drobilla.net/plugins/fomp/rec_vco lp_filrer lp_filter  # typo: index 12 "LP filter", 0..1
+
+# x42 midifilter: the channel selector's value display says 'channel', the selector
+# itself 'channelf'. Neither build has a port 'channel'; 'channelf' is "Filter Channel".
+http://gareus.org/oss/lv2/midifilter#miditranspose channel channelf  # typo in MOD's template
+http://gareus.org/oss/lv2/midifilter#monolegato channel channelf  # typo in MOD's template
+http://gareus.org/oss/lv2/midifilter#nodup channel channelf  # typo in MOD's template
+
+# Guitarix Echo Cat: ports renamed; the installed plugin has a BPM port the GUI lacks.
+http://guitarix.sourceforge.net/plugins/gxechocat#echocat input_gain input  # index 0 "Input Gain" / "Input", 0..1 in both
+http://guitarix.sourceforge.net/plugins/gxechocat#echocat outputgain output  # index 3 "OutputGain" / "Output" (0..1 in MOD's build, 0..4 here)
+
+# Guitarix Tilt Tone: MOD's build had drive, gain and tone; 0.47.0 has body, tone,
+# drive and level. MOD's GUI labels 'gain' "Level": the output level.
+http://guitarix.sourceforge.net/plugins/gxtilttone#tilttone gain level  # GUI label "Level"; "Level" is the output level here
+
+# Guitarix Tube Delay: MOD's build has Faust slider symbols; their lv2:names (and
+# the GUI's labels) name the installed ports. 0.47.0 adds an output port.
+http://guitarix.sourceforge.net/plugins/gxtubedelay#tubedelay fslider0_ drive  # lv2:name "gain", GUI label "Drive"
+http://guitarix.sourceforge.net/plugins/gxtubedelay#tubedelay fslider1_ feedback  # lv2:name "feedback"
+http://guitarix.sourceforge.net/plugins/gxtubedelay#tubedelay fslider2_ delay  # lv2:name "delay"
+http://guitarix.sourceforge.net/plugins/gxtubedelay#tubedelay fslider3_ level  # lv2:name "level"
+
+# Guitarix Tube Tremelo and Tube Vibrato: MOD's 'gain' ("Gain", in dB, -12..22,
+# GUI label "Level") is the output level. In 0.47.0 that is 'output' (in dB:
+# ba.db2linear in the Faust source); 'drive' (0..1) is a new tube-drive control.
+http://guitarix.sourceforge.net/plugins/gxtubetremelo#tubetremelo gain output  # output level in dB, GUI label "Level"
+http://guitarix.sourceforge.net/plugins/gxtubevibrato#tubevibrato gain output  # output level in dB, GUI label "Level"

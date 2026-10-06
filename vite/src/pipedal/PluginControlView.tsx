@@ -82,10 +82,10 @@ interface SideChainSelectItem {
 }
 
 function makeIoPluginInfo(name: string, uri: string): UiPlugin {
-    let result = new UiPlugin();
+    const result = new UiPlugin();
     result.name = name;
     result.uri = uri;
-    let volumeControl = new UiControl();
+    const volumeControl = new UiControl();
     volumeControl.name = "Volume";
     volumeControl.symbol = "volume_db";
     volumeControl.index = 0;
@@ -203,6 +203,18 @@ const styles = (theme: Theme) => createStyles({
         background: theme.mainBackground,
         zIndex: 3
 
+    }),
+
+    // Shown when a plugin has nothing to display (e.g. its only control port is the bypass
+    // port, which is shown as the enable switch in the title bar instead).
+    noControlsMessage: css({
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        textAlign: "center",
+        height: "100%",
+        paddingLeft: 48,
+        paddingRight: 48,
     }),
 
     noScrollGrid: css({
@@ -439,7 +451,7 @@ const PluginControlView =
                 this.model.setPedalboardControl(this.props.instanceId, key, value);
             }
 
-            onPedalboardChanged(value?: Pedalboard) {
+            onPedalboardChanged() {
                 //let item = this.model.pedalboard.get().maybeGetItem(this.props.instanceId);
                 //this.setState({ pedalboardItem: item });
             }
@@ -466,11 +478,11 @@ const PluginControlView =
                 this.setState({ landscapeGrid: height < LANDSCAPE_HEIGHT_BREAK });
             }
             filterNotOnGui(controlValues: ControlValue[], uiPlugin: UiPlugin): ControlValue[] {
-                let result: ControlValue[] = [];
+                const result: ControlValue[] = [];
 
                 for (let i = 0; i < controlValues.length; ++i) {
-                    let controlValue = controlValues[i];
-                    let control = uiPlugin.getControl(controlValue.key);
+                    const controlValue = controlValues[i];
+                    const control = uiPlugin.getControl(controlValue.key);
                     if (control && !control.isHidden()) {
                         result.push(controlValue);
                     }
@@ -479,7 +491,6 @@ const PluginControlView =
             }
 
             requestImeEdit(uiControl: UiControl, value: number) {
-                // eslint-disable-next-line no-restricted-globals
 
                 this.setState({
                     imeUiControl: uiControl,
@@ -514,7 +525,7 @@ const PluginControlView =
 
 
             makeStandardControl(uiControl: UiControl, controlValues: ControlValue[], options?: { slimmableWeights?: number[] }): ReactNode {
-                let symbol = uiControl.symbol;
+                const symbol = uiControl.symbol;
                 if (!uiControl.is_input) {
                     return (
                         <PluginOutputControl key={uiControl.symbol} instanceId={this.props.instanceId} uiControl={uiControl} 
@@ -537,7 +548,7 @@ const PluginControlView =
                     <PluginControl key={"ppc" + uiControl.symbol} instanceId={this.props.instanceId} uiControl={uiControl} value={controlValue.value}
                         onChange={(value: number) => { this.onControlValueChanged(controlValue!.key, value) }}
                         onPreviewChange={(value: number) => { this.onPreviewChange(controlValue!.key, value) }}
-                        requestIMEEdit={(uiControl: any, value: any) => this.requestImeEdit(uiControl, value)}
+                        requestIMEEdit={(uiControl: UiControl, value: number) => this.requestImeEdit(uiControl, value)}
                         options={options}
 
                     />
@@ -557,10 +568,10 @@ const PluginControlView =
                 // combine lamps with their previous control
                 if ((pluginControl.isLamp() || pluginControl.isDbVu()) && controls.length !== 0) {
                     const classes = withStyles.getClasses(this.props);
-                    let newControl = this.makeStandardControl(pluginControl, controlValues);
-                    let previousControl = controls[controls.length - 1];
+                    const newControl = this.makeStandardControl(pluginControl, controlValues);
+                    const previousControl = controls[controls.length - 1];
                     if (!(previousControl instanceof ControlGroup)) {
-                        let pair = (
+                        const pair = (
                             <div key={"k" + this.ixKey++} className={classes.controlPair}>
                                 {previousControl as ReactNode}
                                 {newControl}
@@ -585,24 +596,24 @@ const PluginControlView =
             }
 
             private getSidechainSelectItems(): SideChainSelectItem[] {
-                let myInstanceId = this.props.item.instanceId;
+                const myInstanceId = this.props.item.instanceId;
 
-                let items: SideChainSelectItem[] = [];
+                const items: SideChainSelectItem[] = [];
                 items.push({ instanceId: -1, title: "None" });
                 items.push({ instanceId: -2, title: "Input" });
 
-                let pedalboard = this.model.pedalboard.get();
+                const pedalboard = this.model.pedalboard.get();
                 if (!pedalboard) return items;
 
-                let it = pedalboard.itemsGenerator();
+                const it = pedalboard.itemsGenerator();
 
                 let found = false;
                 while (true) {
-                    let v = it.next();
+                    const v = it.next();
                     if (v.done) {
                         break;
                     }
-                    let pedalboardItem = v.value;
+                    const pedalboardItem = v.value;
                     if (pedalboardItem.isSplit()) {
                         continue;
                     }
@@ -613,7 +624,7 @@ const PluginControlView =
                     if (pedalboardItem.uri.length === 0) {
                         continue;
                     }
-                    let pluginInfo = this.model.getUiPlugin(pedalboardItem.uri);
+                    const pluginInfo = this.model.getUiPlugin(pedalboardItem.uri);
                     if (!pluginInfo) continue;
                     let name = pluginInfo.name;
                     if (pedalboardItem.title.length !== 0) {
@@ -628,9 +639,9 @@ const PluginControlView =
             }
 
             private makeSideChainSelect(uiPlugin: UiPlugin) {
-                let items = this.getSidechainSelectItems();
-                let selectedInstanceId = this.props.item.sideChainInputId;
-                let title = uiPlugin.audio_side_chain_title ? uiPlugin.audio_side_chain_title : "Side chain";
+                const items = this.getSidechainSelectItems();
+                const selectedInstanceId = this.props.item.sideChainInputId;
+                const title = uiPlugin.audio_side_chain_title ? uiPlugin.audio_side_chain_title : "Side chain";
 
                 return (
                     <SideChainSelectControl
@@ -650,13 +661,13 @@ const PluginControlView =
                 return this.state.landscapeGrid;
             }
             renderControlGroup(controlGroup: ControlGroup, key: string): ReactNode {
-                let isLandscapeGrid = this.state.landscapeGrid;
+                const isLandscapeGrid = this.state.landscapeGrid;
 
                 const classes = withStyles.getClasses(this.props);
 
-                let controls: ReactNode[] = [];
+                const controls: ReactNode[] = [];
                 for (let j = 0; j < controlGroup.controls.length; ++j) {
-                    let item = controlGroup.controls[j];
+                    const item = controlGroup.controls[j];
                     controls.push(
                         (
                             <div key={"cgctlx" + j} className={classes.controlPadding}>
@@ -688,17 +699,17 @@ const PluginControlView =
                 );
             }
             getStandardControlNodes(plugin: UiPlugin, controlValues: ControlValue[]): ControlNodes {
-                let result: ControlNodes = [];
-                let portGroupMap: { [id: string]: ControlGroup } = {};
+                const result: ControlNodes = [];
+                const portGroupMap: { [id: string]: ControlGroup } = {};
 
                 for (let i = 0; i < plugin.controls.length; ++i) {
                     let pluginControl = plugin.controls[i];
                     if (!pluginControl.isHidden()) {
                         if (pluginControl.port_group !== "" && plugin.getPortGroupBySymbol(pluginControl.port_group)) {
-                            let portGroup = nullCast(plugin.getPortGroupBySymbol(pluginControl.port_group));
+                            const portGroup = nullCast(plugin.getPortGroupBySymbol(pluginControl.port_group));
 
-                            let groupControls: ReactNode[] = [];
-                            let indexes: number[] = [];
+                            const groupControls: ReactNode[] = [];
+                            const indexes: number[] = [];
                             groupControls.push(
                                 this.makeStandardControl(pluginControl, controlValues)
                             );
@@ -712,7 +723,7 @@ const PluginControlView =
                                     indexes.push(pluginControl.index);
                                 }
                             }
-                            let controlGroup = new ControlGroup(portGroup.name, indexes, groupControls);
+                            const controlGroup = new ControlGroup(portGroup.name, indexes, groupControls);
                             result.push(
                                 controlGroup
                             )
@@ -744,12 +755,12 @@ const PluginControlView =
                     );
                 }
                 for (let i = 0; i < plugin.fileProperties.length; ++i) {
-                    let fileProperty = plugin.fileProperties[i];
-                    let filePropertyUi = this.makeFilePropertyUI(fileProperty);
+                    const fileProperty = plugin.fileProperties[i];
+                    const filePropertyUi = this.makeFilePropertyUI(fileProperty);
 
                     if (fileProperty.portGroup !== "" && plugin.getPortGroupByUri(fileProperty.portGroup)) {
-                        let portGroup = nullCast(plugin.getPortGroupByUri(fileProperty.portGroup));
-                        let controlGroup = portGroupMap[portGroup.symbol];
+                        const portGroup = nullCast(plugin.getPortGroupByUri(fileProperty.portGroup));
+                        const controlGroup = portGroupMap[portGroup.symbol];
                         if (controlGroup) {
                             let insertPosition = controlGroup.indexes.length;
                             if (fileProperty.index !== -1) {
@@ -760,13 +771,13 @@ const PluginControlView =
                                     }
                                 }
                             }
-                            let index = fileProperty.index !== -1 ? fileProperty.index : 100;
+                            const index = fileProperty.index !== -1 ? fileProperty.index : 100;
                             controlGroup.controls.splice(insertPosition, 0, filePropertyUi);
                             controlGroup.indexes.splice(insertPosition, 0, index);
 
                         } else {
-                            let index = fileProperty.index !== -1 ? fileProperty.index : 100;
-                            let controlGroup = new ControlGroup(
+                            const index = fileProperty.index !== -1 ? fileProperty.index : 100;
+                            const controlGroup = new ControlGroup(
                                 portGroup.name,
                                 [index],
                                 [filePropertyUi]);
@@ -785,12 +796,12 @@ const PluginControlView =
                     }
                 }
                 for (let i = 0; i < plugin.frequencyPlots.length; ++i) {
-                    let frequencyPlot = plugin.frequencyPlots[i];
-                    let frequencyPlotUi = this.makeFrequencyPlotUI(frequencyPlot);
+                    const frequencyPlot = plugin.frequencyPlots[i];
+                    const frequencyPlotUi = this.makeFrequencyPlotUI(frequencyPlot);
 
                     if (frequencyPlot.portGroup !== "" && plugin.getPortGroupByUri(frequencyPlot.portGroup)) {
-                        let portGroup = nullCast(plugin.getPortGroupByUri(frequencyPlot.portGroup));
-                        let controlGroup = portGroupMap[portGroup.symbol];
+                        const portGroup = nullCast(plugin.getPortGroupByUri(frequencyPlot.portGroup));
+                        const controlGroup = portGroupMap[portGroup.symbol];
                         if (controlGroup) {
                             let insertPosition = controlGroup.indexes.length;
                             if (frequencyPlot.index !== -1) {
@@ -801,13 +812,13 @@ const PluginControlView =
                                     }
                                 }
                             }
-                            let index = frequencyPlot.index !== -1 ? frequencyPlot.index : 100;
+                            const index = frequencyPlot.index !== -1 ? frequencyPlot.index : 100;
                             controlGroup.controls.splice(insertPosition, 0, frequencyPlotUi);
                             controlGroup.indexes.splice(insertPosition, 0, index);
 
                         } else {
-                            let index = frequencyPlot.index !== -1 ? frequencyPlot.index : 100;
-                            let controlGroup = new ControlGroup(
+                            const index = frequencyPlot.index !== -1 ? frequencyPlot.index : 100;
+                            const controlGroup = new ControlGroup(
                                 portGroup.name,
                                 [index],
                                 [frequencyPlotUi]);
@@ -855,7 +866,7 @@ const PluginControlView =
 
             hasGroups(nodes: (ReactNode | ControlGroup)[]): boolean {
                 for (let i = 0; i < nodes.length; ++i) {
-                    let node = nodes[i];
+                    const node = nodes[i];
                     if (node instanceof ControlGroup) return true;
                 }
                 return false;
@@ -864,15 +875,15 @@ const PluginControlView =
             controlKeyIndex: number = 0;
             controlNodesToNodes(nodes: (ReactNode | ControlGroup)[]): ReactNode[] {
                 const classes = withStyles.getClasses(this.props);
-                let hasGroups = this.hasGroups(nodes);
+                const hasGroups = this.hasGroups(nodes);
 
-                let result: ReactNode[] = [];
+                const result: ReactNode[] = [];
 
                 for (let i = 0; i < nodes.length; ++i) {
-                    let node = nodes[i];
+                    const node = nodes[i];
                     if (node instanceof ControlGroup) {
-                        let controlGroup = node as ControlGroup;
-                        let item = this.renderControlGroup(controlGroup, "cgix" + i)
+                        const controlGroup = node as ControlGroup;
+                        const item = this.renderControlGroup(controlGroup, "cgix" + i)
                         result.push(item);
                     } else {
                         if (this.fullScreen()) {
@@ -907,7 +918,7 @@ const PluginControlView =
                 }
                 return (
                     <MidiChannelBindingControl key="channelBindingCtl" midiChannelBinding={pedalboardItem.midiChannelBinding}
-                        onChange={(result) => {
+                        onChange={() => {
 
                         }}
                     />
@@ -927,11 +938,11 @@ const PluginControlView =
             }
 
             handleModGuiFileProperty(instanceId: number, filePropertyUri: string, selectedFile: string) {
-                let plugin = this.model.getUiPlugin(this.props.item.uri);
+                const plugin = this.model.getUiPlugin(this.props.item.uri);
                 if (!plugin) {
                     throw (new Error("Plugin not found."));
                 }
-                let fileProperty = plugin.getFilePropertyByUri(filePropertyUri);
+                const fileProperty = plugin.getFilePropertyByUri(filePropertyUri);
                 if (!fileProperty) {
                     throw (new Error("File property not found."));
                 }
@@ -945,11 +956,11 @@ const PluginControlView =
                 const classes = withStyles.getClasses(this.props);
                 void classes;
 
-                let uiPlugin = this.model.getUiPlugin(this.props.item.uri);
+                const uiPlugin = this.model.getUiPlugin(this.props.item.uri);
                 if (!uiPlugin) {
                     return (<div />);
                 }
-                let toolBarChildren: ReactNode[] = [];
+                const toolBarChildren: ReactNode[] = [];
                 if (uiPlugin.audio_side_chain_inputs > 0) {
                     toolBarChildren.push(
                         <IconButtonEx tooltip="Select sidechain input"
@@ -1012,7 +1023,7 @@ const PluginControlView =
 
 
                 const classes = withStyles.getClasses(this.props);
-                let pedalboard = this.model.pedalboard.get();
+                const pedalboard = this.model.pedalboard.get();
 
                 if (!pedalboardItem)
                     return (<div className={classes.frame} ></div>);
@@ -1061,7 +1072,7 @@ const PluginControlView =
                     controlNodes = this.props.customization.modifyControls(this, controlNodes);
                 }
 
-                let nodes = this.controlNodesToNodes(controlNodes);
+                const nodes = this.controlNodesToNodes(controlNodes);
 
                 if (plugin.has_midi_input && !pedalboardItem.midiChannelBinding) {
                     pedalboardItem.midiChannelBinding = MidiChannelBinding.CreateMissingValue();
@@ -1069,6 +1080,17 @@ const PluginControlView =
                 }
                 if (pedalboardItem.midiChannelBinding && midiChannelBindingControlFeatureEnabled) {
                     nodes.push(this.midiBindingControl(pedalboardItem));
+                }
+                if (!nodes.some((node) => !!node)) {
+                    return (
+                        <div className={scrollClass}>
+                            <div className={classes.noControlsMessage}>
+                                <Typography variant="body2" color="text.secondary">
+                                    This plugin has no adjustable controls.
+                                </Typography>
+                            </div>
+                        </div>
+                    );
                 }
                 return (
                     <div className={scrollClass}>
@@ -1094,7 +1116,7 @@ const PluginControlView =
             }
             render(): ReactNode {
                 const classes = withStyles.getClasses(this.props);
-                let pedalboard = this.model.pedalboard.get();
+                const pedalboard = this.model.pedalboard.get();
 
                 let pedalboardItem: PedalboardItem;
                 if (this.props.instanceId === Pedalboard.START_CONTROL_ID) {
@@ -1105,7 +1127,7 @@ const PluginControlView =
                     pedalboardItem = pedalboard.getItem(this.props.instanceId);
                 }
 
-                let vuMeterRClass = this.state.landscapeGrid ? classes.vuMeterRLandscape : classes.vuMeterR;
+                const vuMeterRClass = this.state.landscapeGrid ? classes.vuMeterRLandscape : classes.vuMeterR;
                 let frameClass = classes.frame;
 
                 if (this.fullScreen() || this.props.showModGui) {

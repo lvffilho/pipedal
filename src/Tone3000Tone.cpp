@@ -137,12 +137,17 @@ namespace
         return mdEnumList(sizes, sizeEnumValues);
     }
 
+    // TONE3000's gear values, and the deprecated "full-rig" (= amp-cab) and "ir" still found in older data.
     static std::map<std::string, std::string> gearEnumValues =
         {
             {"amp", "Amp only"},
-            {"full-rig", "Full rig"},
+            {"amp-cab", "Amp + cab"},
+            {"full-rig", "Amp + cab"},
             {"pedal", "Pedal"},
             {"outboard", "Outboard"},
+            {"cab", "Cab"},
+            {"space", "Space"},
+            {"experimental", "Experimental"},
             {"ir", "IR"}};
 
     static std::string mdGear(const std::string &gear)
@@ -409,14 +414,16 @@ void pipedal::tone3000::WriteTone3000Readme(const std::filesystem::path &filePat
                     << mdSizes(tone.sizes().value()) << ", "
                 ;
             }
-            if (tone.platform() == "ir")
+            // "format" replaced "platform" in the API; older callers may still send platform only.
+            std::string format = tone.format().empty() ? tone.platform() : tone.format();
+            if (tone.gear().empty() || tone.gear() == "ir")
             {
                 of
-                        << (mdPlatform(tone.platform()));
+                        << (mdPlatform(format));
             } else {
                 of
                         << mdGear(tone.gear()) << ", "
-                        << mdPlatform(tone.platform());
+                        << mdPlatform(format);
             }
             of           << "<br/>\n";
             if (tone.license() != "") {
@@ -471,6 +478,7 @@ JSON_MAP_REFERENCE(Tone, gear)
 JSON_MAP_REFERENCE(Tone, images)
 JSON_MAP_REFERENCE(Tone, is_public)
 JSON_MAP_REFERENCE(Tone, links)
+JSON_MAP_REFERENCE(Tone, format)
 JSON_MAP_REFERENCE(Tone, platform)
 JSON_MAP_REFERENCE(Tone, models_count)
 JSON_MAP_REFERENCE(Tone, favorites_count)

@@ -48,6 +48,12 @@ namespace pipedal {
 
         static ptr Create(PiPedalModel *model);
 
+        // Serves a ModGUI's modgui:javascript file (/resources/_/javascript), verbatim
+        // (text/javascript):
+        // like mod-ui, the script is not a template. Sets ec to no_such_file_or_directory
+        // if the ModGUI has no script, or it isn't a regular file. Public for testing.
+        static void ServeJavascript(const std::string &javascriptFile, HttpResponse &res, std::error_code &ec);
+
         ModWebIntercept(PiPedalModel *model)
             : RequestHandler("/var"),
             model(model)

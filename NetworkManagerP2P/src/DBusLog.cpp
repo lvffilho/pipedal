@@ -51,7 +51,7 @@ class FileDBusLogger : public IDBusLogger {
 public:
     FileDBusLogger(const std::filesystem::path&path)
     {
-        f.open(path);
+        f.open_in_place(path); // streaming log: must be visible immediately, not via a temp file.
         if (!f)
         {
             throw std::runtime_error(SS("Can't open file " << path));

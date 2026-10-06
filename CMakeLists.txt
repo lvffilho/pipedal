@@ -10,7 +10,17 @@ set (DISPLAY_VERSION "PiPedal v2.0.110-Release")
 option(PIPEDAL_DISABLE_COPYRIGHT_BUILD "Skip generation of copyright notices (use on non-Debian distros)" OFF)
 option(PIPEDAL_EXCLUDE_TESTS "Exclude test targets from default build" OFF)
 
-set(PIPEDAL_T3K_PUBLISHABLE_KEY "t3k_pub_bHrH8btdwXXTtxz5ryEU8sNLF-2TGRT9")
+# TONE3000 OAuth client id: a *publishable* key (t3k_pub_...), which TONE3000 designs to be
+# embedded in client apps; it goes into pipedald (src/T3kConfig.h) and the web UI
+# (VITE_T3K_PUBLISHABLE_KEY). A fork that registers its own application (tone3000.com >
+# Settings > API Keys) builds with -DPIPEDAL_T3K_PUBLISHABLE_KEY=t3k_pub_... . Never configure
+# the account's secret key (t3k_cs_...): it is a server-only bearer credential for that account.
+set(PIPEDAL_T3K_PUBLISHABLE_KEY "t3k_pub_47aYRwEal7tgm_i62bBlQP45wcr_7iwl" CACHE STRING
+    "TONE3000 OAuth client id (publishable key, t3k_pub_...)")
+if (NOT PIPEDAL_T3K_PUBLISHABLE_KEY MATCHES "^t3k_pub_[A-Za-z0-9_-]+$")
+    message(FATAL_ERROR "PIPEDAL_T3K_PUBLISHABLE_KEY must be a TONE3000 publishable key (t3k_pub_...). "
+        "A secret key must never be built into PiPedal.")
+endif()
 
 
 # Determine Debian-compatible architecture name (portable across distros)
@@ -68,6 +78,9 @@ install(
 
 install (
     FILES ${PROJECT_SOURCE_DIR}/src/polkit-1/rules/10-pipedal-networkmanager.rules DESTINATION /etc/polkit-1/rules.d/
+)
+install (
+    FILES ${PROJECT_SOURCE_DIR}/src/udev/70-pipedal-cpu-dma-latency.rules DESTINATION /etc/udev/rules.d/
 )
 install (
     DIRECTORY ${VITE_BUILD_DIRECTORY} DESTINATION /etc/pipedal/react

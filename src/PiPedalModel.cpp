@@ -48,6 +48,12 @@
 #include "CrashGuard.hpp"
 #include "Tone3000Downloader.hpp"
 #include "HtmlHelper.hpp"
+#include "UploadPolicy.hpp"
+#include "PedalboardBuilder.hpp"
+#include "Lv2Pedalboard.hpp"
+#include "Lv2Effect.hpp"
+#include "PresetInstanceReuse.hpp"
+#include "PedalboardEditRouting.hpp"
 
 #ifndef NO_MLOCK
 #include <sys/mman.h>
@@ -55,6 +61,49 @@
 
 using namespace pipedal;
 namespace fs = std::filesystem;
+
+namespace pipedal
+{
+    // A request to build an Lv2Pedalboard on the pedalboard builder thread.
+    // Everything the build needs is copied here under PiPedalModel::mutex, so the build never touches model state.
+    struct PedalboardBuildRequest
+    {
+        Pedalboard pedalboard;
+        // When reuseExistingEffects is true, Lv2 effect instances are borrowed from the running pedalboard
+        // (PluginHost::UpdateLv2PedalboardStructure). outgoingPedalboard is the pedalboard being replaced;
+        // it is captured by the builder thread when a reuse build starts (not at submit time), so that it is
+        // always the pedalboard that is actually running. Holding a reference keeps it alive while building.
+        // Full builds capture it the same way when they reuse matching instances of the running pedalboard
+        // (see BuildPedalboard()); otherwise they leave it empty.
+        std::shared_ptr<Lv2Pedalboard> outgoingPedalboard;
+        bool reuseExistingEffects = false;
+        // PiPedalModel::audioEpoch when the request was made.
+        uint64_t audioEpoch = 0;
+    };
+    struct PedalboardBuildResult
+    {
+        std::shared_ptr<Lv2Pedalboard> lv2Pedalboard;
+        Lv2PedalboardErrorList errorMessages;
+        // PiPedalModel::pluginHostConfigurationVersion at build time (sample rate, buffer size, channels).
+        uint64_t pluginHostConfigurationVersion = 0;
+        // PiPedalModel::audioEpoch when outgoingPedalboard was captured.
+        uint64_t audioEpoch = 0;
+        // The build borrowed effects of the running pedalboard (reuse builds, and full builds that reused
+        // matching instances); see TryInstallBuiltPedalboard().
+        bool borrowedRunningEffects = false;
+        // Number of running instances reused by a full build.
+        size_t reusedInstances = 0;
+    };
+    class PedalboardBuilder : public LatestOnlyBuilder<PedalboardBuildRequest, PedalboardBuildResult>
+    {
+    public:
+        using base = LatestOnlyBuilder<PedalboardBuildRequest, PedalboardBuildResult>;
+        using base::base;
+
+        // Protected by PiPedalModel::mutex.
+        PedalboardBuildModeTracker modeTracker;
+    };
+}
 
 template <typename T>
 T &constMutex(const T &mutex)
@@ -83,6 +132,20 @@ PiPedalModel::PiPedalModel()
     this->updater = Updater::Create();
     this->currentUpdateStatus = updater->GetCurrentStatus();
     this->pedalboard = Pedalboard::MakeDefault();
+
+    this->pedalboardBuilder = std::make_unique<PedalboardBuilder>(
+        [this](PedalboardBuildRequest &request)
+        {
+            return this->BuildPedalboard(request);
+        },
+        [this](uint64_t generation, PedalboardBuildRequest &request, PedalboardBuildResult &result)
+        {
+            this->InstallBuiltPedalboard(generation, request, result);
+        },
+        [this](const std::exception &e)
+        {
+            this->OnPedalboardBuildFailed(e.what());
+        });
 
     this->jackServerSettings = this->storage.GetJackServerSettings();
 
@@ -130,7 +193,13 @@ void PrepareSnapshostsForSave(Pedalboard &pedalboard)
 
 void PiPedalModel::Close()
 {
+    // Unlocked: the builder thread takes `mutex` to install, so it must be joined without holding it.
+    // Done first, while the audio host is still running, so that an in-flight build that borrowed live
+    // effects can still be installed. No pedalboard build runs or installs after this point.
+    ClosePedalboardBuilder();
+
     std::unique_ptr<AudioHost> oldAudioHost;
+    std::shared_ptr<Tone3000Auth> oldTone3000Auth;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
 
@@ -142,7 +211,12 @@ void PiPedalModel::Close()
         {
             tone3000Downloader->Close();
         }
+        oldTone3000Auth = this->tone3000Auth;
         closed = true;
+
+        // No build is installed after ClosePedalboardBuilder(): release acks still waiting for one.
+        SendMidiAcks(pendingMidiAcks.TakeAll());
+        FailDeferredPatchRequests("Shutting down.");
 
         CancelAudioRetry();
 
@@ -167,12 +241,65 @@ void PiPedalModel::Close()
     {
         oldAudioHost->Close();
     }
+    // lockless: a poll thread may be waiting on `mutex` to deliver a status update.
+    if (oldTone3000Auth)
+    {
+        oldTone3000Auth->Close();
+    }
+}
+
+std::shared_ptr<Tone3000Auth> PiPedalModel::GetTone3000Auth()
+{
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    return tone3000Auth;
+}
+
+void PiPedalModel::OnTone3000AuthStatusChanged(const Tone3000AuthStatus &status)
+{
+    SubscriberList subscribers;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        if (closed)
+        {
+            return;
+        }
+        subscribers = this->subscribers;
+    }
+    for (auto &subscriber : subscribers)
+    {
+        subscriber->OnTone3000AuthStatusChanged(status);
+    }
+}
+
+void PiPedalModel::ClosePedalboardBuilder()
+{
+    if (pedalboardBuilder)
+    {
+        pedalboardBuilder->Close();
+    }
 }
 
 PiPedalModel::~PiPedalModel()
 {
+    ClosePedalboardBuilder(); // before any member the installer uses is destroyed.
     CancelNetworkChangingTimer();
+    try
+    {
+        std::lock_guard<std::recursive_mutex> guard{mutex};
+        if (autosaveHandle)
+        {
+            CancelPost(autosaveHandle);
+            autosaveHandle = 0;
+        }
+    }
+    catch (...)
+    {
+    }
     hotspotManager = nullptr; // turn off the hotspot.
+    if (tone3000Auth)
+    {
+        tone3000Auth->Close(); // drops the listener that points at us.
+    }
 
     pluginChangeMonitor = nullptr; // stop monitorin LV2 directories.
     try
@@ -222,6 +349,14 @@ void PiPedalModel::Init(const PiPedalConfiguration &configuration)
     storage.SetDataRoot(configuration.GetLocalStoragePath());
     storage.Initialize(this);
     pluginHost.SetPluginStoragePath(storage.GetPluginUploadDirectory());
+
+    // Tokens live in the daemon's private config directory (file mode 0600).
+    this->tone3000Auth = Tone3000Auth::Create(storage.GetDataRoot() / "config" / "tone3000_auth.json");
+    this->tone3000Auth->SetStatusListener(
+        [this](const Tone3000AuthStatus &status)
+        {
+            OnTone3000AuthStatusChanged(status);
+        });
 
     this->systemMidiBindings = storage.GetSystemMidiBindings();
 
@@ -298,7 +433,7 @@ void PiPedalModel::OnStartTone3000Download(int64_t handle, const std::string &ti
         std::lock_guard<std::recursive_mutex> lock(mutex);
         subscribers = this->subscribers;
     }
-    for (auto &subscriber : this->subscribers)
+    for (auto &subscriber : subscribers)
     {
         subscriber->OnTone3000DownloadStarted(handle, title);
     }
@@ -403,7 +538,29 @@ void PiPedalModel::Load()
     this->webRoot = configuration.GetWebRoot();
     this->webPort = (uint16_t)configuration.GetSocketServerPort();
 
-    adminClient.MonitorGovernor(storage.GetGovernorSettings());
+    {
+        // A persisted governor that this kernel doesn't offer (e.g. settings copied from another
+        // device) would be retried by the monitor thread forever and shown in the UI as if it
+        // were in effect. Replace it with the governor actually running, and persist that.
+        std::string persistedGovernor = storage.GetGovernorSettings();
+        bool governorsFromSysfs = false;
+        std::vector<std::string> availableGovernors = pipedal::GetAvailableGovernors(&governorsFromSysfs);
+        std::string governor = pipedal::ResolvePersistedGovernor(
+            persistedGovernor, availableGovernors, pipedal::GetCpuGovernor(), governorsFromSysfs);
+        if (governor != persistedGovernor)
+        {
+            Lv2Log::warning(SS("CPU governor '" << persistedGovernor << "' is not available. Using '" << governor << "'."));
+            try
+            {
+                storage.SetGovernorSettings(governor);
+            }
+            catch (const std::exception &e)
+            {
+                Lv2Log::warning(SS("Unable to save CPU governor setting. " << e.what()));
+            }
+        }
+        adminClient.MonitorGovernor(governor);
+    }
 
     // pluginHost.Load(configuration.GetLv2Path().c_str());
 
@@ -448,6 +605,8 @@ void PiPedalModel::Load()
     this->audioHost->SetSystemMidiBindings(this->systemMidiBindings);
 
     audioHost->SetAlsaSequencerConfiguration(storage.GetAlsaSequencerConfiguration());
+
+    this->audioHost->SetSuspendBypassedPlugins(storage.GetSuspendBypassedPlugins());
 
     if (configuration.GetMLock())
     {
@@ -507,11 +666,31 @@ void PiPedalModel::RemoveNotificationSubsription(std::shared_ptr<IPiPedalModelSu
                 --i;
             }
         }
+        // likewise for requests waiting for a pedalboard build: their callbacks refer to the closed connection.
+        deferredPatchRequests.RemoveClient(clientId);
     }
 }
 
 void PiPedalModel::PreviewControl(int64_t clientId, int64_t pedalItemId, const std::string &symbol, float value)
 {
+    // Called without `mutex` from the websocket (PiPedalSocket). The builder thread and RestartAudio replace/reset
+    // this->lv2Pedalboard (and the audio host's pedalboard) under `mutex`, so the check, the single read of
+    // this->lv2Pedalboard and the dispatch to the audio host (which resolves the instance id against its own
+    // copy of the installed pedalboard) all happen under `mutex`: otherwise a pedalboard installed in between
+    // could receive a value addressed to an instance id of the previous one.
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (!RunningInstanceIdsMatchPedalboard())
+    {
+        // A full build (preset/bank switch) is outstanding: the running pedalboard is the outgoing one,
+        // whose instance ids may name unrelated plugins. The installer applies the model's current
+        // settings when the new pedalboard is installed.
+        return;
+    }
+    const std::shared_ptr<Lv2Pedalboard> lv2Pedalboard = this->lv2Pedalboard;
+    if (!lv2Pedalboard || !audioHost)
+    {
+        return; // still building. The installer applies current settings when the build is installed.
+    }
     IEffect *effect = lv2Pedalboard->GetEffect(pedalItemId);
     if (!effect)
     {
@@ -538,11 +717,25 @@ void PiPedalModel::OnNotifyLv2StateChanged(uint64_t instanceId)
     OnNotifyMaybeLv2StateChanged(instanceId);
 }
 
+// Called with `mutex` held. Whether the instance ids of the running pedalboard are those of this->pedalboard.
+// While a full build (preset/bank switch) is outstanding, the running pedalboard is the outgoing one, and its
+// instance ids may name unrelated items of this->pedalboard (ids collide across presets), so plugin state and
+// path property notifications from it must not be stored into this->pedalboard.
+bool PiPedalModel::RunningInstanceIdsMatchPedalboard() const
+{
+    return pedalboardBuilder && !pedalboardBuilder->modeTracker.FullBuildOutstanding();
+}
+
 // The plugin notified us that a  path path property changed. The state *purrobably changed.
 bool PiPedalModel::OnNotifyMaybeLv2StateChanged(uint64_t instanceId)
 {
     // one or more received PATCH_Sets, which MAY change the state.
     std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (!RunningInstanceIdsMatchPedalboard())
+    {
+        // the notification is from an instance of the outgoing pedalboard (e.g. during a preset switch).
+        return false;
+    }
     PedalboardItem *item = pedalboard.GetItem(instanceId);
     if (item != nullptr)
     {
@@ -666,20 +859,23 @@ void PiPedalModel::FireJackConfigurationChanged(const JackConfiguration &jackCon
 void PiPedalModel::FireBanksChanged(int64_t clientId)
 {
     SubscriberList subscribers;
+    BankIndex banksSnapshot;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         subscribers = this->subscribers;
+        banksSnapshot = this->storage.GetBanks(); // copy under lock; subscribers run unlocked.
     }
     // noify subscribers.
     for (auto &subscriber : subscribers)
     {
-        subscriber->OnBankIndexChanged(this->storage.GetBanks());
+        subscriber->OnBankIndexChanged(banksSnapshot);
     }
 }
 
 void PiPedalModel::FirePedalboardChanged(int64_t clientId, bool loadAudioThread)
 {
     SubscriberList subscribers;
+    Pedalboard pedalboardSnapshot;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         subscribers = this->subscribers;
@@ -695,11 +891,13 @@ void PiPedalModel::FirePedalboardChanged(int64_t clientId, bool loadAudioThread)
                 UpdateRealtimeMonitorPortSubscriptions();
             }
         }
+        // one copy under lock; subscribers run unlocked and must not see later mutations.
+        pedalboardSnapshot = this->pedalboard;
     }
     // noify subscribers.
     for (auto &subscriber : subscribers)
     {
-        subscriber->OnPedalboardChanged(clientId, this->pedalboard);
+        subscriber->OnPedalboardChanged(clientId, pedalboardSnapshot);
     }
 }
 void PiPedalModel::SetPedalboard(int64_t clientId, Pedalboard &pedalboard)
@@ -780,21 +978,11 @@ void PiPedalModel::UpdateCurrentPedalboard(int64_t clientId, Pedalboard &pedalbo
 
         UpdateVst3Settings(pedalboard);
 
-        Lv2PedalboardErrorList errorMessages;
-        std::shared_ptr<Lv2Pedalboard> lv2Pedalboard{
-            this->pluginHost.UpdateLv2PedalboardStructure(pedalboard, this->lv2Pedalboard.get(), errorMessages)};
-        this->lv2Pedalboard = lv2Pedalboard;
-
-        // apply the error messages to the lv2Pedalboard.
-        // return true if the error messages have changed
-        audioHost->SetPedalboard(lv2Pedalboard);
-        this->pedalboard = pedalboard;
-        previousPedalboard = this->pedalboard;
-        previousPedalboardLoaded = true;
         this->pedalboard = pedalboard;
 
-        UpdateRealtimeVuSubscriptions();
-        UpdateRealtimeMonitorPortSubscriptions();
+        // Rebuild on the builder thread, borrowing existing Lv2 effect instances from the running pedalboard.
+        // The installer updates previousPedalboard and the realtime VU/monitor subscriptions.
+        RequestPedalboardBuild(true);
     }
     this->FirePedalboardChanged(clientId, false);
     this->SetPresetChanged(clientId, true);
@@ -820,6 +1008,9 @@ void PiPedalModel::SetPedalboardItemEnable(int64_t clientId, int64_t pedalItemId
 {
     SubscriberList subscribers;
     std::lock_guard<std::recursive_mutex> guard{mutex};
+    // While a full build is outstanding, the running pedalboard's instance ids may name unrelated plugins;
+    // the installer applies the model's enabled state when the new pedalboard is installed.
+    bool updateAudioHost = RunningInstanceIdsMatchPedalboard();
     {
         subscribers = this->subscribers;
 
@@ -841,7 +1032,10 @@ void PiPedalModel::SetPedalboardItemEnable(int64_t clientId, int64_t pedalItemId
         }
         // Notify audo thread.
     }
-    this->audioHost->SetBypass(pedalItemId, enabled);
+    if (updateAudioHost)
+    {
+        this->audioHost->SetBypass(pedalItemId, enabled);
+    }
 
     // Notify clients.
     for (auto &subscriber : subscribers)
@@ -889,7 +1083,76 @@ void PiPedalModel::SetPresetChanged(int64_t clientId, bool value, bool changeSna
     if (value != this->hasPresetChanged)
     {
         hasPresetChanged = value;
+        if (!value)
+        {
+            storage.DiscardCurrentPreset(); // saved: the autosave is no longer meaningful.
+        }
         FirePresetChanged(value);
+    }
+    if (value)
+    {
+        ScheduleCurrentPresetAutosave();
+    }
+}
+
+static const std::chrono::seconds AUTOSAVE_DELAY{3};
+
+void PiPedalModel::ScheduleCurrentPresetAutosave()
+{
+    // Coalescing: record the time of the last change; a single pending timer re-arms itself
+    // until 3 seconds have passed with no further change.
+    std::lock_guard<std::recursive_mutex> guard{mutex};
+    autosaveLastChange = clock::now();
+    if (autosaveHandle == 0)
+    {
+        try
+        {
+            autosaveHandle = PostDelayed(AUTOSAVE_DELAY, [this]()
+                                         { OnAutosaveTimer(); });
+        }
+        catch (const std::exception &)
+        {
+            // dispatcher not ready yet. The shutdown save still applies.
+        }
+    }
+}
+
+void PiPedalModel::OnAutosaveTimer()
+{
+    CurrentPreset currentPreset;
+    {
+        std::lock_guard<std::recursive_mutex> guard{mutex};
+        auto elapsed = clock::now() - autosaveLastChange;
+        if (elapsed < AUTOSAVE_DELAY)
+        {
+            try
+            {
+                autosaveHandle = PostDelayed(AUTOSAVE_DELAY - elapsed, [this]()
+                                             { OnAutosaveTimer(); });
+                return;
+            }
+            catch (const std::exception &)
+            {
+            }
+        }
+        autosaveHandle = 0;
+        if (!hasPresetChanged)
+        {
+            storage.DiscardCurrentPreset();
+            return; // nothing to save.
+        }
+        // serialize a snapshot under the lock; write to disk outside it.
+        currentPreset.modified_ = true;
+        currentPreset.preset_ = this->pedalboard;
+    }
+    storage.SaveCurrentPreset(currentPreset);
+    {
+        // the preset may have been saved or replaced while we were writing.
+        std::lock_guard<std::recursive_mutex> guard{mutex};
+        if (!hasPresetChanged)
+        {
+            storage.DiscardCurrentPreset();
+        }
     }
 }
 
@@ -969,6 +1232,17 @@ void PiPedalModel::UpdateVst3Settings(Pedalboard &pedalboard)
 {
     // get the vst3 state bundle from lv2Pedalboard for the current pedalboard.
 #if ENABLE_VST3
+    if (!lv2Pedalboard || pedalboardBuilder->modeTracker.FullBuildOutstanding())
+    {
+        // The running pedalboard is not of the current pedalboard's lineage (instance ids don't match). The
+        // outstanding build creates its VST3 instances from this->pedalboard, so that is where their current
+        // state is until it is installed.
+        if (&pedalboard != &this->pedalboard)
+        {
+            MergeVst3State(pedalboard, this->pedalboard);
+        }
+        return;
+    }
     Pedalboard pb;
     for (IEffect *effect : lv2Pedalboard->GetEffects())
     {
@@ -1006,7 +1280,15 @@ void PiPedalModel::FireLv2StateChanged(int64_t instanceId, const Lv2PluginState 
 // referesh the plugin state for all plugins.
 bool PiPedalModel::SyncLv2State()
 {
+    std::lock_guard<std::recursive_mutex> guard{mutex};
     bool changed = false;
+    if (!audioHost || !lv2Pedalboard || !RunningInstanceIdsMatchPedalboard())
+    {
+        // A full build is outstanding: the running pedalboard's instance ids may name unrelated plugins, whose
+        // state must not be stored into this->pedalboard. Its items' state is the state the outstanding build
+        // was created from, so it is already current.
+        return false;
+    }
     auto pedalboardItems = pedalboard.GetAllPlugins();
     for (PedalboardItem *item : pedalboardItems)
     {
@@ -1261,10 +1543,7 @@ void PiPedalModel::OnNotifyNextMidiSnapshot(const RealtimeNextMidiProgramRequest
     {
         Lv2Log::error(e.what());
     }
-    if (this->audioHost)
-    {
-        this->audioHost->AckMidiProgramRequest(request.requestId);
-    }
+    AckMidiRequest(PendingMidiAckTracker::Kind::Program, request.requestId);
 }
 
 void PiPedalModel::OnNotifyNextMidiProgram(const RealtimeNextMidiProgramRequest &request)
@@ -1287,14 +1566,12 @@ void PiPedalModel::OnNotifyNextMidiProgram(const RealtimeNextMidiProgramRequest 
 
         Lv2Log::error(e.what());
     }
-    if (this->audioHost)
-    {
-        this->audioHost->AckMidiProgramRequest(request.requestId);
-    }
+    AckMidiRequest(PendingMidiAckTracker::Kind::Program, request.requestId);
 }
 
 void PiPedalModel::OnNotifyMidiRealtimeSnapshotRequest(int32_t snapshotIndex, int64_t snapshotRequestId)
 {
+    std::lock_guard<std::recursive_mutex> guard{mutex};
     try
     {
         SetSnapshot((int64_t)snapshotIndex);
@@ -1303,10 +1580,7 @@ void PiPedalModel::OnNotifyMidiRealtimeSnapshotRequest(int32_t snapshotIndex, in
     {
         Lv2Log::error(SS("SetSnapshot failed. " << e.what()));
     }
-    if (this->audioHost)
-    {
-        this->audioHost->AckSnapshotRequest(snapshotRequestId);
-    }
+    AckMidiRequest(PendingMidiAckTracker::Kind::Snapshot, snapshotRequestId);
 }
 
 void PiPedalModel::OnNotifyNextMidiBank(const RealtimeNextMidiProgramRequest &request)
@@ -1329,10 +1603,7 @@ void PiPedalModel::OnNotifyNextMidiBank(const RealtimeNextMidiProgramRequest &re
 
         Lv2Log::error(e.what());
     }
-    if (this->audioHost)
-    {
-        this->audioHost->AckMidiProgramRequest(request.requestId);
-    }
+    AckMidiRequest(PendingMidiAckTracker::Kind::Program, request.requestId);
 }
 
 void PiPedalModel::OnNotifyMidiProgramChange(RealtimeMidiProgramRequest &midiProgramRequest)
@@ -1363,9 +1634,40 @@ void PiPedalModel::OnNotifyMidiProgramChange(RealtimeMidiProgramRequest &midiPro
 
         Lv2Log::error(e.what());
     }
-    if (this->audioHost)
+    AckMidiRequest(PendingMidiAckTracker::Kind::Program, midiProgramRequest.requestId);
+}
+
+// Called with `mutex` held, once a realtime MIDI program/snapshot request has been handled.
+// If the request (or an earlier change) left a pedalboard build outstanding, the audio thread must keep
+// deferring MIDI until that pedalboard is running, so the ack is sent by the installer (after
+// audioHost->SetPedalboard()), or by whichever path ends the build. Otherwise, ack now.
+void PiPedalModel::AckMidiRequest(PendingMidiAckTracker::Kind kind, int64_t requestId)
+{
+    bool buildOutstanding = !closed && pedalboardBuilder && !pedalboardBuilder->IsIdle();
+    uint64_t generation = pedalboardBuilder ? pedalboardBuilder->CurrentGeneration() : 0;
+    if (pendingMidiAcks.Defer(kind, requestId, buildOutstanding, generation))
     {
-        this->audioHost->AckMidiProgramRequest(midiProgramRequest.requestId);
+        SendMidiAcks({PendingMidiAckTracker::Ack{kind, requestId, generation}});
+    }
+}
+
+// Called with `mutex` held.
+void PiPedalModel::SendMidiAcks(const std::vector<PendingMidiAckTracker::Ack> &acks)
+{
+    if (!this->audioHost)
+    {
+        return;
+    }
+    for (const auto &ack : acks)
+    {
+        if (ack.kind == PendingMidiAckTracker::Kind::Snapshot)
+        {
+            this->audioHost->AckSnapshotRequest(ack.requestId);
+        }
+        else
+        {
+            this->audioHost->AckMidiProgramRequest(ack.requestId);
+        }
     }
 }
 
@@ -1379,6 +1681,7 @@ void PiPedalModel::LoadPreset(int64_t clientId, int64_t instanceId)
         UpdateDefaults(&this->pedalboard);
 
         this->hasPresetChanged = false; // no fire.
+        storage.DiscardCurrentPreset(); // drop any stale autosave of an abandoned edit.
         this->FirePedalboardChanged(clientId);
         this->FirePresetsChanged(clientId); // fire now.
     }
@@ -1476,6 +1779,12 @@ GovernorSettings PiPedalModel::GetGovernorSettings()
 void PiPedalModel::SetGovernorSettings(const std::string &governor)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (!pipedal::IsValidGovernor(governor, pipedal::GetAvailableGovernors()))
+    {
+        // Thrown back to the client as an error reply, so the UI can drop its optimistic value.
+        Lv2Log::warning(SS("Rejecting unavailable CPU governor '" << governor << "'."));
+        throw PiPedalException(SS("CPU governor '" << governor << "' is not available on this device."));
+    }
     adminClient.SetGovernorSettings(governor);
 
     this->storage.SetGovernorSettings(governor);
@@ -1615,6 +1924,33 @@ bool PiPedalModel::GetShowStatusMonitor()
     return storage.GetShowStatusMonitor();
 }
 
+void PiPedalModel::SetSuspendBypassedPlugins(bool value)
+{
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (storage.GetSuspendBypassedPlugins() == value)
+    {
+        return;
+    }
+    storage.SetSuspendBypassedPlugins(value);
+    if (audioHost)
+    {
+        // reaches the audio thread through the host->RT ring buffer.
+        audioHost->SetSuspendBypassedPlugins(value);
+    }
+
+    // Notify clients.
+    std::vector<IPiPedalModelSubscriber::ptr> t{subscribers.begin(), subscribers.end()};
+    for (auto &subscriber : t)
+    {
+        subscriber->OnSuspendBypassedPluginsChanged(value);
+    }
+}
+bool PiPedalModel::GetSuspendBypassedPlugins()
+{
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    return storage.GetSuspendBypassedPlugins();
+}
+
 JackConfiguration PiPedalModel::GetJackConfiguration()
 {
     std::lock_guard<std::recursive_mutex> lock(mutex); // copy atomically.
@@ -1623,6 +1959,31 @@ JackConfiguration PiPedalModel::GetJackConfiguration()
 
 void PiPedalModel::RestartAudio(bool useDummyAudioDriver)
 {
+    {
+        // Any pedalboard that is pending or being built was built for the old audio configuration.
+        // Discard it; LoadCurrentPedalboard() below requests a fresh build.
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        // Until the fresh build is requested below, no full build may be installed: it could have been built
+        // for the old configuration but installed into the re-opened audio host.
+        audioRestarting = true;
+        if (pedalboardBuilder)
+        {
+            pedalboardBuilder->Invalidate();
+        }
+        // The builds that MIDI requests were waiting on will never be installed. (AudioHost::Open() also
+        // clears the audio thread's pending request state, in case these acks are lost with the old ring.)
+        SendMidiAcks(pendingMidiAcks.TakeAll());
+        FailDeferredPatchRequests("The audio is restarting.");
+    }
+    struct RestartingGuard
+    {
+        PiPedalModel *this_;
+        ~RestartingGuard()
+        {
+            std::lock_guard<std::recursive_mutex> lock(this_->mutex);
+            this_->audioRestarting = false;
+        }
+    } restartingGuard{this};
     try
     {
         if (useDummyAudioDriver)
@@ -1640,10 +2001,16 @@ void PiPedalModel::RestartAudio(bool useDummyAudioDriver)
         // Still bugs wrt/ restarting the circular buffers for the audio thread.
 
         // do a complete reload.
-
-        this->audioHost->SetPedalboard(nullptr);
-
-        previousPedalboardLoaded = false;
+        {
+            // The audio thread has stopped: pedalboards that borrowed its effects may now be discarded,
+            // and its effects (instantiated for the old configuration) must never be borrowed again.
+            std::lock_guard<std::recursive_mutex> lock(mutex);
+            ++audioEpoch;
+            this->audioHost->SetPedalboard(nullptr);
+            this->lv2Pedalboard = nullptr;
+            previousPedalboardLoaded = false;
+            pedalboardBuilder->modeTracker.OnRunningPedalboardDiscarded();
+        }
         auto jackServerSettings = this->jackServerSettings;
         if (useDummyAudioDriver)
         {
@@ -1671,10 +2038,18 @@ void PiPedalModel::RestartAudio(bool useDummyAudioDriver)
 
         this->audioHost->Open(jackServerSettings, channelSelection); 
 
-        this->pluginHost.OnConfigurationChanged(jackConfiguration, channelSelection);
+        {
+            std::lock_guard<std::mutex> configLock(pluginHostConfigurationMutex); // wait for any in-flight build.
+            ++pluginHostConfigurationVersion;
+            this->pluginHost.OnConfigurationChanged(jackConfiguration, channelSelection);
+        }
 
         FireChannelRouterSettingsChanged(-1);
-        LoadCurrentPedalboard();
+        {
+            std::lock_guard<std::recursive_mutex> lock(mutex);
+            audioRestarting = false;
+            LoadCurrentPedalboard();
+        }
 
         this->UpdateRealtimeVuSubscriptions();
         UpdateRealtimeMonitorPortSubscriptions();
@@ -1816,9 +2191,17 @@ void PiPedalModel::RemoveVuSubscription(int64_t subscriptionHandle)
     UpdateRealtimeVuSubscriptions();
 }
 
-void PiPedalModel::OnNotifyMidiValueChanged(int64_t instanceId, int portIndex, float value)
+void PiPedalModel::OnNotifyMidiValueChanged(int64_t instanceId, int portIndex, float value, IEffect *sourceEffect, Lv2Pedalboard *sourcePedalboard)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (!RunningInstanceIdsMatchPedalboard() ||
+        !IsMidiValueFromInstalledPedalboard(this->lv2Pedalboard.get(), sourcePedalboard, (uint64_t)instanceId, sourceEffect))
+    {
+        // From the outgoing pedalboard (before the install, or after it but before the audio thread swapped
+        // the new pedalboard in): its instance ids may name unrelated items of this->pedalboard, and the swap
+        // applies the installed item's own value even to a reused instance.
+        return;
+    }
     PedalboardItem *item = this->pedalboard.GetItem(instanceId);
     if (item)
     {
@@ -1882,13 +2265,10 @@ void PiPedalModel::OnNotifyVusSubscription(const std::vector<VuUpdateX> &updates
         std::lock_guard<std::recursive_mutex> lock(mutex);
         subscribers = this->subscribers;
     }
-    for (size_t i = 0; i < updates.size(); ++i)
+    // subscribers is a snapshot, in case a client unsubscribes in the notification handler.
+    for (auto &subscriber : subscribers)
     {
-        // take a snapshot incase a client unsusbscribes in the notification handler (in which case the mutex won't protect us)
-        for (auto &subscriber : subscribers)
-        {
-            subscriber->OnVuMeterUpdate(updates);
-        }
+        subscriber->OnVuMeterUpdate(updates);
     }
 }
 
@@ -1998,11 +2378,12 @@ void PiPedalModel::SendSetPatchProperty(
     }
 
     // save the property to the preset (currently used to reconstruct snapshots only)
+    bool savedPathProperty = false;
     PedalboardItem *pedalboardItem = this->pedalboard.GetItem(instanceId);
     if (pedalboardItem)
     {
         std::shared_ptr<Lv2PluginInfo> pluginInfo = GetPluginInfo(pedalboardItem->uri_);
-        auto pipedalUi = pluginInfo->piPedalUI();
+        auto pipedalUi = pluginInfo ? pluginInfo->piPedalUI() : nullptr;
         if (pipedalUi)
         {
             auto fileProperty = pipedalUi->GetFileProperty(propertyUri);
@@ -2012,10 +2393,57 @@ void PiPedalModel::SendSetPatchProperty(
                 json_variant abstractPath = pluginHost.AbstractPath(value);
                 std::string atomString = abstractPath.to_string();
                 pedalboardItem->pathProperties_[propertyUri] = atomString;
+                savedPathProperty = true;
             }
             this->SetPresetChanged(clientId, true);
         }
     }
+    if (!RunningInstanceIdsMatchPedalboard() || !lv2Pedalboard)
+    {
+        // A full build (preset/bank switch) is outstanding: the running pedalboard is the outgoing one, whose
+        // instance ids may name unrelated plugins.
+        if (savedPathProperty)
+        {
+            // applied to the new pedalboard by the installer (the reconciliation snapshot carries path properties).
+            if (onSuccess)
+            {
+                onSuccess();
+            }
+            return;
+        }
+        try
+        {
+            atomConverter.ToAtom(value); // reject malformed values now, not when the pedalboard is installed.
+        }
+        catch (const std::exception &e)
+        {
+            if (onError)
+            {
+                onError(SS("Invalid value. " << e.what()));
+            }
+            return;
+        }
+        DeferredPatchRequest deferred;
+        deferred.clientId = clientId;
+        deferred.value = value;
+        deferred.onSetSuccess = std::move(onSuccess);
+        deferred.onError = std::move(onError);
+        DeferPatchRequest(instanceId, propertyUri, true, std::move(deferred));
+        return;
+    }
+    SendPatchSetRequest(clientId, instanceId, propertyUri, value, std::move(onSuccess), std::move(onError));
+}
+
+// Called with `mutex` held, when the running pedalboard's instance ids are those of this->pedalboard.
+void PiPedalModel::SendPatchSetRequest(
+    int64_t clientId,
+    int64_t instanceId,
+    const std::string &propertyUri,
+    const json_variant &value,
+    std::function<void()> onSuccess,
+    std::function<void(const std::string &error)> onError)
+{
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     LV2_Atom *atomValue = atomConverter.ToAtom(value);
 
     std::function<void(RealtimePatchPropertyRequest *)> onRequestComplete{
@@ -2061,6 +2489,7 @@ void PiPedalModel::SendSetPatchProperty(
         onRequestComplete,
         clientId, instanceId, urid, atomValue, nullptr, onError,
         sampleTimeout);
+    request->instanceIdLineage = this->instanceIdLineage;
 
     outstandingParameterRequests.push_back(request);
     if (this->audioHost)
@@ -2073,6 +2502,35 @@ void PiPedalModel::SendGetPatchProperty(
     int64_t clientId,
     int64_t instanceId,
     const std::string uri,
+    std::function<void(const std::string &jsonResult)> onSuccess,
+    std::function<void(const std::string &error)> onError)
+{
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+
+    if (!this->audioHost)
+    {
+        onError("Audio stopped.");
+        return;
+    }
+    if (!RunningInstanceIdsMatchPedalboard() || !lv2Pedalboard)
+    {
+        // A full build (preset/bank switch) is outstanding: the running pedalboard is the outgoing one, whose
+        // instance ids may name unrelated plugins. Ask the new pedalboard's plugin once it is installed.
+        DeferredPatchRequest deferred;
+        deferred.clientId = clientId;
+        deferred.onGetSuccess = std::move(onSuccess);
+        deferred.onError = std::move(onError);
+        DeferPatchRequest(instanceId, uri, false, std::move(deferred));
+        return;
+    }
+    SendPatchGetRequest(clientId, instanceId, uri, std::move(onSuccess), std::move(onError));
+}
+
+// Called with `mutex` held, when the running pedalboard's instance ids are those of this->pedalboard.
+void PiPedalModel::SendPatchGetRequest(
+    int64_t clientId,
+    int64_t instanceId,
+    const std::string &uri,
     std::function<void(const std::string &jsonResult)> onSuccess,
     std::function<void(const std::string &error)> onError)
 {
@@ -2139,22 +2597,121 @@ void PiPedalModel::SendGetPatchProperty(
             }
         }};
 
-    LV2_URID urid = this->pluginHost.GetLv2Urid(uri.c_str());
-
     std::lock_guard<std::recursive_mutex> lock(mutex);
-
-    if (!this->audioHost)
-    {
-        onError("Audio stopped.");
-    }
+    LV2_URID urid = this->pluginHost.GetLv2Urid(uri.c_str());
     size_t sampleTimeout = 0.3 * audioHost->GetSampleRate();
     RealtimePatchPropertyRequest *request = new RealtimePatchPropertyRequest(
         onRequestComplete,
         clientId, instanceId, urid, onSuccess, onError, sampleTimeout);
     request->uri = uri;
+    request->instanceIdLineage = this->instanceIdLineage;
 
     outstandingParameterRequests.push_back(request);
     this->audioHost->sendRealtimeParameterRequest(request);
+}
+
+// Called with `mutex` held.
+void PiPedalModel::DeferPatchRequest(int64_t instanceId, const std::string &propertyUri, bool isSet, DeferredPatchRequest &&request)
+{
+    if (!pedalboardBuilder || pedalboardBuilder->IsIdle())
+    {
+        // no build is coming that would answer it (e.g. the last one failed).
+        if (request.onError)
+        {
+            request.onError("The pedalboard is not loaded.");
+        }
+        return;
+    }
+    std::optional<DeferredPatchRequest> replaced;
+    switch (deferredPatchRequests.Add(request.clientId, instanceId, propertyUri, isSet, request, &replaced))
+    {
+    case DeferredPatchRequests<DeferredPatchRequest>::AddResult::Queued:
+        break;
+    case DeferredPatchRequests<DeferredPatchRequest>::AddResult::Replaced:
+        // superseded by a newer value of the same property, which will be sent instead.
+        if (replaced && replaced->onSetSuccess)
+        {
+            replaced->onSetSuccess();
+        }
+        break;
+    case DeferredPatchRequests<DeferredPatchRequest>::AddResult::Full:
+        if (request.onError)
+        {
+            request.onError("Too many requests while the pedalboard is loading.");
+        }
+        break;
+    }
+}
+
+// Called with `mutex` held, after a pedalboard was installed: sends the requests deferred while a full build was
+// outstanding to the installed pedalboard (whose instance ids are now those of this->pedalboard).
+void PiPedalModel::FlushDeferredPatchRequests()
+{
+    if (deferredPatchRequests.empty() || !RunningInstanceIdsMatchPedalboard() || !lv2Pedalboard || !audioHost)
+    {
+        return;
+    }
+    // Each entry is isolated: one that fails (e.g. a value the atom converter rejects) is reported to its own
+    // client and doesn't affect the others, or the install that triggered the flush.
+    deferredPatchRequests.SendAll(
+        [this](DeferredPatchRequests<DeferredPatchRequest>::Entry &entry)
+        {
+            DeferredPatchRequest &request = entry.request;
+            if (!this->pedalboard.HasItem(entry.instanceId))
+            {
+                if (request.onError)
+                {
+                    request.onError("The plugin is no longer in the pedalboard.");
+                }
+                return;
+            }
+            // (callbacks copied: the entry keeps onError in case sending throws.)
+            if (entry.isSet)
+            {
+                SendPatchSetRequest(
+                    request.clientId, entry.instanceId, entry.propertyUri, request.value,
+                    request.onSetSuccess, request.onError);
+            }
+            else
+            {
+                SendPatchGetRequest(
+                    request.clientId, entry.instanceId, entry.propertyUri,
+                    request.onGetSuccess, request.onError);
+            }
+        },
+        [](DeferredPatchRequests<DeferredPatchRequest>::Entry &entry, const std::exception &e)
+        {
+            Lv2Log::warning(SS("Deferred patch property request failed. " << e.what()));
+            try
+            {
+                if (entry.request.onError)
+                {
+                    entry.request.onError(e.what());
+                }
+            }
+            catch (const std::exception &)
+            {
+            }
+        });
+}
+
+// Called with `mutex` held: the pedalboard the deferred requests were waiting for will never be installed.
+void PiPedalModel::FailDeferredPatchRequests(const std::string &error)
+{
+    for (auto &entry : deferredPatchRequests.TakeAll())
+    {
+        try
+        {
+            if (entry.request.onError)
+            {
+                entry.request.onError(error);
+            }
+        }
+        catch (const std::exception &e)
+        {
+            Lv2Log::warning(SS("Failed to report a patch property error. " << e.what()));
+        }
+    }
 }
 
 BankIndex PiPedalModel::GetBankIndex() const
@@ -2191,6 +2748,7 @@ void PiPedalModel::OpenBank(int64_t clientId, int64_t bankId)
 
     UpdateDefaults(&this->pedalboard);
     this->hasPresetChanged = false;
+    storage.DiscardCurrentPreset(); // drop any stale autosave of an abandoned edit.
     this->FirePedalboardChanged(clientId);
 }
 
@@ -2600,7 +3158,12 @@ void PiPedalModel::LoadPluginPreset(int64_t pluginInstanceId, uint64_t presetIns
         if ((!presetValues.state.isValid_) && presetValues.lilvPresetUri.empty() && presetValues.pathProperties.empty())
         {
             // fast path for control changes only.
-            audioHost->SetPluginPreset(pluginInstanceId, presetValues.controls);
+            // (While a full build is outstanding, the running pedalboard's instance ids may name unrelated
+            // plugins; the installer applies the model's control values when the new pedalboard is installed.)
+            if (RunningInstanceIdsMatchPedalboard())
+            {
+                audioHost->SetPluginPreset(pluginInstanceId, presetValues.controls);
+            }
 
             std::vector<IPiPedalModelSubscriber::ptr> t{subscribers.begin(), subscribers.end()};
             for (auto &subscriber : t)
@@ -2654,13 +3217,20 @@ void PiPedalModel::DeleteMidiListeners(int64_t clientId)
     }
 }
 
-void PiPedalModel::OnPatchSetReply(uint64_t instanceId, LV2_URID patchSetProperty, const LV2_Atom *atomValue)
+void PiPedalModel::OnPatchSetReply(uint64_t instanceId, IEffect *sourceEffect, LV2_URID patchSetProperty, const LV2_Atom *atomValue)
 {
     std::vector<IPiPedalModelSubscriber::ptr> subscribers;
     std::vector<AtomOutputListener> atomOutputListeners;
     std::string propertyUri;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
+        uint64_t installedInstanceId = 0;
+        if (!RunningInstanceIdsMatchPedalboard() || !FindInstalledSender(this->lv2Pedalboard.get(), sourceEffect, &installedInstanceId))
+        {
+            // From the outgoing pedalboard (see OnNotifyMidiValueChanged()).
+            return;
+        }
+        instanceId = installedInstanceId;
 
         subscribers = this->subscribers;
         atomOutputListeners = this->atomOutputListeners;
@@ -2718,21 +3288,35 @@ void PiPedalModel::OnPatchSetReply(uint64_t instanceId, LV2_URID patchSetPropert
 
 void PiPedalModel::OnNotifyPathPatchPropertyReceived(
     int64_t instanceId,
+    const IEffect *sourceEffect,
     LV2_URID pathPatchProperty,
     LV2_Atom *pathProperty)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex);
 
+    // Identify the sender by address in the installed pedalboard. Just after a pedalboard is installed, until the
+    // audio thread has swapped it in, notifications still come from the outgoing pedalboard, whose instance ids
+    // may name different (non-reused) instances of the installed one; and a reused instance is only re-keyed to
+    // its new instance id at the swap.
+    uint64_t installedInstanceId = 0;
+    if (!FindInstalledSender(this->lv2Pedalboard.get(), sourceEffect, &installedInstanceId))
+    {
+        return; // from an outgoing pedalboard that is being replaced.
+    }
+    IEffect *effect = this->lv2Pedalboard->GetEffect(installedInstanceId); // == sourceEffect
+    instanceId = (int64_t)installedInstanceId;
+
     std::string pathPatchPropertyUri = this->pluginHost.Lv2UridToString(pathPatchProperty);
     std::string atomString = atomConverter.ToString(pathProperty);
     auto pedalboardItem = this->pedalboard.GetItem(instanceId);
 
-    if (this->audioHost)
+    if (effect->IsLv2Effect() && !effect->IsVst3())
     {
-        this->audioHost->OnNotifyPathPatchPropertyReceived(instanceId, pathPatchPropertyUri, atomString);
+        // keep the instance's own record of its path properties current (FindReusableInstances, snapshots).
+        ((Lv2Effect *)effect)->SetPathPatchProperty(pathPatchPropertyUri, atomString);
     }
 
-    if (pedalboardItem == nullptr)
+    if (pedalboardItem == nullptr || !RunningInstanceIdsMatchPedalboard())
     {
         return;
     }
@@ -3090,28 +3674,420 @@ void PiPedalModel::SetSelectedPedalboardPlugin(uint64_t clientId, uint64_t pedal
     pedalboard.selectedPlugin(pedalboardId);
 }
 
+// Pedalboard loading and threading.
+//
+// Instantiating plugins (e.g. loading a NAM model or a convolution IR) can take hundreds of milliseconds,
+// so Lv2Pedalboards are built on a dedicated non-realtime thread (pedalboardBuilder) without holding `mutex`.
+// Websocket handlers, MIDI program changes, posted tasks and the AudioHost reader thread
+// (OnNotifyMonitorPort) therefore never wait for plugin instantiation.
+//
+//  1. Under `mutex` (callers usually already hold it), LoadCurrentPedalboard() either applies a snapshot
+//     (fast path: structure identical to the last installed pedalboard, and no build outstanding), or calls
+//     RequestPedalboardBuild(), which copies this->pedalboard into a request and submits it.
+//     UpdateCurrentPedalboard() submits a request that reuses the running effect instances, unless a full
+//     build is still outstanding (PedalboardBuildModeTracker), in which case it is downgraded to a full build.
+//     Submitting bumps the builder's generation, so any older pending/in-flight build becomes stale.
+//     A pending request that has not started yet is replaced, so rapid successive changes coalesce.
+//  2. The builder thread calls BuildPedalboard() with no model lock held (CrashGuardLock and
+//     pluginHostConfigurationMutex held), producing an Lv2Pedalboard and its error list.
+//  3. The builder thread calls InstallBuiltPedalboard(), which takes `mutex`, re-checks that the generation
+//     is still current, and installs via audioHost->SetPedalboard(). Edits made to this->pedalboard while
+//     building are then applied as a snapshot, and the realtime VU/monitor subscriptions are refreshed.
+//     Stale builds (including builds that borrowed running effects) are discarded and freed on the builder
+//     thread (never on the realtime thread); see TryInstallBuiltPedalboard().
+//     Until the audio thread swaps the installed pedalboard in, notifications still come from the outgoing
+//     one: path property notifications are matched to their sender by address, and realtime parameter
+//     requests carry the instance-id lineage they are addressed to (Lv2Pedalboard::GetInstanceIdLineage()).
+//
+// Lock order: `mutex` -> pluginHostConfigurationMutex -> builder's internal mutex. The builder thread never
+// holds pluginHostConfigurationMutex while taking `mutex`. Only the installer (on the builder thread, so no build
+// is in progress) takes pluginHostConfigurationMutex under `mutex`; other code must not, since it is held for
+// the whole of a build. Build failures are reported to clients via OnErrorMessage.
+//
+// Clients are notified (FirePedalboardChanged) as soon as the model changes; the audio thread switches when
+// the build is installed. RestartAudio() invalidates outstanding builds (they were built for the old audio
+// configuration). Close() and ~PiPedalModel() join the builder thread without holding `mutex`, before the
+// audio host is closed; no build is installed after that.
 bool PiPedalModel::LoadCurrentPedalboard()
 {
-    CrashGuardLock crashGuardLock;
-    if (previousPedalboardLoaded && pedalboard.IsStructureIdentical(previousPedalboard))
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (previousPedalboardLoaded && pedalboardBuilder->IsIdle() && pedalboard.IsStructureIdentical(previousPedalboard))
     {
+        CrashGuardLock crashGuardLock;
         // then we can send a snapshot update instead!
         Snapshot snapshot = pedalboard.MakeSnapshotFromCurrentSettings(previousPedalboard);
         audioHost->LoadSnapshot(snapshot, pluginHost);
         this->previousPedalboard = this->pedalboard;
         return true;
     }
+    if (lastRequestedPedalboardValid && pedalboardBuilder &&
+        lastRequestedGeneration == pedalboardBuilder->CurrentGeneration() &&
+        !pedalboardBuilder->IsIdle() &&
+        pedalboard.IsStructureIdentical(lastRequestedPedalboard))
+    {
+        // e.g. a snapshot selected while a preset build is in flight: the outstanding (current) build has the
+        // same structure, and the installer applies this->pedalboard's current settings when it installs it.
+        return true;
+    }
+    RequestPedalboardBuild(false);
+    return true;
+}
 
-    Lv2PedalboardErrorList errorMessages;
-    std::shared_ptr<Lv2Pedalboard> lv2Pedalboard{this->pluginHost.CreateLv2Pedalboard(this->pedalboard, errorMessages)};
-    this->lv2Pedalboard = lv2Pedalboard;
+void PiPedalModel::RequestPedalboardBuild(bool reuseExistingEffects)
+{
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (closed || !pedalboardBuilder)
+    {
+        return;
+    }
+    PedalboardBuildRequest request;
+    request.pedalboard = this->pedalboard;
+    // A reuse request must never supersede an unfinished full build (the running pedalboard would then be
+    // of an unrelated lineage, and borrowing matches effects by instance id).
+    request.reuseExistingEffects = pedalboardBuilder->modeTracker.ResolveReuse(reuseExistingEffects);
+    request.audioEpoch = this->audioEpoch; // full builds: rejected if the audio is restarted before install.
+    lastRequestedPedalboard = this->pedalboard;
+    lastRequestedGeneration = pedalboardBuilder->Submit(std::move(request));
+    lastRequestedPedalboardValid = lastRequestedGeneration != 0;
+}
 
-    // apply the error messages to the lv2Pedalboard.
-    // return true if the error messages have changed
-    CheckForResourceInitialization(this->pedalboard);
+// Runs on the pedalboard builder thread. Apart from capturing the running pedalboard (under `mutex`), it only
+// uses the request and pluginHost (read-only, protected against configuration changes by
+// pluginHostConfigurationMutex).
+PedalboardBuildResult PiPedalModel::BuildPedalboard(PedalboardBuildRequest &request)
+{
+    PedalboardBuildResult result;
+    // Full builds (preset/bank switches): running effect instances whose persisted state matches an item of the
+    // new pedalboard (e.g. a NAM model that takes hundreds of ms to load) are reused instead of instantiated.
+    ExistingEffectMap reusableEffects;
+    if (request.reuseExistingEffects)
+    {
+        // Only the builder thread installs pedalboards, so this stays the running pedalboard until
+        // this build is installed (or the audio is stopped by RestartAudio(), which bumps audioEpoch).
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        request.outgoingPedalboard = this->lv2Pedalboard;
+        result.audioEpoch = this->audioEpoch;
+    }
+    else
+    {
+        // Same rules as borrowing by instance id: only from the pedalboard that is running now (captured here, at
+        // build time), only within the current audio epoch, and a build that actually borrowed instances follows
+        // the borrowing-build install rules (see TryInstallBuiltPedalboard). Borrowing doesn't modify the running
+        // effects: their new buffers, instance ids and settings are staged in the new pedalboard and applied on
+        // the audio thread when it is swapped in (Lv2Pedalboard::UpdateAudioPorts()).
+        std::shared_ptr<Lv2Pedalboard> runningPedalboard;
+        uint64_t runningAudioEpoch = 0;
+        std::string uploadDirectory;
+        {
+            std::lock_guard<std::recursive_mutex> lock(mutex);
+            if (!closed && this->lv2Pedalboard && !this->audioRestarting &&
+                request.audioEpoch == this->audioEpoch &&
+                pedalboardBuilder->modeTracker.CanReuseRunningInstances())
+            {
+                runningPedalboard = this->lv2Pedalboard;
+                runningAudioEpoch = this->audioEpoch;
+                uploadDirectory = storage.GetPluginUploadDirectory().string();
+            }
+        }
+        if (runningPedalboard)
+        {
+            // Without `mutex`, so that websocket handlers, MIDI and the AudioHost reader thread don't wait for
+            // the plugins' state save() calls. See FindReusableInstances() for why that is safe.
+            reusableEffects = FindReusableInstances(request.pedalboard, *runningPedalboard, uploadDirectory);
+            if (!reusableEffects.empty())
+            {
+                request.outgoingPedalboard = std::move(runningPedalboard);
+                result.audioEpoch = runningAudioEpoch;
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> configLock(pluginHostConfigurationMutex);
+    CrashGuardLock crashGuardLock;
+
+    result.pluginHostConfigurationVersion = this->pluginHostConfigurationVersion;
+    if (request.reuseExistingEffects)
+    {
+        result.lv2Pedalboard = std::shared_ptr<Lv2Pedalboard>(
+            this->pluginHost.UpdateLv2PedalboardStructure(request.pedalboard, request.outgoingPedalboard.get(), result.errorMessages));
+        result.borrowedRunningEffects = true;
+    }
+    else if (!reusableEffects.empty())
+    {
+        size_t candidates = reusableEffects.size();
+        result.lv2Pedalboard = std::shared_ptr<Lv2Pedalboard>(
+            this->pluginHost.CreateLv2PedalboardReusingInstances(request.pedalboard, reusableEffects, result.errorMessages));
+        result.reusedInstances = result.lv2Pedalboard->GetBorrowedEffectCount();
+        result.borrowedRunningEffects = result.reusedInstances != 0;
+        Lv2Log::debug(SS("Pedalboard load: reused " << result.reusedInstances << " of " << candidates
+                                                    << " matching plugin instance(s)."));
+    }
+    else
+    {
+        result.lv2Pedalboard = std::shared_ptr<Lv2Pedalboard>(
+            this->pluginHost.CreateLv2Pedalboard(request.pedalboard, result.errorMessages));
+        Lv2Log::debug("Pedalboard load: reused 0 plugin instances.");
+    }
+    return result;
+}
+
+// Called on the pedalboard builder thread, WITHOUT `mutex`.
+// Returns the running effects that can be reused for items of `pedalboard`, keyed by the item's instance id.
+//
+// The caller holds a shared_ptr to runningPedalboard, which keeps it and its effects alive. What is read here,
+// and why it doesn't need `mutex`:
+//  - the pedalboard's effect list and instance ids, and the effects' plugin URIs: not modified once built.
+//  - plugin state: Lv2Effect::GetLv2State() serializes the plugin's state save() per instance, so it can't run
+//    concurrently with the model's state-save path (AudioHost::UpdatePluginState(), called under `mutex`).
+//  - path properties: Lv2Effect::GetPathPatchProperties() copies the map under the instance's lock, which
+//    SetPathPatchProperty() (path property notifications, snapshot loads; under `mutex`) also takes.
+//  - uploadDirectory: copied by the caller under `mutex`.
+// The plugins' instantiation-class functions (activate/deactivate/cleanup), which must not run concurrently
+// with save(), only run when a pedalboard is installed (on this thread) or when an effect is destroyed
+// (prevented by the shared_ptr). runningPedalboard can't be replaced meanwhile, since only this thread installs
+// pedalboards. RestartAudio() can stop it, but then bumps audioEpoch, so a build that borrowed from it is
+// discarded by the installer.
+ExistingEffectMap PiPedalModel::FindReusableInstances(
+    const Pedalboard &pedalboard, Lv2Pedalboard &runningPedalboard, const std::string &uploadDirectory)
+{
+    ExistingEffectMap result;
+
+    std::vector<const PedalboardItem *> incoming = FlattenPedalboardItems(pedalboard);
+    std::set<std::string> incomingUris;
+    for (const PedalboardItem *item : incoming)
+    {
+        if (IsInstanceReuseCandidate(*item))
+        {
+            incomingUris.insert(item->uri());
+        }
+    }
+    if (incomingUris.empty())
+    {
+        return result;
+    }
+
+    // Path properties are stored as json atoms, abstract (relative to the upload directory) in pedalboards,
+    // but possibly absolute in the effect (when reported by the plugin). Compare normalized values.
+    PathPropertyNormalizer normalizePath = [&uploadDirectory](const std::string &jsonAtom)
+    {
+        // (as Storage::ToAbstractPathFromJson(), without touching storage.)
+        return AtomConverter::AbstractPath(json_variant::parse(jsonAtom), uploadDirectory).to_string();
+    };
+
+    // Describe the running instances by their *current* persisted state, read from the plugins: the
+    // pedalboard they were built from may be out of date (e.g. a model file was changed since).
+    std::vector<PedalboardItem> runningItems;
+    std::map<int64_t, std::shared_ptr<IEffect>> runningEffects;
+    auto &effects = runningPedalboard.GetSharedEffectList();
+    for (size_t effectIndex = 0; effectIndex < effects.size(); ++effectIndex)
+    {
+        const std::shared_ptr<IEffect> &effect = effects[effectIndex];
+        if (!effect->IsLv2Effect() || effect->IsVst3())
+        {
+            continue; // VST3 instances are never reused.
+        }
+        Lv2Effect *lv2Effect = (Lv2Effect *)effect.get();
+        if (!incomingUris.contains(lv2Effect->PluginUri()))
+        {
+            continue;
+        }
+        int64_t instanceId = (int64_t)runningPedalboard.GetInstanceIdAt(effectIndex);
+        if (runningEffects.contains(instanceId))
+        {
+            continue; // (can't happen) ambiguous.
+        }
+        std::optional<Lv2PluginState> state;
+        try
+        {
+            Lv2PluginState liveState;
+            if (lv2Effect->GetLv2State(&liveState))
+            {
+                state = std::move(liveState);
+            }
+        }
+        catch (const std::exception &e)
+        {
+            // in doubt about the plugin's state: don't reuse it.
+            Lv2Log::debug(SS("Not reusing " << lv2Effect->PluginUri() << ": can't read its state. " << e.what()));
+            continue;
+        }
+        runningItems.push_back(DescribeRunningInstance(
+            instanceId, lv2Effect->PluginUri(), state, lv2Effect->GetPathPatchProperties(), normalizePath));
+        runningEffects[instanceId] = effect;
+    }
+    if (runningItems.empty())
+    {
+        return result;
+    }
+
+    // Normalize the incoming items' path properties the same way.
+    std::vector<PedalboardItem> normalizedIncoming;
+    normalizedIncoming.reserve(incoming.size());
+    for (const PedalboardItem *item : incoming)
+    {
+        normalizedIncoming.push_back(DescribeIncomingItem(*item, normalizePath));
+    }
+
+    std::vector<const PedalboardItem *> runningPointers;
+    for (const auto &item : runningItems)
+    {
+        runningPointers.push_back(&item);
+    }
+    std::vector<const PedalboardItem *> incomingPointers;
+    for (const auto &item : normalizedIncoming)
+    {
+        incomingPointers.push_back(&item);
+    }
+
+    for (const auto &match : MatchReusableInstances(runningPointers, incomingPointers))
+    {
+        result[(uint64_t)match.first] = runningEffects.at(match.second);
+    }
+    return result;
+}
+
+static std::string SnapshotToJson(const Snapshot &snapshot)
+{
+    std::stringstream s;
+    json_writer writer(s, true);
+    writer.write(snapshot);
+    return s.str();
+}
+
+void PiPedalModel::OnPedalboardBuildFailed(const std::string &message)
+{
+    // Runs on the pedalboard builder thread, no locks held.
+    std::string error = SS("Failed to load pedalboard. " << message);
+    Lv2Log::error(error);
+
+    SubscriberList subscribers;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        // the running pedalboard may have been partially modified (borrowed effects); don't borrow again.
+        pedalboardBuilder->modeTracker.OnRunningPedalboardDiscarded();
+        pedalboardBuilder->InstallCompleted();
+        // don't leave the audio thread deferring MIDI for a build that will never be installed.
+        SendMidiAcks(pendingMidiAcks.OnBuildTerminated(pedalboardBuilder->IsIdle()));
+        if (pedalboardBuilder->IsIdle())
+        {
+            FailDeferredPatchRequests("Failed to load the pedalboard.");
+        }
+        subscribers = this->subscribers;
+    }
+    for (auto &subscriber : subscribers)
+    {
+        subscriber->OnErrorMessage(error);
+    }
+}
+
+// Runs on the pedalboard builder thread.
+void PiPedalModel::InstallBuiltPedalboard(uint64_t generation, PedalboardBuildRequest &request, PedalboardBuildResult &result)
+{
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    bool installed = TryInstallBuiltPedalboard(generation, request, result);
+    if (installed)
+    {
+        pedalboardBuilder->modeTracker.OnInstalled(request.reuseExistingEffects);
+    }
+    // under the lock, so that LoadCurrentPedalboard() sees an idle builder as soon as we're done.
+    pedalboardBuilder->InstallCompleted();
+
+    // Release MIDI program/snapshot acks that were waiting for this build. When installed, they follow the
+    // ReplaceEffect (audioHost->SetPedalboard()) in the host->realtime ring, so the audio thread replays its
+    // deferred MIDI against the new pedalboard.
+    bool idle = pedalboardBuilder->IsIdle();
+    SendMidiAcks(installed ? pendingMidiAcks.OnInstalled(generation, idle) : pendingMidiAcks.OnBuildTerminated(idle));
+
+    // Patch property requests deferred while a full build was outstanding: send them to the installed pedalboard,
+    // after the ReplaceEffect in the host->realtime ring. If this build was discarded and no newer one is coming,
+    // they can never be answered.
+    switch (OnBuildEndedDeferredPatchRequests(installed, RunningInstanceIdsMatchPedalboard(), idle))
+    {
+    case DeferredPatchRequestsAction::Send:
+        FlushDeferredPatchRequests();
+        break;
+    case DeferredPatchRequestsAction::Fail:
+        FailDeferredPatchRequests("The pedalboard was not loaded.");
+        break;
+    case DeferredPatchRequestsAction::Keep:
+        break;
+    }
+}
+
+// Called with `mutex` held, on the pedalboard builder thread. Returns true if the pedalboard was installed.
+bool PiPedalModel::TryInstallBuiltPedalboard(uint64_t generation, PedalboardBuildRequest &request, PedalboardBuildResult &result)
+{
+    if (closed || !audioHost)
+    {
+        return false;
+    }
+    // A build is installed only if current, not during an audio restart, requested (or, if it borrowed running
+    // effects, borrowed) in the current audio epoch, and built with the current plugin host configuration.
+    // Otherwise it is discarded (freed by the builder thread, never the realtime thread). This includes builds
+    // that borrowed running effects (reuse builds, and full builds that reused matching instances of the running
+    // pedalboard; see BuildPedalboard()): borrowing only stages its changes in the new pedalboard until the swap,
+    // so the running effects are left intact, and the build that superseded it borrows them again. Since only
+    // current builds are installed, the reconciliation below always sees the pedalboard that was last requested.
+    PedalboardInstallState state;
+    state.reuseBuild = result.borrowedRunningEffects;
+    state.isCurrent = pedalboardBuilder->IsCurrent(generation);
+    state.audioRestarting = this->audioRestarting;
+    state.buildAudioEpoch = result.borrowedRunningEffects ? result.audioEpoch : request.audioEpoch;
+    state.currentAudioEpoch = this->audioEpoch;
+    state.buildConfigurationVersion = result.pluginHostConfigurationVersion;
+    {
+        // Doesn't block: we are on the builder thread, so no build holds this mutex.
+        std::lock_guard<std::mutex> configLock(pluginHostConfigurationMutex);
+        state.currentConfigurationVersion = this->pluginHostConfigurationVersion;
+    }
+    if (!ShouldInstallBuiltPedalboard(state))
+    {
+        return false;
+    }
+    // A full build's instance ids may name unrelated plugins of the running pedalboard (ids collide across
+    // presets): realtime parameter requests addressed to the running pedalboard's ids must not reach it if
+    // the audio thread processes them after the swap (see Lv2Pedalboard::ProcessParameterRequests()).
+    if (!request.reuseExistingEffects)
+    {
+        ++instanceIdLineage;
+    }
+    result.lv2Pedalboard->SetInstanceIdLineage(instanceIdLineage); // not yet visible to the audio thread.
+
+    // Reused instances get the new items' control values and enabled state on the audio thread, when the
+    // pedalboard is swapped in (Lv2Pedalboard::UpdateAudioPorts()).
+    this->lv2Pedalboard = result.lv2Pedalboard;
+    // result.errorMessages have already been logged by Lv2Pedalboard::Prepare (errors are also reported
+    // through the effects themselves). They are kept in the result for callers that want them.
+
+    CheckForResourceInitialization(request.pedalboard);
     audioHost->SetPedalboard(lv2Pedalboard);
-    previousPedalboard = this->pedalboard;
+    previousPedalboard = std::move(request.pedalboard);
     previousPedalboardLoaded = true;
+
+    // Apply edits that were made to this->pedalboard while the build was in progress
+    // (control changes, bypass, volumes). Structural changes would have submitted a newer build.
+    if (this->pedalboard.IsStructureIdentical(previousPedalboard))
+    {
+        Snapshot current = this->pedalboard.MakeSnapshotFromCurrentSettings(previousPedalboard);
+        Snapshot built = previousPedalboard.MakeSnapshotFromCurrentSettings(previousPedalboard);
+        if (SnapshotToJson(current) != SnapshotToJson(built))
+        {
+            CrashGuardLock crashGuardLock;
+            audioHost->LoadSnapshot(current, pluginHost);
+        }
+        if (this->pedalboard.input_volume_db() != previousPedalboard.input_volume_db())
+        {
+            audioHost->SetInputVolume(this->pedalboard.input_volume_db());
+        }
+        if (this->pedalboard.output_volume_db() != previousPedalboard.output_volume_db())
+        {
+            audioHost->SetOutputVolume(this->pedalboard.output_volume_db());
+        }
+        previousPedalboard = this->pedalboard;
+    }
+
+    UpdateRealtimeVuSubscriptions();
+    UpdateRealtimeMonitorPortSubscriptions();
     return true;
 }
 
@@ -3583,12 +4559,19 @@ ChannelRouterSettings::ptr PiPedalModel::GetChannelRouterSettings()
 
 void PiPedalModel::SetChannelRouterSettings(int64_t clientId, ChannelRouterSettings::ptr &settings)
 {
+    JackConfiguration jackConfiguration;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         this->channelRouterSettings = settings;
         this->storage.SetChannelRouterSettings(settings);
-        this->pluginHost.OnConfigurationChanged(jackConfiguration, *settings);
+        jackConfiguration = this->jackConfiguration;
         CancelAudioRetry();
+    }
+    {
+        // Not under `mutex`: this waits for any in-flight pedalboard build, which must not block the model.
+        std::lock_guard<std::mutex> configLock(pluginHostConfigurationMutex);
+        ++pluginHostConfigurationVersion;
+        this->pluginHost.OnConfigurationChanged(jackConfiguration, *settings);
     }
     RestartAudio(); // no lock to avoid mutex deadlock when reader thread is sending notifications..
 
@@ -3597,11 +4580,11 @@ void PiPedalModel::SetChannelRouterSettings(int64_t clientId, ChannelRouterSetti
 
 std::string PiPedalModel::Tone3000ThumbnailDirectory()
 {
-    return "/var/pipedal/audio_uploads/tone3000_thumbnails";
+    return TONE3000_THUMBNAILS_ROOT.string();
 }
 std::string PiPedalModel::OldTone3000ThumbnailDirectory()
 {
-    return "/var/pipedal/tone3000_thumbnails";
+    return LEGACY_TONE3000_THUMBNAILS_ROOT.string();
 }
 
 void PiPedalModel::EnableUpdater(bool enable)
@@ -3611,15 +4594,7 @@ void PiPedalModel::EnableUpdater(bool enable)
 
 static bool IsSafeMediaPath(const fs::path path)
 {
-    if (!HtmlHelper::IsSafeFileName(path))
-    {
-        return false;
-    }
-    if (!(path.string().starts_with("/var/pipedal/audio_uploads")))
-    {
-        return false;
-    }
-    return true;
+    return IsPathInAudioUploads(path);
 }
 
 void PiPedalModel::WriteTone3000Readme(const std::filesystem::path &filePath, const tone3000::Tone &tone, const std::string &thumbnailUrl)

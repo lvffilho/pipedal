@@ -142,6 +142,7 @@ MimeTypes::MimeTypes()
     AddMimeType("OGA", "application/ogg");
     AddMimeType("AAC", "audio/aac");
     AddMimeType("AAC", "audio/aac-adts");
+    AddMimeType("OPUS", "audio/opus");
     AddMimeType("MKA", "audio/x-matroska");
     AddMimeType("MID", "audio/midi");
     AddMimeType("MIDI", "audio/midi");

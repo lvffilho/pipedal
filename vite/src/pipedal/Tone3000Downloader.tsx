@@ -13,7 +13,7 @@ import { safeFilenameEncode } from "./SafeFilename";
 
 // const  T3K_API = "https://www.tone3000.com";
 // used to check for online status.
-let TONE3000_PING_URL = "https://www.tone3000.com/robots.txt";
+const TONE3000_PING_URL = "https://www.tone3000.com/robots.txt";
 
 
 async function asyncSleep(ms: number): Promise<void> {
@@ -49,7 +49,7 @@ class DownloadThrottler {
         }
 
 
-        let downloadCount = this.downloadCount;
+        const downloadCount = this.downloadCount;
         let delay: number;
         if (downloadCount < THROTTLING_TRIGGGER_LEVEL) { 
             delay = 0;
@@ -68,17 +68,34 @@ class DownloadThrottler {
 
 function runThrottlerTest() {
     // just dump the delay times for a few downloads to the debugger console, to verify that the throttler is working as expected;
-    let throttler = new DownloadThrottler();
+    const throttler = new DownloadThrottler();
 
     let download = 0;
     let now = 0;
     console.debug("Tone3000 Throttler Test");
 
     while (download < ALLOWED_DOWNLOADS_PER_MINUTE *4) {
-        let delay = throttler.getThrottleDelay(now);
+        const delay = throttler.getThrottleDelay(now);
         now += delay;
         ++download;
     } 
+}
+
+
+// t3k_uploadAsset answers JSON, but errors produced by the web server itself (e.g. 503 when too many
+// uploads are in progress) are HTML pages. Don't try to parse those as JSON.
+async function readUploadResult(uploadResponse: Response, what: string): Promise<any> {
+    if (uploadResponse.status === 503) {
+        throw new Error(`${what}: the server is busy with other uploads. Please retry.`);
+    }
+    if (!uploadResponse.ok) {
+        throw new Error(`${what}: ${uploadResponse.status} ${uploadResponse.statusText}`);
+    }
+    try {
+        return await uploadResponse.json();
+    } catch (e) {
+        throw new Error(`${what}: invalid server response.`);
+    }
 }
 
 export class Tone3000DownloadHandler {
@@ -116,10 +133,10 @@ export class Tone3000DownloadHandler {
                 model.showAlert("TONE3000 authentication failed. Please try again.");
             }
         );
-        let this_ = this;
+        const this_ = this;
         this.messageEventListener = (event: MessageEvent) => {
             if (event.data?.type === "t3k_response") {
-                let uri = event.data.uri;
+                const uri = event.data.uri;
                 this.handleTone3000DownloadComplete();
                 if (uri) {
 
@@ -154,7 +171,7 @@ export class Tone3000DownloadHandler {
             return;
 
         }
-        let tone3000PckceParams: Tone3000PkceParams = {
+        const tone3000PckceParams: Tone3000PkceParams = {
             publishableKey: PUBLISHABLE_KEY,
             redirectUrl: this.redirectUrl(),
             codeChallenge: this.pkceParams.codeChallenge,
@@ -176,7 +193,7 @@ export class Tone3000DownloadHandler {
     private progress: Tone3000DownloadProgress = new Tone3000DownloadProgress();
 
     private async throttleRequests(): Promise<boolean> {
-        let now = Date.now();
+        const now = Date.now();
         let delay = this.throttler.getThrottleDelay(now);
         while (delay > 0) {
             await asyncSleep(250);
@@ -201,7 +218,7 @@ export class Tone3000DownloadHandler {
         this.model.onTone3000DownloadStarted(this.progress.handle, this.progress.title);
     }
     private onTone3000DownloadProgress(progress: Tone3000DownloadProgress) {
-        let newProgress = progress.clone();
+        const newProgress = progress.clone();
         this.model.onTone3000DownloadProgress(newProgress);
     }
     private onTone3000DownloadError(errorMessage: string) {
@@ -215,7 +232,7 @@ export class Tone3000DownloadHandler {
 
 
     private async maybeSelectModels(toneName: string, models: Model[]): Promise<Model[]> {
-        let result = new Promise<Model[]>((resolve, reject) => {
+        const result = new Promise<Model[]>((resolve, reject) => {
             if (models.length < PROMPT_FOR_SELECT_THRESHOLD) {
                 resolve(models);
                 return;
@@ -253,7 +270,7 @@ export class Tone3000DownloadHandler {
             }
 
             if (!await this.throttleRequests()) return;
-            let tokenResponse = await handleOAuthCallback(
+            const tokenResponse = await handleOAuthCallback(
                 PUBLISHABLE_KEY,
                 this.redirectUrl(),
                 responseUri);
@@ -279,14 +296,62 @@ export class Tone3000DownloadHandler {
             if (tokenResponse.toneId == undefined) {
                 throw new Error("No tone selected. Please try again.");
             }
-            let toneId = tokenResponse.toneId;
+            // The popup flow's own tokens, not the server session's.
+            this.t3kClient.setTokenProvider(null);
+            await this.downloadTone(tokenResponse.toneId, downloadType);
+        } catch (error) {
+            let message = getErrorMessage(error);
+            if (this.progress.progress > 0) {
+                message += " (" + this.progress.progress.toString() + "/" + this.progress.total.toString() + " models downloaded)";    
+            }
+            this.onTone3000DownloadError(message);
+            return;
+        }
+    }
+
+
+    /**
+     * Download a tone using the PiPedal server's TONE3000 session (device-code sign-in) instead of
+     * the popup flow. The browser fetches model files with short-lived access tokens obtained from
+     * the server, then uploads them to the server exactly as the popup flow does.
+     */
+    public async downloadToneWithServerAuth(
+        toneId: string | number,
+        downloadType: Tone3000DownloadType,
+        downloadPath: string,
+        modelIds?: number[], // only these models (picked in the catalog browser).
+        allModels: boolean = false // every model was chosen in the catalog browser: skip the second picker.
+    ): Promise<void> {
+        if (this.progress.transferring) {
+            throw new Error("A TONE3000 download is already in progress.");
+        }
+        this.downloadPath = downloadPath;
+        this.downloadType = downloadType;
+        this.model.showTone3000DownloadStatus();
+        try {
+            this.onTone3000DownloadStarted();
+            this.t3kClient.setTokenProvider((forceRefresh: boolean, rejectedAccessToken?: string) =>
+                this.model.t3kGetAccessToken(forceRefresh, rejectedAccessToken));
+            await this.downloadTone(String(toneId), downloadType, modelIds, allModels);
+        } catch (error) {
+            let message = getErrorMessage(error);
+            if (this.progress.progress > 0) {
+                message += " (" + this.progress.progress.toString() + "/" + this.progress.total.toString() + " models downloaded)";    
+            }
+            this.onTone3000DownloadError(message);
+            return;
+        }
+    }
+
+    // Everything after authentication: tone info, model list, model files, thumbnail, README.
+    private async downloadTone(toneId: string, downloadType: Tone3000DownloadType, modelIds?: number[], allModels: boolean = false): Promise<void> {
 
             this.progress.title = "Fetching tone information...";
             this.onTone3000DownloadProgress(this.progress);
 
 
              if (!await this.throttleRequests()) return;
-            let tone: Tone = await this.t3kClient.getTone(tokenResponse.toneId);
+            const tone: Tone = await this.t3kClient.getTone(toneId);
 
             if (this.checkForCancel()) {
                 return;
@@ -309,7 +374,7 @@ export class Tone3000DownloadHandler {
                     return;
                 }
 
-                let modelsThisTime: PaginatedResponse<Model> = await this.t3kClient.listModels(toneId, page, 800, architectureFilter);
+                const modelsThisTime: PaginatedResponse<Model> = await this.t3kClient.listModels(toneId, page, 800, architectureFilter);
                 models.push(...modelsThisTime.data);
                 if (modelsThisTime.total_pages <= page) {
                     break;
@@ -317,14 +382,23 @@ export class Tone3000DownloadHandler {
                 ++page;
             }
 
-            try {
+            if (modelIds !== undefined) {
+                // Already picked in the catalog browser.
+                const wanted = new Set<number>(modelIds);
+                models = models.filter((m) => wanted.has(m.id));
+                if (models.length === 0) {
+                    throw new Error("The selected models are no longer available on TONE3000.");
+                }
+            } else if (allModels) {
+                // "All models" was chosen in the catalog browser: no second picker.
+            } else try {
                 models = await this.maybeSelectModels(tone.title, models);
             } catch (e) {
                 // canceled.
                 this.onTone3000DownloadComplete("");
                 return;
             }
-            let uploadPath = this.downloadPath;
+            const uploadPath = this.downloadPath;
             let extension: string | null = null;;
             if (tone.platform) 
             {
@@ -362,6 +436,7 @@ export class Tone3000DownloadHandler {
             this.onTone3000DownloadProgress(this.progress);
 
             let lastUpdateTime = Date.now();
+            let irFolderResolved = false;
 
 
                 for (const model of models) {
@@ -376,10 +451,10 @@ export class Tone3000DownloadHandler {
                 if (!model.model_url) {
                     throw new Error("Model " + model.name + " does not have a model URL.");
                 }
-                let modelUploadPath = toneUploadPath + safeFilenameEncode(model.name) + extension;
+                const modelUploadPath = toneUploadPath + safeFilenameEncode(model.name) + extension;
 
-                let accessToken = await this.t3kClient.getAccessToken();
-                let modelResult = await fetch(model.model_url,
+                const accessToken = await this.t3kClient.getAccessToken();
+                const modelResult = await fetch(model.model_url,
                     {
                         headers: {
                             Authorization: `Bearer ${accessToken}`,
@@ -397,6 +472,10 @@ export class Tone3000DownloadHandler {
 
                 let serverUrl = this.model.varServerUrl + "t3k_uploadAsset?path="
                     + encodeURIComponent(modelUploadPath);
+                if (extension === ".wav") {
+                    // Let the server classify the IR (cab vs reverb) by catalog gear, then length.
+                    serverUrl += "&irGear=" + encodeURIComponent(tone.gear ?? "");
+                }
 
                 // get the content length of modelResult from modelResult headers (modelresult is the return value from fetch())
                 const strContentLength = modelResult.headers.get('Content-Length');
@@ -422,14 +501,19 @@ export class Tone3000DownloadHandler {
                     },
                 });
 
-                if (!uploadResponse.ok) {
-                    throw new Error(`Upload failed: ${uploadResponse.statusText}`);
-                }
                 // discard the response body, if any, to free up memory
-                let uploadResult: any = await uploadResponse.json();
+                const uploadResult: any = await readUploadResult(uploadResponse, "Upload failed");
 
                 if (!uploadResult.ok === true) {
                     throw new Error(`Upload failed: ${uploadResult.error ?? "Unknown error."}`);
+                }
+                if (extension === ".wav" && !irFolderResolved && typeof uploadResult.path === "string") {
+                    // The server may have routed the IR to a different root (CabIR / ReverbImpulseFiles).
+                    irFolderResolved = true;
+                    const slash = uploadResult.path.lastIndexOf("/");
+                    if (slash > 0) {
+                        toneUploadPath = uploadResult.path.substring(0, slash + 1);
+                    }
                 }
                 this.progress.progress++;
             }
@@ -439,9 +523,9 @@ export class Tone3000DownloadHandler {
 
                 await this.throttleRequests();
 
-                let accessToken = await this.t3kClient.getAccessToken();
-                let thumbnailUrl = tone.images[0];
-                let thumbnailResult = await fetch(thumbnailUrl,   
+                const accessToken = await this.t3kClient.getAccessToken();
+                const thumbnailUrl = tone.images[0];
+                const thumbnailResult = await fetch(thumbnailUrl,   
                     {
                         headers: {
                             Authorization: `Bearer ${accessToken}`,
@@ -456,7 +540,7 @@ export class Tone3000DownloadHandler {
                 if (this.checkForCancel()) {
                     return;
                 }
-                let mediaType = thumbnailResult.headers.get("Content-Type");
+                const mediaType = thumbnailResult.headers.get("Content-Type");
                 if (mediaType == null) {
                     throw new Error("Thumbnail download failed: Content-Type header is missing.");  
                 }
@@ -474,12 +558,12 @@ export class Tone3000DownloadHandler {
                     default:
                         throw new Error(`Thumbnail download failed: Unexpected media type '${mediaType}'.`);
                 }
-                let blob = await thumbnailResult.blob();
+                const blob = await thumbnailResult.blob();
                 
                 const TONE3000_THUMBNAIL_PATH = "/var/pipedal/audio_uploads/tone3000_thumbnails/";
-                let thumbnailUploadPath = TONE3000_THUMBNAIL_PATH + tone.id +  extension;
+                const thumbnailUploadPath = TONE3000_THUMBNAIL_PATH + tone.id +  extension;
 
-                 let serverUrl = this.model.varServerUrl + "t3k_uploadAsset?path="
+                 const serverUrl = this.model.varServerUrl + "t3k_uploadAsset?path="
                     + encodeURIComponent(thumbnailUploadPath);
 
                 const uploadResponse = await fetch(serverUrl, {
@@ -492,10 +576,7 @@ export class Tone3000DownloadHandler {
                     },
                 });
 
-                if (!uploadResponse.ok) {
-                    throw new Error(`Thumbnail upload failed: ${uploadResponse.statusText}`);
-                }
-                 let uploadResult: any = await uploadResponse.json();
+                const uploadResult: any = await readUploadResult(uploadResponse, "Thumbnail upload failed");
 
                 if (!uploadResult.ok === true) {
                     throw new Error(`Thumbnail upload failed: ${uploadResult.error ?? "Unknown error."}`);
@@ -503,24 +584,16 @@ export class Tone3000DownloadHandler {
                 toobThubmnailUrl = "/var/t3k_thumbnail?id=" + tone.id;  
 
             }
-            let readmePath = toneUploadPath + "README.md";
+            const readmePath = toneUploadPath + "README.md";
             this.model.writeTone3000Readme(readmePath, tone, toobThubmnailUrl);
 
             this.onTone3000DownloadComplete(toneUploadPath);
-        } catch (error) {
-            let message = getErrorMessage(error);
-            if (this.progress.progress > 0) {
-                message += " (" + this.progress.progress.toString() + "/" + this.progress.total.toString() + " models downloaded)";    
-            }
-            this.onTone3000DownloadError(message);
-            return;
-        }
     }
 
     private popupWindow: Window | null = null;
 
     private redirectUrl(): string {
-        let serverUrl = this.model.t3k_redirect_url;
+        const serverUrl = this.model.t3k_redirect_url;
         if (serverUrl === null || serverUrl === "") {
             throw new Error("Unable to find an IP4 address for the PiPedalServer. Feature disabled.");
         }
@@ -578,15 +651,15 @@ export class Tone3000DownloadHandler {
         this.downloadType = downloadType;
 
         let popupWidth = Math.floor(window.innerWidth * 0.8);
-        let popupHeight = Math.floor(window.innerHeight * 0.8);
+        const popupHeight = Math.floor(window.innerHeight * 0.8);
         if (window.innerWidth < 410) {
             popupWidth = 400;
         }
 
         this.model.showTone3000DownloadStatus();
 
-        let launchInstance = ++this.launchInstance;
-        let cancelled = () => {
+        const launchInstance = ++this.launchInstance;
+        const cancelled = () => {
             return (launchInstance !== this.launchInstance) || this.popupWindow == null || this.popupWindow.closed;
         }
 
@@ -613,7 +686,7 @@ export class Tone3000DownloadHandler {
                     redirectUrl: this.redirectUrl()
                 };
                 // verify that the server matches.
-                let testcodeChallenge = await this.model.sha256Base64url(pkceParams.codeVerifier);
+                const testcodeChallenge = await this.model.sha256Base64url(pkceParams.codeVerifier);
                 if (testcodeChallenge !== pkceParams.codeChallenge) {
                     throw new Error("model.sha256Base64url produces incorrect results. ");
                 }
@@ -643,7 +716,7 @@ export class Tone3000DownloadHandler {
             }
             // No procedure for detecting 404, so let's ping the server to see if it's reachable, and cancel if it's not.
             try {
-                let response = await fetch(TONE3000_PING_URL, { method: "HEAD", cache: "no-cache" });
+                const response = await fetch(TONE3000_PING_URL, { method: "HEAD", cache: "no-cache" });
                 if (cancelled()) return;
                 if (!response.ok) {
                     // offline

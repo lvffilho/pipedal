@@ -20,6 +20,8 @@
 #include "pch.h"
 #include "restrict.hpp"
 #include "Lv2Effect.hpp"
+#include "PresetInstanceReuse.hpp"
+#include "ZeroInputMix.hpp"
 #include "PiPedalException.hpp"
 #include <lv2/lv2plug.in/ns/ext/worker/worker.h>
 #include <lilv/lilv.h>
@@ -69,6 +71,13 @@ inline void Lv2Effect::CheckStagingBufferSentries()
         }
 
     }
+    for (size_t i = 0; i < sidechainStagingBuffers.size(); ++i)
+    {
+        if (sidechainStagingBuffers[i].at(stagingBufferSize) != 99.9f)
+        {
+            throw std::logic_error("Staging buffer sentry overwritten.");
+        }
+    }
     for (size_t i = 0; i < outputStagingBuffers.size(); ++i)
     {
         if (outputStagingBuffers[i].at(stagingBufferSize) != 99.9f)
@@ -79,6 +88,8 @@ inline void Lv2Effect::CheckStagingBufferSentries()
     }
 #endif
 }
+
+std::atomic<uint64_t> Lv2Effect::droppedPathPatchProperties{0};
 
 Lv2Effect::Lv2Effect(
     IHost *pHost_,
@@ -94,7 +105,9 @@ Lv2Effect::Lv2Effect(
 
     optionsFeature.Prepare(pHost->GetMapFeature(), 44100, stagedBufferSize, pHost->GetAtomBufferSize());
 
-    this->bypassStartingSamples = (uint32_t)(pHost->GetSampleRate() * BYPASS_TIME_S);
+    this->bypassFader.SetFadeSamples((uint32_t)(pHost->GetSampleRate() * BYPASS_TIME_S));
+    this->instantiatedSampleRate = pHost->GetSampleRate();
+    this->instantiatedMaxBufferSize = pHost->GetMaxAudioBufferSize();
 
     this->bypass = pedalboardItem.isEnabled();
 
@@ -111,7 +124,10 @@ Lv2Effect::Lv2Effect(
             LV2_URID filePropertyUrid = pHost->GetLv2Urid(fileProperty->patchProperty().c_str());
             this->pathProperties.push_back(filePropertyUrid);
 
-            this->pathPropertyWriters.push_back(PatchPropertyWriter(instanceId, filePropertyUrid));
+            // Reserve for the largest atom the plugin can emit (bounded by its atom output
+            // buffer) so GatherPathPatchProperties never grows the buffer on the audio thread.
+            this->pathPropertyWriters.push_back(
+                PatchPropertyWriter(instanceId, filePropertyUrid, pHost->GetAtomBufferSize()));
         }
     }
     for (auto &pathProperty : pedalboardItem.pathProperties_)
@@ -449,6 +465,45 @@ void Lv2Effect::PreparePortIndices()
     }
 }
 
+bool Lv2Effect::BorrowKeepsBufferLayout(size_t numberOfInputs, size_t maxBufferSize) const
+{
+    EffectBufferLayout layout;
+    layout.inputAudioPorts = inputAudioPortIndices.size();
+    layout.outputAudioPorts = outputAudioPortIndices.size();
+    layout.inputAudioBuffers = inputAudioBuffers.size();
+    layout.outputAudioBuffers = outputAudioBuffers.size();
+    layout.passThroughOutputs = (size_t)numberOfOutputs;
+    layout.outputMixBuffers = outputMixBuffers.size();
+    for (const auto &mixBuffer : outputMixBuffers)
+    {
+        if (mixBuffer.size() != maxBufferSize)
+        {
+            layout.outputMixBuffersSized = false;
+        }
+    }
+    return pipedal::BorrowKeepsBufferLayout(layout, numberOfInputs);
+}
+
+void Lv2Effect::SetBorrowedAudioBuffers(
+    const std::vector<float *> &inputs,
+    const std::vector<float *> &sidechains,
+    const std::vector<float *> &outputs)
+{
+    // audio thread: sizes are unchanged by borrowing (BorrowKeepsBufferLayout); copy without allocating.
+    for (size_t i = 0; i < inputs.size() && i < inputAudioBuffers.size(); ++i)
+    {
+        inputAudioBuffers[i] = inputs[i];
+    }
+    for (size_t i = 0; i < sidechains.size() && i < inputSidechainBuffers.size(); ++i)
+    {
+        inputSidechainBuffers[i] = sidechains[i];
+    }
+    for (size_t i = 0; i < outputs.size() && i < outputAudioBuffers.size(); ++i)
+    {
+        outputAudioBuffers[i] = outputs[i];
+    }
+}
+
 void Lv2Effect::PrepareNoInputEffect(int numberOfInputs, size_t maxBufferSize)
 {
     if (outputAudioPortIndices.size() == 0)
@@ -468,11 +523,15 @@ void Lv2Effect::PrepareNoInputEffect(int numberOfInputs, size_t maxBufferSize)
         {
             outputMixBuffers.at(i).resize(maxBufferSize);
         }
-        // connect the plugin to the mix buffer instead of output buffer.
+        // connect the plugin to the mix buffer instead of output buffer (with buffer staging: to the output
+        // staging buffers, which RunWithBufferStaging copies into the mix buffers).
+        bool staged = GetAudioOutputPortConnection(0, stagingBufferSize != 0) == AudioOutputPortConnection::StagingBuffer;
         for (size_t i = 0; i < outputAudioPortIndices.size(); ++i)
         {
             int pluginIndex = this->outputAudioPortIndices.at(i);
-            lilv_instance_connect_port(this->pInstance, pluginIndex, outputMixBuffers.at(i).data());
+            lilv_instance_connect_port(
+                this->pInstance, pluginIndex,
+                staged ? outputStagingBufferPointers.at(i) : outputMixBuffers.at(i).data());
         }
     }
 }
@@ -489,33 +548,16 @@ void Lv2Effect::SetAudioInputBuffer(int index, float *buffer)
         return;
     }
 
-    if (inputAudioPortIndices.size() == inputAudioBuffers.size())
+    // (zero-input and zero-output plugins may have more input buffers than input ports, see
+    // PrepareNoInputEffect: the extra buffers are only read by MixOutput.)
+    if ((size_t)index >= inputAudioPortIndices.size())
     {
-        if (stagingBufferSize != 0)
-        {
-            int pluginIndex = this->inputAudioPortIndices.at(index);
-            if (index >= inputStagingBufferPointers.size())
-            {
-                throw std::runtime_error("Invalid input staging buffer index.");
-            }
-            lilv_instance_connect_port(this->pInstance, pluginIndex, inputStagingBufferPointers.at(index));
-        }
-        else
-        {
-            int pluginIndex = this->inputAudioPortIndices.at(index);
-            lilv_instance_connect_port(this->pInstance, pluginIndex, buffer);
-        }
+        return;
     }
-    else
-    {
-        throw std::runtime_error("Invalid input buffer index.");
-        // // cases: 1->0, 1->1, 2->0, 2->1
-        // if (index < inputAudioPortIndices.size())
-        // {
-        //     int pluginIndex = this->inputAudioPortIndices.at(index);
-        //     lilv_instance_connect_port(this->pInstance, pluginIndex, buffer);
-        // }
-    }
+    int pluginIndex = this->inputAudioPortIndices.at(index);
+    lilv_instance_connect_port(
+        this->pInstance, pluginIndex,
+        stagingBufferSize != 0 ? inputStagingBufferPointers.at(index) : buffer);
 }
 void Lv2Effect::SetAudioSidechainBuffer(int index, float *buffer)
 {
@@ -581,28 +623,24 @@ void Lv2Effect::SetAudioOutputBuffer(int index, float *buffer)
         return;
     }
 
-    if (this->inputAudioPortIndices.size() != 0) // i.e. we're not mixing a zero-input control
+    // (a zero-input plugin may have more output buffers than output ports: see PrepareNoInputEffect.)
+    if ((size_t)index >= this->outputAudioPortIndices.size())
     {
-        if (this->stagingBufferSize != 0)
-        {
-            if ((size_t)index < this->outputStagingBufferPointers.size())
-            {
-                int pluginIndex = this->outputAudioPortIndices.at(index);
-                lilv_instance_connect_port(pInstance, pluginIndex, outputStagingBufferPointers.at(index));
-            }
-            else
-            {
-                throw std::runtime_error("outputStagingBufferPointers index out of range.");
-            }
-        }
-        else
-        {
-            if ((size_t)index < this->outputAudioPortIndices.size())
-            {
-                int pluginIndex = this->outputAudioPortIndices.at(index);
-                lilv_instance_connect_port(pInstance, pluginIndex, buffer);
-            }
-        }
+        return;
+    }
+    int pluginIndex = this->outputAudioPortIndices.at(index);
+    switch (GetAudioOutputPortConnection(this->inputAudioPortIndices.size(), this->stagingBufferSize != 0))
+    {
+    case AudioOutputPortConnection::MixBuffer:
+        // zero-input plugins without buffer staging: PrepareNoInputEffect connected the port to its output
+        // mix buffer; `buffer` only receives MixOutput()'s result.
+        break;
+    case AudioOutputPortConnection::StagingBuffer:
+        lilv_instance_connect_port(pInstance, pluginIndex, outputStagingBufferPointers.at(index));
+        break;
+    case AudioOutputPortConnection::OutputBuffer:
+        lilv_instance_connect_port(pInstance, pluginIndex, buffer);
+        break;
     }
 }
 
@@ -687,12 +725,18 @@ void Lv2Effect::UpdateAudioPorts()
                     lilv_instance_connect_port(pInstance, portIndex, inputStagingBufferPointers.at(i));
                 }
             }
-            for (size_t i = 0; i < this->outputAudioPortIndices.size(); ++i)
+            // With buffer staging, every plugin (zero-input plugins included, see PrepareNoInputEffect) writes
+            // to its own output staging buffers, which borrowing doesn't change.
+            if (GetAudioOutputPortConnection(this->inputAudioPortIndices.size(), true) ==
+                AudioOutputPortConnection::StagingBuffer)
             {
-                int portIndex = this->outputAudioPortIndices.at(i);
-                if (outputStagingBufferPointers.at(i) != nullptr)
+                for (size_t i = 0; i < this->outputAudioPortIndices.size(); ++i)
                 {
-                    lilv_instance_connect_port(pInstance, portIndex, outputStagingBufferPointers.at(i));
+                    int portIndex = this->outputAudioPortIndices.at(i);
+                    if (outputStagingBufferPointers.at(i) != nullptr)
+                    {
+                        lilv_instance_connect_port(pInstance, portIndex, outputStagingBufferPointers.at(i));
+                    }
                 }
             }
             for (size_t i = 0; i < this->inputSidechainPortIndices.size(); ++i)
@@ -741,12 +785,17 @@ void Lv2Effect::UpdateAudioPorts()
                     lilv_instance_connect_port(pInstance, portIndex, GetAudioInputBuffer(i));
                 }
             }
-            for (size_t i = 0; i < this->outputAudioPortIndices.size(); ++i)
+            // (zero-input plugins stay connected to their output mix buffers; see SetAudioOutputBuffer.)
+            if (GetAudioOutputPortConnection(this->inputAudioPortIndices.size(), false) ==
+                AudioOutputPortConnection::OutputBuffer)
             {
-                int portIndex = this->outputAudioPortIndices.at(i);
-                if (GetAudioOutputBuffer(i) != nullptr)
+                for (size_t i = 0; i < this->outputAudioPortIndices.size(); ++i)
                 {
-                    lilv_instance_connect_port(pInstance, portIndex, GetAudioOutputBuffer(i));
+                    int portIndex = this->outputAudioPortIndices.at(i);
+                    if (GetAudioOutputBuffer(i) != nullptr)
+                    {
+                        lilv_instance_connect_port(pInstance, portIndex, GetAudioOutputBuffer(i));
+                    }
                 }
             }
             for (size_t i = 0; i < this->inputSidechainPortIndices.size(); ++i)
@@ -785,14 +834,24 @@ void Lv2Effect::UpdateAudioPorts()
 
 void Lv2Effect::AssignUnconnectedPorts()
 {
+    // (with buffer staging, unconnected ports use their staging buffers: RunWithBufferStaging zero-fills
+    // the staged input of an unconnected input, and doesn't copy out the output of an unconnected output.)
+    bool staged = stagingBufferSize != 0;
     for (size_t i = 0; i < this->inputAudioPortIndices.size(); ++i)
     {
         if (GetAudioInputBuffer(i) == nullptr)
         {
             int pluginIndex = this->inputAudioPortIndices.at(i);
 
-            float *buffer = bufferPool.AllocateBuffer<float>(pHost->GetMaxAudioBufferSize());
+            float *buffer = staged ? inputStagingBufferPointers.at(i) : bufferPool.AllocateBuffer<float>(pHost->GetMaxAudioBufferSize());
             lilv_instance_connect_port(pInstance, pluginIndex, buffer);
+        }
+    }
+    for (size_t i = 0; staged && i < this->inputSidechainPortIndices.size(); ++i)
+    {
+        if (GetAudioSidechainBuffer(i) == nullptr)
+        {
+            lilv_instance_connect_port(pInstance, inputSidechainPortIndices.at(i), sidechainStagingBufferPointers.at(i));
         }
     }
 
@@ -802,7 +861,7 @@ void Lv2Effect::AssignUnconnectedPorts()
         {
             if (GetAudioOutputBuffer(i) == nullptr)
             {
-                float *buffer = bufferPool.AllocateBuffer<float>(pHost->GetMaxAudioBufferSize());
+                float *buffer = staged ? outputStagingBufferPointers.at(i) : bufferPool.AllocateBuffer<float>(pHost->GetMaxAudioBufferSize());
                 int pluginIndex = this->outputAudioPortIndices.at(i);
                 lilv_instance_connect_port(pInstance, pluginIndex, buffer);
             }
@@ -845,8 +904,6 @@ void Lv2Effect::AssignUnconnectedPorts()
             {
                 lilv_instance_connect_port(pInstance, pluginIndex, buffer);
             }
-
-            lilv_instance_connect_port(pInstance, pluginIndex, buffer);
             this->outputAtomBuffers.at(i) = (char *)buffer;
         }
     }
@@ -873,70 +930,153 @@ static inline void CopyBuffer(float *restrict input, float *restrict output, uin
     }
 }
 
-size_t Lv2Effect::stageToOutput(size_t outputIndex, size_t nFrames)
-{
-    size_t thisTime = nFrames - outputIndex;
-    size_t stagedOutputAvailable = this->stagingBufferSize - this->stagingOutputIx;
-    if (stagedOutputAvailable < thisTime)
-    {
-        thisTime = stagedOutputAvailable;
-    }
-    if (thisTime)
-    {
-        for (size_t ch = 0; ch < this->GetNumberOfOutputAudioBuffers(); ++ch)
-        {
-            float *restrict pIn = this->outputStagingBufferPointers.at(ch) + this->stagingOutputIx;
-            float *restrict pOut = this->GetAudioOutputBuffer(ch) + outputIndex;
-            for (size_t i = 0; i < thisTime; ++i)
-            {
-                pOut[i] = pIn[i];
-            }
-        }
-        this->stagingOutputIx += thisTime;
-    }
-    return outputIndex + thisTime;
-}
-
-void Lv2Effect::copyAtomBufferEventSequence(LV2_Atom_Sequence *controlInput, LV2_Atom_Forge &outputForge)
+void Lv2Effect::copyAtomBufferEventSequence(LV2_Atom_Sequence *controlInput, LV2_Atom_Forge &outputForge, int64_t frameTime)
 {
     LV2_ATOM_SEQUENCE_FOREACH(controlInput, ev)
     {
-        lv2_atom_forge_frame_time(&outputForge, ev->time.frames);
-        lv2_atom_forge_raw(&outputForge, &(ev->body), ev->body.size); // literal copy of the atom body.
+        // Check that the whole event (frame time, atom header and body, padded) fits first, so that a full
+        // output never ends with a frame time without its atom.
+        uint32_t atomSize = (uint32_t)(sizeof(LV2_Atom) + ev->body.size);
+        uint32_t eventSize = (uint32_t)sizeof(ev->time) + lv2_atom_pad_size(atomSize);
+        if (outputForge.offset + eventSize > outputForge.size)
+        {
+            break; // output full.
+        }
+        // (frameTime: all events at that frame, which keeps the merged sequence's times non-decreasing.)
+        lv2_atom_forge_frame_time(&outputForge, frameTime >= 0 ? frameTime : ev->time.frames);
+        // literal copy of the atom (header and body), padded to 64 bits.
+        lv2_atom_forge_write(&outputForge, &(ev->body), atomSize);
     }
 }
 
-size_t Lv2Effect::stageToInput(size_t inputSampleOffset, size_t samples)
+float *Lv2Effect::StagedOutputDestination(size_t channel)
 {
-
-    size_t thisTime = samples - inputSampleOffset;
-    size_t inputAvailable = this->stagingBufferSize - this->stagingInputIx;
-    if (thisTime > inputAvailable)
+    // zero-input plugins: the mix buffer that MixOutput() mixes with the input.
+    if (this->inputAudioPortIndices.size() == 0)
     {
-        thisTime = inputAvailable;
+        return this->outputMixBuffers[channel].data();
     }
-    // copy into staging buffers.
-    for (size_t nInput = 0; nInput < this->inputAudioBuffers.size(); ++nInput)
+    return this->outputAudioBuffers[channel];
+}
+
+void Lv2Effect::PushStagedOutput()
+{
+    // Append the block the plugin just wrote to the output FIFO (no allocation: sized by EnableBufferStaging).
+    size_t blockLength = this->stagingBufferSize;
+    if (this->stagingFifoCount + blockLength > this->stagingFifoCapacity)
     {
-        float *restrict pInput = this->inputAudioBuffers[nInput] + inputSampleOffset;
-        float *restrict pOutput = this->inputStagingBufferPointers.at(nInput) + this->stagingInputIx;
-        for (size_t i = 0; i < thisTime; ++i)
+        // Can't happen with cycles of at most the maximum buffer size; drop the oldest frames if it does.
+        size_t excess = this->stagingFifoCount + blockLength - this->stagingFifoCapacity;
+        this->stagingFifoReadIx = (this->stagingFifoReadIx + excess) % this->stagingFifoCapacity;
+        this->stagingFifoCount -= excess;
+    }
+    size_t writeIx = (this->stagingFifoReadIx + this->stagingFifoCount) % this->stagingFifoCapacity;
+    for (size_t ch = 0; ch < this->stagingOutputFifo.size(); ++ch)
+    {
+        const float *restrict pIn = this->outputStagingBufferPointers[ch];
+        float *restrict fifo = this->stagingOutputFifo[ch].data();
+        size_t ix = writeIx;
+        for (size_t i = 0; i < blockLength; ++i)
         {
-            pOutput[i] = pInput[i];
+            fifo[ix] = pIn[i];
+            if (++ix == this->stagingFifoCapacity)
+            {
+                ix = 0;
+            }
         }
     }
-    for (size_t nSidechain = 0; nSidechain < this->inputSidechainBuffers.size(); ++nSidechain)
-    {
-        float *restrict pInput = this->inputSidechainBuffers[nSidechain] + inputSampleOffset;
-        float *restrict pOutput = this->sidechainStagingBufferPointers.at(nSidechain) + this->stagingInputIx;
-        for (size_t i = 0; i < thisTime; ++i)
-        {
-            pOutput[i] = pInput[i];
-        }
+    this->stagingFifoCount += blockLength;
+}
 
+void Lv2Effect::PopStagedOutput(size_t samples)
+{
+    // With cycles of maxBufferSize frames the FIFO always holds at least `samples` frames (see
+    // EnableBufferStaging). A shorter cycle can run it dry: the missing frames are output as silence once,
+    // and from then on the output lags by that much more (a permanent latency increase of up to B - 1 - L
+    // frames), so GetStagingLatency() no longer matches.
+    size_t available = std::min(samples, this->stagingFifoCount);
+    for (size_t ch = 0; ch < this->stagingOutputFifo.size(); ++ch)
+    {
+        float *destination = StagedOutputDestination(ch);
+        if (destination == nullptr) // unconnected output.
+        {
+            continue;
+        }
+        const float *restrict fifo = this->stagingOutputFifo[ch].data();
+        float *restrict pOut = destination;
+        size_t ix = this->stagingFifoReadIx;
+        for (size_t i = 0; i < available; ++i)
+        {
+            pOut[i] = fifo[ix];
+            if (++ix == this->stagingFifoCapacity)
+            {
+                ix = 0;
+            }
+        }
+        for (size_t i = available; i < samples; ++i)
+        {
+            pOut[i] = 0;
+        }
+    }
+    if (this->stagingFifoCapacity != 0)
+    {
+        this->stagingFifoReadIx = (this->stagingFifoReadIx + available) % this->stagingFifoCapacity;
+    }
+    this->stagingFifoCount -= available;
+}
+
+size_t Lv2Effect::stageFrames(size_t sampleOffset, size_t samples)
+{
+    // Input frames are collected in the input staging buffers; each full block runs the plugin, and its
+    // output is appended to the output FIFO, which RunWithBufferStaging reads stagingLatency frames behind.
+    size_t thisTime = samples - sampleOffset;
+    size_t available = this->stagingBufferSize - this->stagingInputIx;
+    if (thisTime > available)
+    {
+        thisTime = available;
+    }
+    for (size_t nInput = 0; nInput < this->inputStagingBufferPointers.size(); ++nInput)
+    {
+        float *restrict pOutput = this->inputStagingBufferPointers[nInput] + this->stagingInputIx;
+        float *pInput = nInput < this->inputAudioBuffers.size() ? this->inputAudioBuffers[nInput] : nullptr;
+        if (pInput == nullptr) // unconnected input port.
+        {
+            for (size_t i = 0; i < thisTime; ++i)
+            {
+                pOutput[i] = 0;
+            }
+        }
+        else
+        {
+            pInput += sampleOffset;
+            for (size_t i = 0; i < thisTime; ++i)
+            {
+                pOutput[i] = pInput[i];
+            }
+        }
+    }
+    for (size_t nSidechain = 0; nSidechain < this->sidechainStagingBufferPointers.size(); ++nSidechain)
+    {
+        float *restrict pOutput = this->sidechainStagingBufferPointers[nSidechain] + this->stagingInputIx;
+        float *pInput = nSidechain < this->inputSidechainBuffers.size() ? this->inputSidechainBuffers[nSidechain] : nullptr;
+        if (pInput == nullptr)
+        {
+            for (size_t i = 0; i < thisTime; ++i)
+            {
+                pOutput[i] = 0;
+            }
+        }
+        else
+        {
+            pInput += sampleOffset;
+            for (size_t i = 0; i < thisTime; ++i)
+            {
+                pOutput[i] = pInput[i];
+            }
+        }
     }
     this->stagingInputIx += thisTime;
-    inputSampleOffset += thisTime;
+    sampleOffset += thisTime;
 
     if (stagingInputIx == this->stagingBufferSize)
     {
@@ -959,14 +1099,17 @@ size_t Lv2Effect::stageToInput(size_t inputSampleOffset, size_t samples)
         }
         if (stagedOutputAtomBufferPointer)
         {
-            copyAtomBufferEventSequence((LV2_Atom_Sequence *)stagedOutputAtomBufferPointer, this->outputForgeRt);
+            // (at the position in this host cycle where the block completed.)
+            copyAtomBufferEventSequence(
+                (LV2_Atom_Sequence *)stagedOutputAtomBufferPointer, this->outputForgeRt,
+                (int64_t)std::min(sampleOffset, samples - 1));
         }
+        PushStagedOutput();
 
         this->stagingInputIx = 0;
-        this->stagingOutputIx = 0;
         this->resetStagedInputAtomBuffer();
     }
-    return inputSampleOffset;
+    return sampleOffset;
 }
 
 void Lv2Effect::resetStagedInputAtomBuffer()
@@ -976,56 +1119,37 @@ void Lv2Effect::resetStagedInputAtomBuffer()
         const uint32_t notify_capacity = pHost->GetAtomBufferSize();
         lv2_atom_forge_set_buffer(
             &(this->stagedInputForgeRt), (uint8_t *)(this->stagedInputAtomBufferPointer), notify_capacity);
-        lv2_atom_forge_sequence_head(&this->inputForgeRt, &staged_input_frame, urids.units__frame);
+        lv2_atom_forge_sequence_head(&this->stagedInputForgeRt, &staged_input_frame, urids.units__frame);
     }
 }
 void Lv2Effect::RunWithBufferStaging(uint32_t samples, RealtimeRingBufferWriter *realtimeRingBufferWriter)
 {
-    // accumulte control input sequence until we can execute a run operation.
+    // Atom events are delivered at block boundaries: input events accumulate until the next block runs and
+    // reach the plugin at frame 0 of that block; output events of a block are delivered at the frame of the
+    // host cycle in which the block completed.
     if (this->inputAtomBuffers.size() != 0)
     {
         lv2_atom_forge_pop(&this->inputForgeRt, &input_frame);
 
         LV2_Atom_Sequence *controlInput = (LV2_Atom_Sequence *)GetAtomInputBuffer(0);
-        copyAtomBufferEventSequence(controlInput, this->stagedInputForgeRt);
+        copyAtomBufferEventSequence(controlInput, this->stagedInputForgeRt, 0);
     }
     // Prepare ACTUAL control output port.
     if (this->stagedOutputAtomBufferPointer)
     {
         const uint32_t notify_capacity = pHost->GetAtomBufferSize();
         lv2_atom_forge_set_buffer(
-            &(this->outputForgeRt), (uint8_t *)(this->inputAtomBuffers.at(0)), notify_capacity);
+            &(this->outputForgeRt), (uint8_t *)(this->outputAtomBuffers.at(0)), notify_capacity);
         lv2_atom_forge_sequence_head(&this->outputForgeRt, &output_frame, urids.units__frame);
     }
 
-    uint32_t inputSampleOffset = 0;
-    uint32_t outputSampleOffset = 0;
-
-    while (true)
+    size_t sampleOffset = 0;
+    while (sampleOffset < samples)
     {
-        outputSampleOffset = stageToOutput(outputSampleOffset, samples);
-
+        sampleOffset = stageFrames(sampleOffset, samples);
         CheckStagingBufferSentries();
-
-        if (inputSampleOffset == samples)
-        {
-            break;
-        }
-        inputSampleOffset = stageToInput(inputSampleOffset, samples);
     }
-    // no staging data avaialble? Output zeros.
-    if (outputSampleOffset != samples)
-    {
-        size_t thisTime = samples - outputSampleOffset;
-        for (size_t ch = 0; ch < this->GetNumberOfOutputAudioBuffers(); ++ch)
-        {
-            float *pOut = this->GetAudioOutputBuffer(ch) + outputSampleOffset;
-            for (size_t i = 0; i < thisTime; ++i)
-            {
-                pOut[i] = 0;
-            }
-        }
-    }
+    PopStagedOutput(samples);
     MixOutput(samples, realtimeRingBufferWriter);
 }
 
@@ -1036,8 +1160,9 @@ inline void Lv2Effect::MixOutput(uint32_t samples, RealtimeRingBufferWriter *rea
     {
 
         // mix a zero input controls into the output buffer using a triangular mix curve.
-        float pluginLevel = std::max(1.0f, this->zeroInputMix * 2);
-        float inputLevel = std::max(1.0f, (1 - this->zeroInputMix) * 2);
+        ZeroInputMixLevels levels = ComputeZeroInputMixLevels(this->zeroInputMix);
+        float pluginLevel = levels.pluginLevel;
+        float inputLevel = levels.inputLevel;
 
         // case
         // 1 plugin output into 1 output.
@@ -1072,7 +1197,7 @@ inline void Lv2Effect::MixOutput(uint32_t samples, RealtimeRingBufferWriter *rea
         {
             // 1 plugin output into 2 outputs.
             float *restrict pluginOutput = this->outputMixBuffers.at(0).data();
-            for (size_t i = 0; i < this->outputMixBuffers.size(); ++i)
+            for (size_t i = 0; i < this->outputAudioBuffers.size(); ++i) // (both outputs, not just the first.)
             {
                 float *restrict input = this->inputAudioBuffers.at(i);
                 float *restrict finalOutput = this->outputAudioBuffers.at(i);
@@ -1091,9 +1216,9 @@ inline void Lv2Effect::MixOutput(uint32_t samples, RealtimeRingBufferWriter *rea
     }
 
     // do soft bypass.
-    if (this->bypassSamplesRemaining == 0)
+    if (!this->bypassFader.IsFading())
     {
-        if (this->currentBypass == 0)
+        if (this->bypassFader.Value() == 0)
         {
             // replace the contents of the output buffer(s) with the input buffer(s).
             if (this->outputAudioBuffers.size() == 1)
@@ -1117,24 +1242,15 @@ inline void Lv2Effect::MixOutput(uint32_t samples, RealtimeRingBufferWriter *rea
     }
     else
     {
-        double currentBypass = this->currentBypass;
-        double currentBypassDx = this->currentBypassDx;
-        int32_t bypassSamplesRemaining = (int)this->bypassSamplesRemaining;
-
+        BypassFader &fader = this->bypassFader;
         if (this->outputAudioBuffers.size() == 1)
         {
             float *restrict input = this->inputAudioBuffers.at(0);
             float *restrict output = this->outputAudioBuffers.at(0);
             for (uint32_t i = 0; i < samples; ++i)
             {
+                double currentBypass = fader.Tick();
                 output[i] = currentBypass * output[i] + (1 - currentBypass) * input[i];
-
-                if (--bypassSamplesRemaining == 0)
-                {
-                    currentBypassDx = 0;
-                    currentBypass = this->targetBypass;
-                }
-                currentBypass += currentBypassDx;
             }
         }
         else
@@ -1154,27 +1270,10 @@ inline void Lv2Effect::MixOutput(uint32_t samples, RealtimeRingBufferWriter *rea
             float *restrict outputR = outputAudioBuffers.at(1);
             for (uint32_t i = 0; i < samples; ++i)
             {
+                double currentBypass = fader.Tick();
                 outputL[i] = currentBypass * outputL[i] + (1 - currentBypass) * inputL[i];
                 outputR[i] = currentBypass * outputR[i] + (1 - currentBypass) * inputR[i];
-                if (--bypassSamplesRemaining == 0)
-                {
-                    currentBypassDx = 0;
-                    currentBypass = this->targetBypass;
-                }
-                currentBypass += currentBypassDx;
             }
-        }
-        if (bypassSamplesRemaining <= 0)
-        {
-            this->bypassSamplesRemaining = 0;
-            this->currentBypass = this->targetBypass;
-            this->currentBypassDx = 0;
-        }
-        else
-        {
-            this->currentBypass = currentBypass;
-            this->currentBypassDx = currentBypassDx;
-            this->bypassSamplesRemaining = bypassSamplesRemaining;
         }
     }
     RelayPatchSetMessages(this->instanceId, realtimeRingBufferWriter);
@@ -1182,15 +1281,57 @@ inline void Lv2Effect::MixOutput(uint32_t samples, RealtimeRingBufferWriter *rea
 
 void Lv2Effect::Run(uint32_t samples, RealtimeRingBufferWriter *realtimeRingBufferWriter)
 {
+    Run(samples, realtimeRingBufferWriter, false);
+}
+
+bool Lv2Effect::HasPendingAtomInput() const
+{
+    if (this->inputAtomBuffers.size() == 0)
+    {
+        return false;
+    }
+    // The forge keeps the sequence header's size current as events are written.
+    const LV2_Atom *sequence = (const LV2_Atom *)(this->inputAtomBuffers[0]);
+    return sequence->size > sizeof(LV2_Atom_Sequence_Body);
+}
+
+void Lv2Effect::WriteEmptyOutputAtomBuffers()
+{
+    // The plugin didn't run, so nothing wrote a sequence into the (Chunk-reset) output buffers.
+    for (size_t i = 0; i < this->outputAtomBuffers.size(); ++i)
+    {
+        WriteEmptyAtomSequence(this->outputAtomBuffers[i], urids.atom__Sequence);
+    }
+}
+
+void Lv2Effect::Run(uint32_t samples, RealtimeRingBufferWriter *realtimeRingBufferWriter, bool suspendBypassedPlugins)
+{
+    // Plugins with an lv2:enabled port handle bypass themselves, and are never suspended.
+    this->suspended = BypassSuspendPolicy::ShouldSuspendEffect(
+        suspendBypassedPlugins,
+        this->bypassControlIndex != -1,
+        this->bypassFader,
+        HasPendingAtomInput());
+
     // close off the atom input frame.
     if (this->inputAtomBuffers.size() != 0)
     {
         lv2_atom_forge_pop(&this->inputForgeRt, &input_frame);
     }
-    lilv_instance_run(pInstance, samples);
+    if (this->suspended)
+    {
+        // Fully bypassed: MixOutput() overwrites the audio outputs with the dry input.
+        WriteEmptyOutputAtomBuffers();
+    }
+    else
+    {
+        lilv_instance_run(pInstance, samples);
+    }
 
     if (worker)
     {
+        // Still delivered while suspended (work_response without run()); a plugin that
+        // applies the response in run() picks it up when it resumes.
         // relay worker response
         worker->EmitResponses();
     }
@@ -1227,29 +1368,12 @@ void Lv2Effect::ResetOutputAtomBuffer(char *data)
 }
 void Lv2Effect::BypassDezipperSet(float targetValue)
 {
-    this->targetBypass = targetValue;
-    this->currentBypass = targetValue;
-    this->currentBypassDx = 0;
-    this->bypassSamplesRemaining = 0;
+    this->bypassFader.Set(targetValue);
 }
 
 void Lv2Effect::BypassDezipperTo(float targetValue)
 {
-    this->targetBypass = targetValue;
-    double dx = targetValue - this->currentBypass;
-    if (dx != 0)
-    {
-        this->bypassSamplesRemaining = (int)(bypassStartingSamples * std::abs(dx));
-        if (this->bypassStartingSamples == 0)
-        {
-            currentBypassDx = 0;
-            this->currentBypass = targetBypass;
-        }
-        else
-        {
-            this->currentBypassDx = dx / this->bypassSamplesRemaining;
-        }
-    }
+    this->bypassFader.FadeTo(targetValue);
 }
 
 void Lv2Effect::ResetAtomBuffers()
@@ -1336,7 +1460,7 @@ void Lv2Effect::RelayPatchSetMessages(uint64_t instanceId, RealtimeRingBufferWri
             else if (obj->body.otype == urids.patch__Set) // patch_Set is handled elsewhere.
             {
                 maybeStateChanged = true;
-                realtimeRingBufferWriter->AtomOutput(instanceId, obj->atom.size + sizeof(obj->atom), (uint8_t *)obj);
+                realtimeRingBufferWriter->AtomOutput(instanceId, static_cast<IEffect *>(this), obj->atom.size + sizeof(obj->atom), (uint8_t *)obj);
             }
         }
     }
@@ -1388,9 +1512,20 @@ void Lv2Effect::GatherPathPatchProperties(IPatchWriterCallback *cbPatchWriter)
                         {
                             if (key == pathPropertyWriter.patchPropertyUrid)
                             {
-                                auto buffer = pathPropertyWriter.AquireWriteBuffer();
                                 size_t atom_size = value->size + sizeof(LV2_Atom);
-                                buffer->memory.resize(atom_size);
+                                if (atom_size > pathPropertyWriter.Capacity())
+                                {
+                                    // Would need to grow the buffer on the audio thread. Drop it.
+                                    // (Cannot happen for atoms that fit the plugin's atom output
+                                    // buffer, which is what the capacity is sized to.)
+                                    droppedPathPatchProperties.fetch_add(1, std::memory_order_relaxed);
+                                    break;
+                                }
+                                auto buffer = pathPropertyWriter.AquireWriteBuffer();
+                                // the instance may have been re-keyed (reused across a preset switch).
+                                buffer->instanceId = (int64_t)this->instanceId.load();
+                                buffer->sourceEffect = static_cast<const IEffect *>(this);
+                                buffer->memory.resize(atom_size); // within reserved capacity: no allocation.
                                 memcpy(buffer->memory.data(), value, atom_size);
                                 break;
                             }
@@ -1454,7 +1589,7 @@ void Lv2Effect::GatherPatchProperties(RealtimePatchPropertyRequest *pRequest)
 
 void Lv2Effect::SetLv2State(Lv2PluginState &state)
 {
-    if (state.isValid_)
+    if (!state.isValid_)
     {
         return;
     }
@@ -1462,6 +1597,7 @@ void Lv2Effect::SetLv2State(Lv2PluginState &state)
     {
         return;
     }
+    std::lock_guard<std::mutex> lock(stateMutex);
     try
     {
 
@@ -1476,6 +1612,7 @@ bool Lv2Effect::GetLv2State(Lv2PluginState *state)
 {
     if (!this->stateInterface)
         return false;
+    std::lock_guard<std::mutex> lock(stateMutex);
     try
     {
         if (this->stateInterface == nullptr)
@@ -1534,6 +1671,7 @@ float Lv2Effect::GetDefaultInputControlValue(uint64_t index) const
 
 std::string Lv2Effect::GetPathPatchProperty(const std::string &propertyUri)
 {
+    std::lock_guard<std::mutex> lock(mainThreadPathPropertiesMutex);
     if (!this->mainThreadPathProperties.contains(propertyUri))
     {
         return "";
@@ -1542,21 +1680,44 @@ std::string Lv2Effect::GetPathPatchProperty(const std::string &propertyUri)
 }
 void Lv2Effect::SetPathPatchProperty(const std::string &propertyUri, const std::string &jsonAtom)
 {
+    std::lock_guard<std::mutex> lock(mainThreadPathPropertiesMutex);
     mainThreadPathProperties[propertyUri] = jsonAtom;
 }
 
 void Lv2Effect::EnableBufferStaging(size_t bufferSize )
 {
-    size_t nInputs = this->GetNumberOfInputAudioBuffers();
-    size_t nSidechainInputs = this->GetNumberOfSidechainAudioBuffers();
-    size_t nOutputs = this->GetNumberOfOutputAudioBuffers();
+    // One staging buffer per plugin port (the effect's buffer vectors may differ from the port counts: see
+    // PrepareNoInputEffect).
+    size_t nInputs = this->inputAudioPortIndices.size();
+    size_t nSidechainInputs = this->inputSidechainPortIndices.size();
+    size_t nOutputs = this->outputAudioPortIndices.size();
 
     stagingBufferSize = bufferSize;
-    stagingOutputIx = bufferSize;
     stagingInputIx = 0;
+
+    // Output latency. With host cycles of N = maxBufferSize frames and blocks of B frames, at the end of host
+    // cycle m the plugin has produced floor(mN/B)·B frames, and mN frames of output have been due. Reading the
+    // output L frames behind never runs dry iff L >= max over m of (mN mod B) = B - gcd(N, B). So:
+    // L = 0 when N is a multiple of B, L = B - N when N divides B, and gapless with any N and B, as long as every
+    // cycle is N frames. A shorter cycle may run the FIFO dry: a one-time silence gap, after which the latency is
+    // permanently larger (by up to B - 1 - L frames) than L, i.e. than GetStagingLatency(). The FIFO holds at
+    // most L + N frames before a cycle's read; capacity has a block of slack.
+    size_t maxBufferSize = pHost->GetMaxAudioBufferSize();
+    stagingLatency = StagingLatency(maxBufferSize, bufferSize);
+    stagingFifoCapacity = stagingLatency + maxBufferSize + bufferSize;
+    stagingOutputFifo.resize(nOutputs);
+    for (auto &fifo : stagingOutputFifo)
+    {
+        fifo.assign(stagingFifoCapacity, 0.0f);
+    }
+    stagingFifoReadIx = 0;
+    stagingFifoCount = stagingLatency; // primed with L frames of silence.
+
     inputStagingBuffers.resize(nInputs);
+    sidechainStagingBuffers.resize(nSidechainInputs);
     outputStagingBuffers.resize(nOutputs);
     inputStagingBufferPointers.resize(nInputs);
+    sidechainStagingBufferPointers.resize(nSidechainInputs);
     outputStagingBufferPointers.resize(nOutputs);
 
     if (inputAtomBuffers.size() != 0)

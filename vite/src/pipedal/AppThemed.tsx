@@ -18,6 +18,7 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
+import LazyBoundary, { lazyWithRetry, prefetchLazyChunks } from './LazyBoundary';
 import './AppThemed.css';
 
 //import {alpha} from '@mui/material/styles';
@@ -49,7 +50,7 @@ import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 import ResizeResponsiveComponent from './ResizeResponsiveComponent';
 import Button from '@mui/material/Button';
 import PresetSelector from './PresetSelector';
-import SettingsDialog from './SettingsDialog';
+const SettingsDialog = lazyWithRetry(() => import('./SettingsDialog'));
 import AboutDialog from './AboutDialog';
 import BankDialog from './BankDialog';
 import {Tone3000DownloadStaus as Tone3000DownloadStatus} from './Tone3000Dialog';
@@ -255,16 +256,16 @@ const appStyles = ((theme: Theme) => (
 
 
 function supportsFullScreen(): boolean {
-    let doc: any = window.document;
-    let docEl: any = doc.documentElement;
-    var requestFullScreen = docEl.requestFullscreen || docEl.mozRequestFullScreen || docEl.webkitRequestFullscreen || docEl.msRequestFullScreen;
+    const doc: any = window.document;
+    const docEl: any = doc.documentElement;
+    const requestFullScreen = docEl.requestFullscreen || docEl.mozRequestFullScreen || docEl.webkitRequestFullscreen || docEl.msRequestFullScreen;
     return (!!requestFullScreen);
 
 }
 
 function setFullScreen(value: boolean) {
-    let doc: any = window.document;
-    let docEl: any = doc.documentElement;
+    const doc: any = window.document;
+    const docEl: any = doc.documentElement;
 
     if (docEl.requestFullscreen) // the latest offical api.
     {
@@ -280,8 +281,8 @@ function setFullScreen(value: boolean) {
         }
     }
 
-    var requestFullScreen = docEl.requestFullscreen || docEl.mozRequestFullScreen || docEl.webkitRequestFullscreen || docEl.msRequestFullScreen;
-    var cancelFullScreen = docEl.exitFullscreen || doc.mozCancelFullScreen || doc.webkitExitFullscreen || doc.msExitFullscreen;
+    const requestFullScreen = docEl.requestFullscreen || docEl.mozRequestFullScreen || docEl.webkitRequestFullscreen || docEl.msRequestFullScreen;
+    const cancelFullScreen = docEl.exitFullscreen || doc.mozCancelFullScreen || doc.webkitExitFullscreen || doc.msExitFullscreen;
 
     if (value) {
         requestFullScreen.call(docEl);
@@ -423,7 +424,7 @@ export
 
     popOpenMenuState() {
         if (this.menuStackHandler) {
-            let t = this.menuStackHandler;
+            const t = this.menuStackHandler;
             this.menuStackHandler = null;
             popDialogStack(t);
         }
@@ -442,7 +443,7 @@ export
     }
 
     handleSaveBankAsOk(newName: string) {
-        let currentName = this.model_.banks.get().getSelectedEntryName();
+        const currentName = this.model_.banks.get().getSelectedEntryName();
         if (currentName === newName) {
             this.setState({
                 renameBankDialogOpen: false,
@@ -467,7 +468,7 @@ export
 
     }
     handleBankRenameOk(newName: string) {
-        let currentName = this.model_.banks.get().getSelectedEntryName();
+        const currentName = this.model_.banks.get().getSelectedEntryName();
         if (currentName === newName) {
             this.setState({
                 renameBankDialogOpen: false,
@@ -577,7 +578,7 @@ export
         });
     }
     presetChangedHandler() {
-        let presets = this.model_.presets.get();
+        const presets = this.model_.presets.get();
 
         this.setState({
             presetName: presets.getSelectedText(),
@@ -635,11 +636,11 @@ export
     updateOverscroll(): void {
         if (this.model_.serverVersion) {
             // no pull-down refresh on android devices once we're ready (unless we're debug)
-            let preventOverscroll =
+            const preventOverscroll =
                 this.model_.state.get() === State.Ready
                 && !this.model_.debug;
 
-            let overscrollBehavior = preventOverscroll ? "none" : "auto";
+            const overscrollBehavior = preventOverscroll ? "none" : "auto";
             document.body.style.overscrollBehavior = overscrollBehavior;
         }
     }
@@ -668,7 +669,7 @@ export
     }
 
     alertMessageChangedHandler() {
-        let message = this.model_.alertMessage.get();
+        const message = this.model_.alertMessage.get();
         if (message === "") {
             this.setState({ alertDialogOpen: false });
             // leave the message intact so the dialog can fade.
@@ -685,7 +686,7 @@ export
         // let tinyToolBar_ = this.windowSize.height < 600;
         // this.setState({ tinyToolBar: tinyToolBar_ });
 
-        let height = this.windowSize.height;
+        const height = this.windowSize.height;
 
         const ENTRY_HEIGHT = 48;
         //   ENTRY_HEIGHT*6 +K = 727 from observation.
@@ -718,6 +719,8 @@ export
             canFullScreen: supportsFullScreen() && !this.model_.isAndroidHosted()
         });
         if (newState === State.Ready) {
+            // fetch the lazy-loaded dialogs at idle time, so they still open if the network drops later.
+            prefetchLazyChunks();
             if (this.model_.isOnboarding()) {
                 this.handleDisplayOnboarding();
             }
@@ -725,11 +728,11 @@ export
     }
 
     shortBankList(banks: BankIndex): BankIndexEntry[] {
-        let nDisplayEntries = this.state.bankDisplayItems;
-        let entries = banks.entries;
-        let nListEntries = entries.length;
+        const nDisplayEntries = this.state.bankDisplayItems;
+        const entries = banks.entries;
+        const nListEntries = entries.length;
 
-        let result: BankIndexEntry[] = [];
+        const result: BankIndexEntry[] = [];
 
         if (nListEntries <= nDisplayEntries) {
             for (let i = 0; i < nListEntries; ++i) {
@@ -784,8 +787,8 @@ export
 
         const classes = withStyles.getClasses(this.props);
 
-        let shortBankList = this.shortBankList(this.state.banks);
-        let showBankSelectDialog = shortBankList.length !== this.state.banks.entries.length;
+        const shortBankList = this.shortBankList(this.state.banks);
+        const showBankSelectDialog = shortBankList.length !== this.state.banks.entries.length;
 
 
         return (
@@ -813,7 +816,9 @@ export
                 ) : (
                     <div style={{
                         position: "absolute", width: "100%", height: "100%", userSelect: "none",
-                        display: "flex", flexDirection: "column", flexWrap: "nowrap"
+                        display: "flex", flexDirection: "column", flexWrap: "nowrap",
+                        // last known UI stays visible, but is not interactive while reconnecting.
+                        pointerEvents: this.state.displayState === State.Reconnecting ? "none" : "auto"
                     }}
                     >
 
@@ -1035,10 +1040,12 @@ export
                                 <AboutDialog open={this.state.aboutDialogOpen} onClose={() => this.setState({ aboutDialogOpen: false })} />
                             )}
                         {this.state.isSettingsDialogOpen && (
-                            <SettingsDialog
-                                open={this.state.isSettingsDialogOpen}
-                                onboarding={this.state.onboarding}
-                                onClose={() => this.handleSettingsDialogClose()} />
+                            <LazyBoundary onLoadFailed={() => this.handleSettingsDialogClose()}>
+                                <SettingsDialog
+                                    open={this.state.isSettingsDialogOpen}
+                                    onboarding={this.state.onboarding}
+                                    onClose={() => this.handleSettingsDialogClose()} />
+                            </LazyBoundary>
                         )}
                         {(this.state.renameBankDialogOpen || this.state.saveBankAsDialogOpen) && (
                             <RenameDialog
@@ -1107,7 +1114,7 @@ export
                 </DialogEx>
 
                 {/* Status of TONE3000 download */}
-                <Tone3000DownloadStatus zindex={2000}/>
+                <Tone3000DownloadStatus zindex={1400}/>
                 {/* Fatal error mask */}
                 <Modal open={this.state.displayState === State.Error}
                     aria-label="fatal-error"
@@ -1141,9 +1148,40 @@ export
                     </div>
 
                 </Modal >
+                {/* While reconnecting, block input to everything, including MUI portals (drawer, menus,
+                    open dialogs) that the pointerEvents: none above doesn't reach. Transparent, and below
+                    the banner. */}
+                {this.state.displayState === State.Reconnecting && (
+                    <div aria-hidden="true"
+                        onClick={(e) => { e.stopPropagation(); e.preventDefault(); }}
+                        onContextMenu={(e) => { e.preventDefault(); }}
+                        style={{
+                            position: "fixed", top: 0, left: 0, right: 0, bottom: 0, zIndex: 1499,
+                            background: "transparent", pointerEvents: "auto", touchAction: "none"
+                        }}
+                    />
+                )}
+                {/* Non-blocking reconnecting banner. Snackbar-style placement at the bottom so it never covers the app bar. */}
+                {this.state.displayState === State.Reconnecting && (
+                    <div role="status" aria-live="polite"
+                        style={{
+                            position: "fixed", bottom: "calc(16px + env(safe-area-inset-bottom, 0px))",
+                            left: "50%", transform: "translateX(-50%)", zIndex: 1500,
+                            display: "flex", justifyContent: "center", alignItems: "center", gap: 8,
+                            padding: "8px 16px", borderRadius: 8, pointerEvents: "none",
+                            boxShadow: "0 2px 8px rgba(0,0,0,0.4)",
+                            background: isDarkMode() ? "#5D4037" : "#FFB300",
+                            color: isDarkMode() ? "#FFFFFF" : "#000000",
+                            fontSize: "0.875rem", fontWeight: 500
+                        }}>
+                        <CircularProgress color="inherit" size={14} thickness={5} />
+                        <span>Reconnecting&hellip;</span>
+                    </div>
+                )}
                 {/* Reloading mask */}
                 < Modal
-                    open={wantsReloadingScreen(this.state.displayState) || this.state.displayState === State.Loading}
+                    open={(wantsReloadingScreen(this.state.displayState) && this.state.displayState !== State.Reconnecting)
+                        || this.state.displayState === State.Loading}
                     aria-label="loading"
                     aria-describedby="reloading-modal-description"
                 >

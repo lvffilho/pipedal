@@ -19,6 +19,7 @@
 
 import React, { ReactNode, Component, SyntheticEvent } from 'react';
 import { css } from '@emotion/react';
+import './SignalFlowAnimation'; // applies the stored animation preference to <html>.
 import { createStyles } from './WithStyles';
 
 import WithStyles, { withTheme } from './WithStyles';
@@ -261,10 +262,15 @@ const pedalboardStyles = (theme: Theme) => createStyles({
         boxShadow: `0 0 4px ${theme.palette.primary.main}, 0 0 1px ${theme.palette.primary.main}`,
         zIndex: 2,
         pointerEvents: 'none',
-        animation: 'ppLedPulse 2.4s ease-in-out infinite',
+        // Pulses only when "Animate signal flow" is on (class set on <html>).
+        'html.pp-animate-flow &': {
+            animation: 'ppLedPulse 2.4s ease-in-out infinite',
+        },
         // Paired with the .ppSignalFlow rule in AppThemed.css.
         '@media (prefers-reduced-motion: reduce)': {
-            animation: 'none',
+            'html.pp-animate-flow &': {
+                animation: 'none',
+            },
         },
     }),
 
@@ -318,14 +324,47 @@ const EMPTY_PEDALS: PedalLayout[] = [];
 
 
 function makeChain(model: PiPedalModel, uiItems?: PedalboardItem[]): PedalLayout[] {
-    let result: PedalLayout[] = [];
+    const result: PedalLayout[] = [];
     if (uiItems) {
         for (let i = 0; i < uiItems.length; ++i) {
-            let item = uiItems[i];
+            const item = uiItems[i];
             result.push(new PedalLayout(model, item));
         }
     }
     return result;
+}
+
+// Signature of everything that affects layout: ids, uris, titles, enabled state, split configuration.
+// Control values are deliberately excluded, except for the A/B select of a splitter, which changes
+// the splitter's icon and the routing display.
+function layoutSignature(items: PedalboardItem[] | undefined): unknown[] {
+    if (!items) return [];
+    return items.map((item) => {
+        const entry: unknown[] = [item.instanceId, item.uri, item.title ?? "", item.iconColor ?? "",
+            item.pluginName ?? "", item.isEnabled];
+        if (item.isSplit()) {
+            const split = item as PedalboardSplitItem;
+            entry.push(split.getSplitType(), split.isASelected(),
+                layoutSignature(split.topChain), layoutSignature(split.bottomChain));
+        }
+        return entry;
+    });
+}
+
+// Re-point cached layout entries at the items of a newer (structurally identical) pedalboard.
+function rebindLayout(chain: PedalLayout[], items: PedalboardItem[]): void {
+    let j = 0;
+    for (let i = 0; i < chain.length; ++i) {
+        const layout = chain[i];
+        if (layout.pedalItem === undefined) continue; // start/end terminals.
+        const item = items[j++];
+        layout.pedalItem = item;
+        if (layout.isSplitter()) {
+            const split = item as PedalboardSplitItem;
+            rebindLayout(layout.topChildren, split.topChain);
+            rebindLayout(layout.bottomChildren, split.bottomChain);
+        }
+    }
 }
 
 class PedalLayout {
@@ -352,7 +391,7 @@ class PedalLayout {
 
 
     static Start(): PedalLayout {
-        let t: PedalLayout = new PedalLayout();
+        const t: PedalLayout = new PedalLayout();
         t.uri = START_PEDALBOARD_ITEM_URI;
         t.pluginType = PluginType.Terminal;
         t.iconUrl = TERMINAL_ICON_URL;
@@ -361,7 +400,7 @@ class PedalLayout {
         return t;
     }
     static End(): PedalLayout {
-        let t: PedalLayout = new PedalLayout();
+        const t: PedalLayout = new PedalLayout();
         t.pluginType = PluginType.Terminal;
         t.uri = END_PEDALBOARD_ITEM_URI;
         t.iconUrl = TERMINAL_ICON_URL;
@@ -379,7 +418,7 @@ class PedalLayout {
         this.pedalItem = pedalItem;
         this.uri = pedalItem.uri;
         if (pedalItem.isSplit()) {
-            let splitter = pedalItem as PedalboardSplitItem;
+            const splitter = pedalItem as PedalboardSplitItem;
 
             this.pluginType = PluginType.UtilityPlugin;
             this.topChildren = makeChain(model, splitter.topChain);
@@ -414,7 +453,7 @@ class PedalLayout {
             this.numberOfOutputs = 0;
         }
         else {
-            let uiPlugin = model.getUiPlugin(pedalItem.uri);
+            const uiPlugin = model.getUiPlugin(pedalItem.uri);
             if (uiPlugin != null) {
                 let pluginType = uiPlugin.plugin_type;
                 this.pluginType = pluginType;
@@ -457,12 +496,12 @@ class PedalLayout {
 
 function* chainIterator(layoutChain: PedalLayout[]): Generator<PedalLayout, void, undefined> {
     for (let i = 0; i < layoutChain.length; ++i) {
-        let item = layoutChain[i];
+        const item = layoutChain[i];
         yield item;
         if (item.isSplitter()) {
             let g = chainIterator(item.topChildren);
             while (true) {
-                let v = g.next();
+                const v = g.next();
                 if (v.done) {
                     break;
                 }
@@ -470,7 +509,7 @@ function* chainIterator(layoutChain: PedalLayout[]): Generator<PedalLayout, void
             }
             g = chainIterator(item.bottomChildren);
             while (true) {
-                let v = g.next();
+                const v = g.next();
                 if (v.done) {
                     break;
                 }
@@ -527,10 +566,10 @@ const PedalboardView =
                     if (item.instanceId === splitterInstanceId) {
                         return true;
                     }
-                    let pedalboard: Pedalboard | undefined = this.state.pedalboard;
+                    const pedalboard: Pedalboard | undefined = this.state.pedalboard;
                     if (!pedalboard) return false;
 
-                    let splitter = pedalboard.maybeGetItem(splitterInstanceId);
+                    const splitter = pedalboard.maybeGetItem(splitterInstanceId);
                     if (splitter === null) {
                         return false;
                     }
@@ -545,19 +584,19 @@ const PedalboardView =
 
                     if (!this.frameRef.current) return;
 
-                    let currentLayout: PedalLayout[] = this.currentLayout;
-                    let frameElement = this.frameRef.current;
+                    const currentLayout: PedalLayout[] = this.currentLayout;
+                    const frameElement = this.frameRef.current;
 
-                    let rc = frameElement.getBoundingClientRect();
+                    const rc = frameElement.getBoundingClientRect();
                     clientX -= rc.left;
                     clientY -= rc.top;
 
-                    let it = chainIterator(currentLayout);
+                    const it = chainIterator(currentLayout);
 
                     while (true) {
-                        let v = it.next();
+                        const v = it.next();
                         if (v.done) break;
-                        let item = v.value;
+                        const item = v.value;
 
                         if (item.isSplitter() && item.pedalItem) {
                             if (item.bounds.contains(clientX, clientY)) {
@@ -580,13 +619,13 @@ const PedalboardView =
 
                                 }
                             }
-                            let yMid = (item.bounds.y + item.bounds.bottom) / 2;
+                            const yMid = (item.bounds.y + item.bounds.bottom) / 2;
                             if (clientX >= item.bounds.x
                                 && clientY < yMid && clientY >= item.topChildren[0].bounds.y
 
                             ) {
                                 if (clientX < item.topChildren[0].bounds.x) {
-                                    let topPedalItem = item.topChildren[0].pedalItem;
+                                    const topPedalItem = item.topChildren[0].pedalItem;
                                     if (topPedalItem) {
                                         if (this.isSplitterChild(topPedalItem, instanceId)) 
                                         {
@@ -598,7 +637,7 @@ const PedalboardView =
                                         return;
                                     }
                                 }
-                                let lastTop = item.topChildren[item.topChildren.length - 1];
+                                const lastTop = item.topChildren[item.topChildren.length - 1];
                                 if (clientX >= lastTop.bounds.right && clientX < item.bounds.right - CELL_WIDTH / 2) {
                                     if (lastTop.pedalItem) {
                                         if (this.isSplitterChild(lastTop.pedalItem, instanceId)) {
@@ -615,7 +654,7 @@ const PedalboardView =
                                 && clientY > yMid && clientY < item.bottomChildren[0].bounds.bottom
                             ) {
                                 if (clientX < item.bottomChildren[0].bounds.x) {
-                                    let bottomPedalItem = item.bottomChildren[0].pedalItem;
+                                    const bottomPedalItem = item.bottomChildren[0].pedalItem;
                                     if (bottomPedalItem) {
                                         if (this.isSplitterChild(bottomPedalItem, instanceId)) {
                                             return;
@@ -625,7 +664,7 @@ const PedalboardView =
                                         return;
                                     }
                                 }
-                                let lastBottom = item.bottomChildren[item.bottomChildren.length - 1];
+                                const lastBottom = item.bottomChildren[item.bottomChildren.length - 1];
                                 if (clientX >= lastBottom.bounds.right && clientX < item.bounds.right - CELL_WIDTH / 2) {
                                     if (lastBottom.pedalItem) {
                                         if (this.isSplitterChild(lastBottom.pedalItem, instanceId)) {
@@ -651,7 +690,7 @@ const PedalboardView =
                                 return;
                             } else {
                                 if (item.pedalItem) {
-                                    let margin = (CELL_WIDTH - FRAME_SIZE) / 2;
+                                    const margin = (CELL_WIDTH - FRAME_SIZE) / 2;
                                     if (clientX < item.bounds.x + margin) {
                                         if (this.isSplitterChild(item.pedalItem,instanceId))
                                         {
@@ -679,7 +718,7 @@ const PedalboardView =
                         }
                     }
                     // delete the plugin.
-                    let newId = this.model.setPedalboardItemEmpty(instanceId);
+                    const newId = this.model.setPedalboardItemEmpty(instanceId);
                     this.setSelection(newId);
 
                 }
@@ -708,7 +747,7 @@ const PedalboardView =
 
                 offsetLayout_(layoutItems: PedalLayout[], offset: number): void {
                     for (let i = 0; i < layoutItems.length; ++i) {
-                        let layoutItem = layoutItems[i];
+                        const layoutItem = layoutItems[i];
                         layoutItem.bounds.y += offset;
                         if (layoutItem.isSplitter()) {
                             layoutItem.topConnectorY += offset;
@@ -723,7 +762,7 @@ const PedalboardView =
                     if (layoutItem.pedalItem === undefined) {
                         throw new Error("Invalid splitter");
                     }
-                    let split = layoutItem.pedalItem as PedalboardSplitItem;
+                    const split = layoutItem.pedalItem as PedalboardSplitItem;
                     if (split.getSplitType() === SplitType.Ab) {
                         if (split.isASelected()) {
                             return PluginType.SplitA;
@@ -739,12 +778,12 @@ const PedalboardView =
                 }
 
                 doLayout2_(lp: LayoutParams, layoutItems: PedalLayout[]): Rect {
-                    let bounds = new Rect();
+                    const bounds = new Rect();
                     for (let i = 0; i < layoutItems.length; ++i) {
-                        let layoutItem = layoutItems[i];
+                        const layoutItem = layoutItems[i];
                         if (layoutItem.isSplitter()) {
-                            let x0 = lp.cx;
-                            let y0 = lp.cy;
+                            const x0 = lp.cx;
+                            const y0 = lp.cy;
 
                             layoutItem.bounds.x = x0;
                             layoutItem.bounds.y = y0;
@@ -754,7 +793,7 @@ const PedalboardView =
                             lp.cx += CELL_WIDTH;
 
 
-                            let topBounds = this.doLayout2_(lp, layoutItem.topChildren);
+                            const topBounds = this.doLayout2_(lp, layoutItem.topChildren);
                             if (topBounds.isEmpty()) {
                                 topBounds.x = lp.cx;
                                 topBounds.width = 0;
@@ -764,7 +803,7 @@ const PedalboardView =
                             }
 
 
-                            let dyTop = (lp.cy + CELL_HEIGHT / 2) - (topBounds.y + topBounds.height);
+                            const dyTop = (lp.cy + CELL_HEIGHT / 2) - (topBounds.y + topBounds.height);
 
 
 
@@ -772,17 +811,17 @@ const PedalboardView =
                             topBounds.offset(0, dyTop);
                             bounds.accumulate(topBounds);
 
-                            let topCx = lp.cx;
+                            const topCx = lp.cx;
                             lp.cx = x0;
                             lp.cx += CELL_WIDTH;
 
-                            let bottomBounds = this.doLayout2_(lp, layoutItem.bottomChildren);
+                            const bottomBounds = this.doLayout2_(lp, layoutItem.bottomChildren);
                             if (bottomBounds.isEmpty()) {
                                 bottomBounds.x = lp.cx; bottomBounds.width = 0;
                                 bottomBounds.y = lp.cy; bottomBounds.height = CELL_HEIGHT;
                             }
 
-                            let dyBottom = (lp.cy + CELL_HEIGHT / 2) - bottomBounds.y;
+                            const dyBottom = (lp.cy + CELL_HEIGHT / 2) - bottomBounds.y;
                             this.offsetLayout_(layoutItem.bottomChildren, dyBottom)
                             bottomBounds.offset(0, dyBottom);
                             bounds.accumulate(bottomBounds);
@@ -823,14 +862,14 @@ const PedalboardView =
                         return { width: 1, height: TWO_ROW_HEIGHT };
                     }
 
-                    let lp = new LayoutParams();
+                    const lp = new LayoutParams();
 
-                    let bounds = this.doLayout2_(lp, layoutItems);
+                    const bounds = this.doLayout2_(lp, layoutItems);
                     // shift everything down so there are no negative y coordinates.
 
                     if (bounds.height < TWO_ROW_HEIGHT) {
 
-                        let extra = Math.floor((TWO_ROW_HEIGHT - Math.ceil(bounds.height)) / 2);
+                        const extra = Math.floor((TWO_ROW_HEIGHT - Math.ceil(bounds.height)) / 2);
                         this.offsetLayout_(layoutItems, Math.floor(-bounds.y + extra / 2));
                         bounds.height += extra;
 
@@ -883,8 +922,8 @@ const PedalboardView =
 
                 }
 
-                strokeConnector(output: ReactNode[], channels: number, enabled: Boolean, svgPath: string) {
-                    let color = enabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
+                strokeConnector(output: ReactNode[], channels: number, enabled: boolean, svgPath: string) {
+                    const color = enabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
 
                     if (channels === 2) {
                         output.push((
@@ -902,22 +941,22 @@ const PedalboardView =
 
                 renderConnector(output: ReactNode[], item: PedalLayout, enabled: boolean): void {
                     // const classes = withStyles.getClasses(this.props);
-                    let x_ = item.bounds.x + CELL_WIDTH / 2;
-                    let y_ = item.bounds.y + CELL_HEIGHT / 2;
-                    let numberOfOutputs = item.numberOfOutputs;
-                    let color = enabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
-                    let stereoCenterColor = this.bgColor;
+                    const x_ = item.bounds.x + CELL_WIDTH / 2;
+                    const y_ = item.bounds.y + CELL_HEIGHT / 2;
+                    const numberOfOutputs = item.numberOfOutputs;
+                    const color = enabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
+                    const stereoCenterColor = this.bgColor;
 
                     if (item.originalInputs === 0) {
                         // break the input paths.
-                        let rx = item.bounds.x + CELL_WIDTH / 2 - FRAME_SIZE / 2 - 4;
-                        let ry = y_ - 4;
+                        const rx = item.bounds.x + CELL_WIDTH / 2 - FRAME_SIZE / 2 - 4;
+                        const ry = y_ - 4;
 
                         output.push((
                             <rect key={this.renderKey++} x={rx} y={ry} width={4} height={8} fill={this.props.theme.palette.background.paper} />
                         ));
                     }
-                    let svgPath = new SvgPathBuilder().moveTo(x_, y_).lineTo(x_ + CELL_WIDTH, y_).toString();
+                    const svgPath = new SvgPathBuilder().moveTo(x_, y_).lineTo(x_ + CELL_WIDTH, y_).toString();
 
 
                     if (numberOfOutputs === 2) {
@@ -942,21 +981,21 @@ const PedalboardView =
                 }
                 renderSplitConnectors(output: ReactNode[], item: PedalLayout, enabled: boolean, shortSplitOutput: boolean,): void {
                     //const classes = withStyles.getClasses(this.props);
-                    let x_ = item.bounds.x + CELL_WIDTH / 2;
-                    let y_ = item.bounds.y + CELL_HEIGHT / 2;
-                    let yTop = item.topConnectorY;
-                    let yBottom = item.bottomConnectorY;
+                    const x_ = item.bounds.x + CELL_WIDTH / 2;
+                    const y_ = item.bounds.y + CELL_HEIGHT / 2;
+                    const yTop = item.topConnectorY;
+                    const yBottom = item.bottomConnectorY;
                     //let isStereo = item.stereoOutput;
-                    let split = item.pedalItem as PedalboardSplitItem;
+                    const split = item.pedalItem as PedalboardSplitItem;
 
-                    let topEnabled = enabled && split.isASelected();
-                    let bottomEnabled = enabled && split.isBSelected();
-                    let topColor = topEnabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
-                    let bottomColor = bottomEnabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
+                    const topEnabled = enabled && split.isASelected();
+                    const bottomEnabled = enabled && split.isBSelected();
+                    const topColor = topEnabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
+                    const bottomColor = bottomEnabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
 
 
-                    let topStartPath = new SvgPathBuilder().moveTo(x_, y_).lineTo(x_, yTop).lineTo(x_ + CELL_WIDTH, yTop).toString();
-                    let bottomStartPath = new SvgPathBuilder().moveTo(x_, y_).lineTo(x_, yBottom).lineTo(x_ + CELL_WIDTH, yBottom).toString();
+                    const topStartPath = new SvgPathBuilder().moveTo(x_, y_).lineTo(x_, yTop).lineTo(x_ + CELL_WIDTH, yTop).toString();
+                    const bottomStartPath = new SvgPathBuilder().moveTo(x_, y_).lineTo(x_, yBottom).lineTo(x_ + CELL_WIDTH, yBottom).toString();
 
                     if (item.numberOfInputs === 2 && item.topChildren[0].numberOfInputs === 2) {
                         output.push((<path key={this.renderKey++} d={topStartPath} stroke={topColor} strokeWidth={SVG_STEREO_STROKE_WIDTH} />));
@@ -973,14 +1012,14 @@ const PedalboardView =
                         output.push((<path key={this.renderKey++} d={bottomStartPath} stroke={bottomColor} strokeWidth={SVG_STROKE_WIDTH} />));
                     }
 
-                    let lastTop = item.topChildren[item.topChildren.length - 1];
-                    let lastBottom = item.bottomChildren[item.bottomChildren.length - 1];
+                    const lastTop = item.topChildren[item.topChildren.length - 1];
+                    const lastBottom = item.bottomChildren[item.bottomChildren.length - 1];
 
-                    let xTop = lastTop.bounds.right - CELL_WIDTH / 2;
-                    let xBottom = lastBottom.bounds.right - CELL_WIDTH / 2;
+                    const xTop = lastTop.bounds.right - CELL_WIDTH / 2;
+                    const xBottom = lastBottom.bounds.right - CELL_WIDTH / 2;
 
-                    let xEnd = shortSplitOutput ? item.bounds.right : item.bounds.right + CELL_WIDTH / 2;
-                    let xTee0 = item.bounds.right - CELL_WIDTH / 2;
+                    const xEnd = shortSplitOutput ? item.bounds.right : item.bounds.right + CELL_WIDTH / 2;
+                    const xTee0 = item.bounds.right - CELL_WIDTH / 2;
 
                     let firstPath: string;  // top or bottom depending on draw order.
                     let secondPath: string;  // top or bottom depending on draw order.
@@ -993,10 +1032,10 @@ const PedalboardView =
                     let secondPathEnabled: boolean;
                     let xTee: number;
 
-                    let monoAdjustment = (STEREO_STROKE_WIDTH - STROKE_WIDTH) / 2;
+                    const monoAdjustment = (STEREO_STROKE_WIDTH - STROKE_WIDTH) / 2;
 
-                    let bottomPathFirst = topEnabled && !bottomEnabled;
-                    let topPathFirst = bottomEnabled && !topEnabled;
+                    const bottomPathFirst = topEnabled && !bottomEnabled;
+                    const topPathFirst = bottomEnabled && !topEnabled;
 
 
                     // Third case: L/R stereo output, when both outputs are mono, requires a third stroke.
@@ -1047,8 +1086,8 @@ const PedalboardView =
                         firstPathEnabled = topEnabled;
                         secondPathEnabled = bottomEnabled;
                     }
-                    let firstPathColor = firstPathEnabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
-                    let secondPathColor = secondPathEnabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
+                    const firstPathColor = firstPathEnabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
+                    const secondPathColor = secondPathEnabled ? ENABLED_CONNECTOR_COLOR : DISABLED_CONNECTOR_COLOR;
 
                     if (bottomPathFirst || topPathFirst) {
                         // display stereo strokes with cutoff line.
@@ -1223,9 +1262,9 @@ const PedalboardView =
                         ++length;
                     }
                     for (let i = 0; i < length; ++i) {
-                        let item = layoutChain[i];
+                        const item = layoutChain[i];
                         if (item.isSplitter()) {
-                            let splitter = item.pedalItem as PedalboardSplitItem;
+                            const splitter = item.pedalItem as PedalboardSplitItem;
                             this.renderSplitConnectors(output, item, enabled, i === length - 1 && shortSplitOutput,);
                             this.renderConnectors(output, item.topChildren, enabled && splitter.isASelected(), false);
                             this.renderConnectors(output, item.bottomChildren, enabled && splitter.isBSelected(), false);
@@ -1237,7 +1276,7 @@ const PedalboardView =
                     }
                 }
                 renderConnectorFrame(layoutChain: PedalLayout[], layoutSize: LayoutSize): ReactNode {
-                    let outputs: ReactNode[] = [];
+                    const outputs: ReactNode[] = [];
                     this.renderConnectors(outputs, layoutChain, true, false);
                     return (
                         <div key="connectors" style={{ width: layoutSize.width, height: layoutSize.height, overflow: "hidden" }}>
@@ -1259,15 +1298,15 @@ const PedalboardView =
 
                     const classes = withStyles.getClasses(this.props);
 
-                    let result: ReactNode[] = [];
+                    const result: ReactNode[] = [];
 
                     result.push(this.renderConnectorFrame(layoutChain, layoutSize));
 
-                    let it = chainIterator(layoutChain);
+                    const it = chainIterator(layoutChain);
                     while (true) {
-                        let v = it.next();
+                        const v = it.next();
                         if (v.done) break;
-                        let item = v.value;
+                        const item = v.value;
                         switch (item.uri) {
                             case START_PEDALBOARD_ITEM_URI:
                                 result.push(<div key={this.renderKey++} className={classes.splitItem} style={{ left: item.bounds.x, top: item.bounds.y, width: item.bounds.width }} >
@@ -1308,8 +1347,8 @@ const PedalboardView =
                                             >{item.name}</Typography>
                                         </div>
                                     )
-                                    let uiPlugin = this.model.getUiPlugin(item.pedalItem?.uri ?? "");
-                                    let pluginMissing = uiPlugin === null;
+                                    const uiPlugin = this.model.getUiPlugin(item.pedalItem?.uri ?? "");
+                                    const pluginMissing = uiPlugin === null;
                                     let pluginType = item.pluginType;
                                     if (uiPlugin && uiPlugin.uri === "http://two-play.com/plugins/toob-nam") {
                                         pluginType = PluginType.NamPlugin;
@@ -1339,7 +1378,7 @@ const PedalboardView =
 
                 canInputStero(item: PedalLayout): boolean {
                     if (item.pedalItem) {
-                        let plugin = this.model.getUiPlugin(item.pedalItem.uri);
+                        const plugin = this.model.getUiPlugin(item.pedalItem.uri);
                         if (plugin) {
                             return plugin.audio_inputs === 2;
                         }
@@ -1348,7 +1387,7 @@ const PedalboardView =
                 }
                 getNumberOfInputs(item: PedalLayout): number {
                     if (item.pedalItem) {
-                        let plugin = this.model.getUiPlugin(item.pedalItem.uri);
+                        const plugin = this.model.getUiPlugin(item.pedalItem.uri);
                         if (plugin) {
                             return plugin.audio_inputs;
                         }
@@ -1357,7 +1396,7 @@ const PedalboardView =
                 }
                 getNumberOfOutputs(item: PedalLayout): number {
                     if (item.pedalItem) {
-                        let plugin = this.model.getUiPlugin(item.pedalItem.uri);
+                        const plugin = this.model.getUiPlugin(item.pedalItem.uri);
                         if (plugin) {
                             return plugin.audio_outputs;
                         }
@@ -1374,16 +1413,16 @@ const PedalboardView =
 
                 markStereoBackward(layoutChain: PedalLayout[], numberOfOutputs: number): number {
                     for (let i = layoutChain.length - 1; i >= 0; --i) {
-                        let item = layoutChain[i];
+                        const item = layoutChain[i];
                         if (item.isSplitter()) {
                             item.numberOfOutputs = CalculateConnection(item.numberOfOutputs, numberOfOutputs)
 
                             this.markStereoBackward(item.topChildren, numberOfOutputs);
                             this.markStereoBackward(item.bottomChildren, numberOfOutputs);
-                            let topInputs = item.topChildren[0].numberOfInputs;
-                            let bottomInputs = item.bottomChildren[0].numberOfInputs;
+                            const topInputs = item.topChildren[0].numberOfInputs;
+                            const bottomInputs = item.bottomChildren[0].numberOfInputs;
 
-                            let splitItem = item.pedalItem as PedalboardSplitItem;
+                            const splitItem = item.pedalItem as PedalboardSplitItem;
                             if (splitItem.getSplitType() !== SplitType.Lr) {
                                 item.numberOfInputs = CalculateConnection(item.numberOfInputs, Math.max(topInputs, bottomInputs));
                             }
@@ -1413,17 +1452,17 @@ const PedalboardView =
                         return numberOfInputs;
                     }
                     for (let i = 0; i < layoutChain.length; ++i) {
-                        let item = layoutChain[i];
+                        const item = layoutChain[i];
                         if (item.isSplitter()) {
-                            let splitter = item.pedalItem as PedalboardSplitItem;
+                            const splitter = item.pedalItem as PedalboardSplitItem;
                             item.numberOfInputs = numberOfInputs;
 
                             let chainInputs = numberOfInputs;
                             if (splitter.getSplitType() === SplitType.Lr) {
                                 chainInputs = CalculateConnection(numberOfInputs, 1);
                             }
-                            let topOutputs = this.markStereoForward(item.topChildren, chainInputs);
-                            let bottomOutputs = this.markStereoForward(item.bottomChildren, chainInputs);
+                            const topOutputs = this.markStereoForward(item.topChildren, chainInputs);
+                            const bottomOutputs = this.markStereoForward(item.bottomChildren, chainInputs);
 
 
                             if (splitter.getSplitType() === SplitType.Ab) {
@@ -1466,21 +1505,42 @@ const PedalboardView =
                 }
 
                 currentLayout?: PedalLayout[];
+                private layoutCache?: { signature: string, plugins: unknown, chain: PedalLayout[], size: LayoutSize };
                 private renderKey: number = 0;
-                render() {
-                    const classes = withStyles.getClasses(this.props);
-                    this.renderKey = 0;
-                    let layoutChain = makeChain(this.model, this.state.pedalboard?.items);
-                    let start = PedalLayout.Start();
-                    let end = PedalLayout.End();
+                private computeLayout(): { chain: PedalLayout[], size: LayoutSize } {
+                    const pedalboard = this.state.pedalboard;
+                    const jack = this.model.jackSettings.get();
+                    const signature = JSON.stringify([jack.inputAudioPorts.length, jack.outputAudioPorts.length,
+                        layoutSignature(pedalboard?.items)]);
+                    // PedalLayout reads names, icons and port counts from the plugin registry, so a
+                    // (re)loaded plugin list must invalidate the cache.
+                    const plugins = this.model.ui_plugins.get();
+                    const cache = this.layoutCache;
+                    if (cache && cache.signature === signature && cache.plugins === plugins) {
+                        if (pedalboard) {
+                            rebindLayout(cache.chain, pedalboard.items);
+                        }
+                        return cache;
+                    }
+                    const layoutChain = makeChain(this.model, this.state.pedalboard?.items);
+                    const start = PedalLayout.Start();
+                    const end = PedalLayout.End();
                     if (layoutChain.length !== 0) {
                         layoutChain.splice(0, 0, start);
                         layoutChain.splice(layoutChain.length, 0, end);
                         this.markStereoOutputs(layoutChain, 2, 2);
                     }
 
-                    let layoutSize = this.doLayout(layoutChain);
-
+                    const layoutSize = this.doLayout(layoutChain);
+                    this.layoutCache = { signature: signature, plugins: plugins, chain: layoutChain, size: layoutSize };
+                    return this.layoutCache;
+                }
+                render() {
+                    const classes = withStyles.getClasses(this.props);
+                    this.renderKey = 0;
+                    const computed = this.computeLayout();
+                    const layoutChain = computed.chain;
+                    const layoutSize = computed.size;
 
                     this.currentLayout = layoutChain; // save for mouse processing &c.
 

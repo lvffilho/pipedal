@@ -18,15 +18,24 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 import { PiPedalStateError } from './PiPedalError';
-import Utility from './Utility';
 
 export type MessageHandler = (header: PiPedalMessageHeader, body: any | null) => void;
 export type ErrorHandler = (message: string, exception?: Error) => void;
 export type ReconnectHandler = () => void;
-export type ReconnectingHandler = (retry: number, maxRetries: number) => void;
+export type ReconnectingHandler = (retry: number) => void;
 
-const MAX_RETRIES = 6;
-const MAX_RETRY_TIME = 90 * 1000;
+// Reconnect backoff: 250ms, 500ms, 1s, 2s, then 3s forever, each with +/-20% jitter.
+const RETRY_DELAYS_MS = [250, 500, 1000, 2000, 3000];
+const RETRY_JITTER = 0.2;
+
+export const DISCONNECTED_MESSAGE = "Disconnected";
+
+export function isDisconnectedError(error: any): boolean {
+    if (error instanceof Error) {
+        return error.message === DISCONNECTED_MESSAGE;
+    }
+    return error === DISCONNECTED_MESSAGE;
+}
 
 export type PiPedalMessageHeader = {
     replyTo?: number;
@@ -34,14 +43,42 @@ export type PiPedalMessageHeader = {
     message: string;
 }
 type ReplyHandler = (header: PiPedalMessageHeader, body: any | null) => void;
+type Reservation = {
+    handler: ReplyHandler;
+    reject: (reason: any) => void;
+};
 
+// Idempotent "set a value" commands that are worth replaying after a reconnect.
+// Only the latest message per key is kept. Returns undefined for anything else.
+function idempotentKey(message: string, body: any): string | undefined {
+    switch (message) {
+        case "setControl":
+            return message + "|" + body?.instanceId + "|" + body?.symbol;
+        case "loadPreset":
+        case "setSnapshot":
+            // latest selection wins, regardless of target.
+            return message + "||";
+        default:
+            return undefined;
+    }
+}
+
+type PendingSend = {
+    message: string;
+    body?: any;
+    queuedAt: number; // Date.now() when queued.
+};
+
+// Queued messages older than this are dropped at reconnect: a preset/snapshot tap or a control
+// change that is replayed long after it was made would surprise the player.
+export const MAX_PENDING_SEND_AGE_MS = 5000;
 
 export interface PiPedalSocketListener {
     onMessageReceived: (header: PiPedalMessageHeader, body: any | null) => void;
     onError: (message: string, exception?: Error) => void;
     onConnectionLost: () => void;
     onReconnect: () => void;
-    onReconnecting: (retry: number, maxRetries: number) => boolean;
+    onReconnecting: (retry: number) => boolean;
 };
 
 class PiPedalSocket {
@@ -54,8 +91,6 @@ class PiPedalSocket {
     url: string;
     retrying: boolean = false;
     retryCount: number = 0;
-    retryDelay: number = 0;
-    totalRetryDelay: number = 0;
 
     constructor(
         url: string,
@@ -63,17 +98,29 @@ class PiPedalSocket {
     ) {
         this.url = url;
         this.listener = listener;
+        this.onOnline = this.onOnline.bind(this);
+        this.onVisibilityChange = this.onVisibilityChange.bind(this);
+        window.addEventListener("online", this.onOnline);
+        document.addEventListener("visibilitychange", this.onVisibilityChange);
     }
 
     handleOpen(event: Event): any {
 
     }
 
-    sendInternal_(json: string) {
-        if (!this.retrying) {
-            this.socket?.send(json);
-        }
+    isConnected(): boolean {
+        return !this.retrying && !this.isBackground
+            && this.socket !== undefined && this.socket.readyState === WebSocket.OPEN;
     }
+
+    private sendInternal_(json: string): boolean {
+        if (!this.isConnected()) return false;
+        this.socket!.send(json);
+        return true;
+    }
+
+    private pendingSends: Map<string, PendingSend> = new Map<string, PendingSend>();
+
     send(message: string, jsonObject?: any) {
         let msg: any;
         if (jsonObject === undefined) {
@@ -81,9 +128,50 @@ class PiPedalSocket {
         } else {
             msg = [{ message: message }, jsonObject];
         }
-        let json = JSON.stringify(msg);
-        this.sendInternal_(json);
+        const json = JSON.stringify(msg);
+        if (this.sendInternal_(json)) return;
+
+        const key = idempotentKey(message, jsonObject);
+        if (key !== undefined) {
+            // keep only the latest; move it to the back of the queue.
+            this.pendingSends.delete(key);
+            this.pendingSends.set(key, { message: message, body: jsonObject, queuedAt: Date.now() });
+        } else {
+            console.warn("Not connected. Dropping message: " + message);
+        }
     }
+
+    // Send queued idempotent messages after a reconnect. Messages older than MAX_PENDING_SEND_AGE_MS
+    // are dropped. Bodies that carry a clientId are re-addressed from the previous connection's client
+    // id to clientId (the server ignores echoes to the sending client by id). onFlush is called for each
+    // message sent so that the caller can reflect it in local state.
+    flushPendingSends(clientId: number, onFlush?: (message: string, body: any) => void) {
+        const pending = Array.from(this.pendingSends.values());
+        this.pendingSends.clear();
+        const now = Date.now();
+        for (const item of pending) {
+            if (now - item.queuedAt > MAX_PENDING_SEND_AGE_MS) {
+                console.warn("Dropping stale queued message: " + item.message);
+                continue;
+            }
+            let body = item.body;
+            if (body !== null && typeof body === "object" && !Array.isArray(body) && "clientId" in body) {
+                body = { ...body, clientId: clientId };
+            }
+            const json = JSON.stringify(body === undefined ? [{ message: item.message }] : [{ message: item.message }, body]);
+            if (this.sendInternal_(json)) {
+                onFlush?.(item.message, body);
+            } else {
+                console.warn("Not connected. Dropping message: " + item.message);
+            }
+        }
+    }
+
+    // Discard queued messages (e.g. the server state could not be reloaded after a reconnect).
+    clearPendingSends() {
+        this.pendingSends.clear();
+    }
+
     reply(replyTo: number, message: string, jsonObject?: any) {
         if (replyTo !== -1) {
             let msg: any;
@@ -92,7 +180,7 @@ class PiPedalSocket {
             } else {
                 msg = [{ reply: replyTo, message: message }, jsonObject];
             }
-            let json = JSON.stringify(msg);
+            const json = JSON.stringify(msg);
             this.sendInternal_(json);
         }
     }
@@ -101,29 +189,34 @@ class PiPedalSocket {
         return ++this.nextResponseCode;
     }
 
-    _replyMap: Map<number, ReplyHandler> = new Map<number, ReplyHandler>();
+    _replyMap: Map<number, Reservation> = new Map<number, Reservation>();
 
     _discardReplyReservations() {
-        // it's ok. All pending reservations disappear into the GC.
-        this._replyMap = new Map<number, ReplyHandler>();
+        const reservations = this._replyMap;
+        this._replyMap = new Map<number, Reservation>();
+        for (const reservation of reservations.values()) {
+            reservation.reject(new Error(DISCONNECTED_MESSAGE));
+        }
     }
 
-
-    _addReservation(replyCode: number, handler: ReplyHandler): void {
-        this._replyMap.set(replyCode, handler);
-    }
 
     request<Type = any>(message_: string, requestArgs?: any): Promise<Type> {
-        let responseCode = this._nextResponseCode();
+        if (!this.isConnected()) {
+            return Promise.reject(new Error(DISCONNECTED_MESSAGE));
+        }
+        const responseCode = this._nextResponseCode();
 
         return new Promise<Type>((resolve, reject) => {
             try {
-                this._addReservation(responseCode, (header: PiPedalMessageHeader, jsonObject?: any) => {
-                    if (header.message === "error") {
-                        reject(jsonObject + "");
-                    } else {
-                        resolve(jsonObject as Type);
-                    }
+                this._replyMap.set(responseCode, {
+                    handler: (header: PiPedalMessageHeader, jsonObject?: any) => {
+                        if (header.message === "error") {
+                            reject(jsonObject + "");
+                        } else {
+                            resolve(jsonObject as Type);
+                        }
+                    },
+                    reject: reject
                 });
                 let msg: any;
                 if (requestArgs !== undefined) {
@@ -131,28 +224,30 @@ class PiPedalSocket {
                 } else {
                     msg = [{ message: message_, replyTo: responseCode }];
                 }
-                let jsonMessage = JSON.stringify(msg);
+                const jsonMessage = JSON.stringify(msg);
                 this.sendInternal_(jsonMessage);
             } catch (err) {
+                this._replyMap.delete(responseCode);
                 reject(err);
             }
         });
     }
     handleMessage(event: MessageEvent<string>): any {
         try {
-            let message: any = JSON.parse(event.data);
+            const message: any = JSON.parse(event.data);
             if (!Array.isArray(message)) {
                 throw new PiPedalStateError("Invalid message received from server.");
             }
-            let header = message[0] as PiPedalMessageHeader;
+            const header = message[0] as PiPedalMessageHeader;
             let body = undefined;
             if (message.length === 2) {
                 body = message[1];
             }
             if (header.reply !== undefined) {
-                let handler = this._replyMap.get(header.reply);
-                if (handler) {
-                    handler(header, body);
+                const reservation = this._replyMap.get(header.reply);
+                if (reservation) {
+                    this._replyMap.delete(header.reply);
+                    reservation.handler(header, body);
                 }
                 return;
             } else {
@@ -171,39 +266,26 @@ class PiPedalSocket {
     }
 
     handleError(_event: Event): any {
-        if (this.listener) {
-            this.listener.onError("Server connection lost.");
-        } else {
-            throw new PiPedalStateError("Server connection lost.");
-        }
+        // Once the socket has opened, onclose drives reconnection. A network blip
+        // is not a fatal error.
+        console.warn("WebSocket error (ignored; waiting for close).");
     }
 
     canReconnect: boolean = false;
 
     handleClose(_event: any): any {
-        if (this.retrying) {
-            this.close();
-            // treat this as a fatal error.
-            if (this.listener) {
-                this.listener.onError("Server connection lost.");
-            } else {
-                throw new PiPedalStateError("Server connection closed.");
-            }
-            return;
-
-        }
         if (this.canReconnect) {
+            this.socket = undefined;
             this.listener.onConnectionLost();
             this._reconnect();
         }
     }
     _reconnect() {
         this._discardReplyReservations();
+        this.cancelRetry_();
         this.retrying = true;
         this.retryCount = 0;
         this.socket = undefined;
-        this.retryDelay = 10000;
-        this.totalRetryDelay = 0;
 
         this.reconnect();
     }
@@ -212,12 +294,67 @@ class PiPedalSocket {
 
     enterBackgroundState() {
         this.isBackground = true;
+        this.cancelRetry_();
         this.close();
-
+        this._discardReplyReservations();
     }
     exitBackgroundState() {
         this.isBackground = false;
         this._reconnect();
+    }
+
+    private retryTimer?: ReturnType<typeof setTimeout>;
+    private attemptId: number = 0;
+    private pendingWs?: WebSocket;
+
+    private cancelRetry_() {
+        if (this.retryTimer !== undefined) {
+            clearTimeout(this.retryTimer);
+            this.retryTimer = undefined;
+        }
+        // abandon any connection attempt in flight.
+        ++this.attemptId;
+        if (this.pendingWs) {
+            const ws = this.pendingWs;
+            this.pendingWs = undefined;
+            ws.onopen = null; ws.onclose = null; ws.onerror = null; ws.onmessage = null;
+            try { ws.close(); } catch (ignored) { }
+        }
+    }
+
+    private nextRetryDelay_(): number {
+        const base = RETRY_DELAYS_MS[Math.min(this.retryCount, RETRY_DELAYS_MS.length - 1)];
+        const jitter = 1 + (Math.random() * 2 - 1) * RETRY_JITTER;
+        return Math.round(base * jitter);
+    }
+
+    // Retry right now, skipping any backoff delay.
+    retryNow() {
+        if (!this.retrying || this.isBackground) return;
+        this.cancelRetry_();
+        this.reconnect();
+    }
+
+    private onOnline() {
+        this.retryNow();
+    }
+    private onVisibilityChange() {
+        // The model's exitBackgroundState owns the foreground-return reconnect. Only
+        // shortcut a pending backoff delay; never start a second attempt while one is in flight.
+        if (document.visibilityState === "visible" && this.pendingWs === undefined) {
+            this.retryNow();
+        }
+    }
+
+    // Detach the window/document listeners and abandon any connection; used when the socket is replaced.
+    dispose() {
+        window.removeEventListener("online", this.onOnline);
+        document.removeEventListener("visibilitychange", this.onVisibilityChange);
+        this.canReconnect = false;
+        this.retrying = false;
+        this.cancelRetry_();
+        this.close();
+        this._discardReplyReservations();
     }
 
     reconnect() {
@@ -226,27 +363,32 @@ class PiPedalSocket {
             this.close();
         }
 
-        if (!this.listener.onReconnecting(this.retryCount, MAX_RETRIES)) {
+        if (!this.listener.onReconnecting(this.retryCount)) {
             return;
         }
+        const delay = this.nextRetryDelay_();
         ++this.retryCount;
+        const attempt = ++this.attemptId;
 
-        this.connectInternal_()
+        this.connectInternal_((ws) => { this.pendingWs = ws; })
             .then((socket) => {
+                if (attempt !== this.attemptId) {
+                    // abandoned.
+                    try { socket.onclose = null; socket.onerror = null; socket.onmessage = null; socket.close(); } catch (ignored) { }
+                    return;
+                }
+                this.pendingWs = undefined;
                 this.socket = socket;
                 this.retrying = false;
                 this.listener.onReconnect();
             })
             .catch(error => {
-                if (this.totalRetryDelay >= MAX_RETRY_TIME) {
-                    this.listener.onError("Server connection lost.");
-                    return;
-                } else {
-                    this.totalRetryDelay += this.retryDelay;
-                    Utility.delay(this.retryDelay).then(() => this.reconnect());
-                    this.retryDelay *= 2;
-                    if (this.retryDelay > 3000) this.retryDelay = 3000;
-                }
+                if (attempt !== this.attemptId) return;
+                this.pendingWs = undefined;
+                this.retryTimer = setTimeout(() => {
+                    this.retryTimer = undefined;
+                    this.reconnect();
+                }, delay);
             });
     }
 
@@ -265,12 +407,13 @@ class PiPedalSocket {
         }
         this.socket = undefined;
     }
-    connectInternal_(): Promise<WebSocket> {
+    connectInternal_(onCreate?: (ws: WebSocket) => void): Promise<WebSocket> {
         return new Promise<WebSocket>((resolve, reject) => {
             try {
-                let ws = new WebSocket(this.url);
+                const ws = new WebSocket(this.url);
+                onCreate?.(ws);
 
-                let self = this;
+                const self = this;
 
                 ws.onmessage = this.handleMessage.bind(this);
                 ws.onclose = (event: Event) => {
@@ -289,24 +432,24 @@ class PiPedalSocket {
                     ws.onopen = null;
                     resolve(ws);
                 };
-            } catch (e: any){
+            } catch (e: any) {
                 reject("Failed to connect: " + e.toString());
             };
         });
-}
-connect(): Promise < void> {
-    return new Promise<void>((resolve, reject) => {
+    }
+    connect(): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
 
-        this.connectInternal_()
-            .then((socket) => {
-                this.socket = socket;
-                resolve();
-            })
-            .catch((reason) => {
-                reject(reason);
-            });
-    });
-}
+            this.connectInternal_()
+                .then((socket) => {
+                    this.socket = socket;
+                    resolve();
+                })
+                .catch((reason) => {
+                    reject(reason);
+                });
+        });
+    }
 
 }
 

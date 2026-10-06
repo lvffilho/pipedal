@@ -46,6 +46,23 @@ namespace pipedal {
         virtual void OnUnderrun() = 0;
         virtual void OnAlsaDriverStopped() = 0;
         virtual void OnAudioTerminated() = 0;
+
+        // While the driver is stopped after an abnormal termination: process pending
+        // host->audio commands only (no DSP), so the host's pedalboard bookkeeping and
+        // blocking requests keep moving. Called from the driver's (demoted) audio thread.
+        virtual void OnProcessCommandsOnly() {}
+
+        // Audio thread, still realtime, while it waits for a device restart (up to ~30 s):
+        // process pending host->audio commands only (no DSP), so that UI commands are not
+        // held up. Unlike OnProcessCommandsOnly(), requests that need the pedalboard to run
+        // stay queued for the next OnProcess() (or are failed if the restart fails).
+        // Must be realtime-safe.
+        virtual void OnProcessCommandsWhileRestarting() {}
+
+        // Audio thread: ask a non-realtime thread to call AudioDriver::ServiceRestartRequest().
+        // Must not block. Returns false if no such thread is available, in which case the
+        // driver restarts the device on its own thread.
+        virtual bool RequestDriverRestart() { return false; }
     };
     class AudioDriver {
     public:
@@ -100,6 +117,15 @@ namespace pipedal {
 
         virtual std::string GetConfigurationDescription() = 0;
         virtual void DumpBufferTrace(size_t nEntries) {}
+
+        // Non-realtime service thread: perform a restart previously requested through
+        // AudioDriverHost::RequestDriverRestart(). No-op if none is pending.
+        virtual void ServiceRestartRequest() {}
+
+        // Non-realtime service thread: log counters accumulated by the audio thread
+        // (xruns, dropped MIDI events) since the previous call.
+        // Returns true if anything was logged.
+        virtual bool LogRealtimeStatistics() { return false; }
 
     };
 

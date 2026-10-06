@@ -28,6 +28,8 @@
 #include "Ipv6Helpers.hpp"
 #include <memory>
 #include "ZipFile.hpp"
+#include "UploadPolicy.hpp"
+#include "IrClassifier.hpp"
 #include "PiPedalUI.hpp"
 #include "ofstream_synced.hpp"
 #include "UpdaterSecurity.hpp"
@@ -83,23 +85,33 @@ static std::string GetMimeType(const std::filesystem::path& path)
 
 static bool IsSafeMediaPath(const fs::path path)
 {
-    if (!HtmlHelper::IsSafeFileName(path)) {
-        return false;
-    }
-    if (!(path.string().starts_with("/var/pipedal/audio_uploads/")))
+    return IsPathInAudioUploads(path) && IsAllowedUploadExtension(path);
+}
+// Remove leftover "*.uploading" copy-fallback temp files (older than an hour) from a directory.
+static void SweepStaleUploadTemps(const fs::path &dir)
+{
+    std::error_code ec;
+    auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(1);
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
     {
-        return false;
+        std::error_code e2;
+        if (it->path().extension() == ".uploading" && it->is_regular_file(e2))
+        {
+            auto t = it->last_write_time(e2);
+            if (!e2 && t < cutoff)
+            {
+                fs::remove(it->path(), e2);
+            }
+        }
     }
-    return true;
 }
 static bool IsSafeThumbnailPath(const fs::path path)
 {
     if (!HtmlHelper::IsSafeFileName(path)) {
         return false;
     }
-    if ((!path.string().starts_with("/var/pipedal/tone3000_thumbnails/")) &&
-        (!path.string().starts_with("/var/pipedal/audio_uploads/tone3000_thumbnails/"))
-        )
+    if (!IsFileUnderRoot(TONE3000_THUMBNAILS_ROOT, path) &&
+        !IsFileUnderRoot(LEGACY_TONE3000_THUMBNAILS_ROOT, path))
     {
         return false;
     }
@@ -293,6 +305,15 @@ using namespace pipedal::implementation;
 class DownloadIntercept : public RequestHandler
 {
     PiPedalModel* model;
+
+    // Lexical + canonical-parent containment (IsFileUnderRoot), in addition to the
+    // IsInUploadsDirectory() check: a symlinked directory must not lead out of
+    // the uploads directory. File symlinks are allowed (PiPedal links factory
+    // resources from plugin bundles into the uploads directory).
+    bool IsContainedInUploads(const fs::path& path)
+    {
+        return IsFileUnderRoot(model->GetStorage().GetPluginUploadDirectory(), path);
+    }
 
 public:
     DownloadIntercept(PiPedalModel* model)
@@ -528,7 +549,7 @@ public:
             {
                 fs::path path = request_uri.query("path");
 
-                if (!fs::exists(path) || !this->model->IsInUploadsDirectory(path) || HasDotDot(path))
+                if (!fs::exists(path) || !this->model->IsInUploadsDirectory(path) || !IsContainedInUploads(path) || HasDotDot(path))
                 {
                     throw PiPedalException("File not found.");
                 }
@@ -715,7 +736,7 @@ public:
             {
                 fs::path path = request_uri.query("path");
 
-                if (!fs::exists(path) || !this->model->IsInUploadsDirectory(path) || HasDotDot(path))
+                if (!fs::exists(path) || !this->model->IsInUploadsDirectory(path) || !IsContainedInUploads(path) || HasDotDot(path))
                 {
                     throw PiPedalException("File not found.");
                 }
@@ -801,7 +822,7 @@ public:
                 res.set(HttpField::cache_control, "no-cache");
                 fs::path path = model->GetStorage().FromAbstractPathString(request_uri.query("path"));
 
-                if (!fs::exists(path) || !this->model->IsInUploadsDirectory(path) || HasDotDot(path))
+                if (!fs::exists(path) || !this->model->IsInUploadsDirectory(path) || !IsContainedInUploads(path) || HasDotDot(path))
                 {
                     throw PiPedalException("File not found.");
                 }
@@ -842,6 +863,7 @@ public:
                         if (path.empty() ||
                             !fs::exists(path) ||
                             !this->model->IsInUploadsDirectory(path) ||
+                            !IsContainedInUploads(path) ||
                             HasDotDot(path))
                         {
                             std::shared_ptr<TemporaryFile> thumbnail;
@@ -850,6 +872,7 @@ public:
 
                             if (!path.empty() && fs::exists(path) &&
                                 this->model->IsInUploadsDirectory(path) &&
+                                IsContainedInUploads(path) &&
                                 !HasDotDot(path))
                             {
                                 // path is a folder.
@@ -909,7 +932,7 @@ public:
 
                 try
                 {
-                    if (!fs::exists(path) || !this->model->IsInUploadsDirectory(path) || HasDotDot(path))
+                    if (!fs::exists(path) || !this->model->IsInUploadsDirectory(path) || !IsContainedInUploads(path) || HasDotDot(path))
                     {
                         throw PiPedalException("File not found.");
                     }
@@ -941,7 +964,7 @@ public:
 
                 try
                 {
-                    if (!fs::exists(path) || !this->model->IsInUploadsDirectory(path) || HasDotDot(path))
+                    if (!fs::exists(path) || !this->model->IsInUploadsDirectory(path) || !IsContainedInUploads(path) || HasDotDot(path))
                     {
                         throw PiPedalException("File not found.");
                     }
@@ -1132,21 +1155,55 @@ public:
                     {
                         throw std::runtime_error("Unexpected.");
                     }
-
-                    try {
-                        fs::create_directories(targetPath.parent_path());
-                        // try moving into place.
-                        if (fs::exists(targetPath))
+                    // IR uploads: classify (catalog gear, then WAV length) and route to CabIR or ReverbImpulseFiles.
+                    {
+                        auto irGear = request_uri.optionalQuery("irGear");
+                        std::string lowerExt = targetPath.extension().string();
+                        std::transform(lowerExt.begin(), lowerExt.end(), lowerExt.begin(),
+                                       [](unsigned char c) { return (char)std::tolower(c); });
+                        if (irGear.has_value() && lowerExt == ".wav")
                         {
-                            fs::remove(targetPath);
+                            fs::path resolved = ResolveIrUploadPath(
+                                targetPath, AUDIO_UPLOADS_ROOT, irGear.value(), filePath);
+                            if (resolved != targetPath)
+                            {
+                                if (!IsSafeMediaPath(resolved))
+                                {
+                                    throw std::runtime_error("Unsafe path.");
+                                }
+                                targetPath = resolved;
+                            }
                         }
+                    }
+
+                    fs::create_directories(targetPath.parent_path());
+                    SweepStaleUploadTemps(targetPath.parent_path());
+                    // Never delete the existing file first: rename() atomically replaces it,
+                    // and the copy fallback writes a temp sibling and renames that.
+                    // The sibling is uniquely named (mkstemps) so concurrent uploads to the
+                    // same target can't clobber each other's partially copied temp file.
+                    try {
                         fs::rename(req.get_body_temporary_file(), targetPath);
                         req.detach_body_temporary_file();
-
                     }
                     catch (const std::exception& e) {
-                        // ok Copy into place instead.
-                        fs::copy(req.get_body_temporary_file(), targetPath);
+                        fs::path tmpPath;
+                        try {
+                            tmpPath = MakeUploadTempFile(targetPath);
+                        }
+                        catch (const std::exception& tempError) {
+                            // Report the rename failure (the root cause), not just the fallback's.
+                            throw std::runtime_error(SS(e.what() << " (" << tempError.what() << ")"));
+                        }
+                        try {
+                            fs::copy_file(req.get_body_temporary_file(), tmpPath, fs::copy_options::overwrite_existing);
+                            fs::rename(tmpPath, targetPath);
+                        }
+                        catch (...) {
+                            std::error_code ignored;
+                            fs::remove(tmpPath, ignored);
+                            throw;
+                        }
                     }
                     // set target permissions to "pipedal_d:pipedald -rw-rw-r-- if we can.
                     try {
@@ -1160,7 +1217,7 @@ public:
                         // ignore.
                     }
 
-                    responseText = "{\"ok\": true}";
+                    responseText = SS("{\"ok\": true, \"path\": " << json_writer::encode_string(targetPath.string()) << "}");
                 }
                 catch (const std::exception& e)
                 {
@@ -1536,6 +1593,15 @@ void pipedal::ConfigureWebServer(
     int port,
     size_t maxUploadSize)
 {
+    // Downloads are checked against Storage's upload directory, uploads/thumbnails against
+    // AUDIO_UPLOADS_ROOT. They are expected to be the same directory; say so once if not.
+    if (!IsSameDirectory(model.GetPluginUploadDirectory(), AUDIO_UPLOADS_ROOT))
+    {
+        Lv2Log::warning(SS("Plugin upload directory " << model.GetPluginUploadDirectory()
+            << " differs from " << AUDIO_UPLOADS_ROOT
+            << ". Downloads and uploads are validated against different roots."));
+    }
+
     std::shared_ptr<RequestHandler> interceptConfig{ new InterceptConfig(model,port, maxUploadSize) };
     server.AddRequestHandler(interceptConfig);
 

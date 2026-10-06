@@ -85,6 +85,8 @@ namespace fs = std::filesystem;
 #define CHGRP_BIN "/usr/bin/chgrp"
 #define CHOWN_BIN "/usr/bin/chown"
 #define CHMOD_BIN "/usr/bin/chmod"
+// /bin (not /usr/bin): udev ships udevadm in /bin, which also resolves on usr-merged systems.
+#define UDEVADM_BIN "/bin/udevadm"
 
 #define SERVICE_PATH "/usr/lib/systemd/system"
 #define PIPEDALD_SERVICE "pipedald"
@@ -699,6 +701,11 @@ static std::map<fs::path, fs::perms> sPermissionExceptions({{"/var/pipedal/confi
 
 }});
 
+// Files that keep tighter permissions when their directory is fixed up recursively.
+static std::map<fs::path, fs::perms> sRecursivePermissionExceptions({
+    // TONE3000 access + refresh tokens (Tone3000Auth): daemon only.
+    {"/var/pipedal/config/tone3000_auth.json", fs::perms::owner_read | fs::perms::owner_write}});
+
 void SetVarPermissions(
     const fs::path &path,
     fs::perms directoryPermissions,
@@ -732,6 +739,10 @@ void SetVarPermissions(
                         if (fs::is_directory(entry.path()))
                         {
                             fs::permissions(entry.path(), directoryPermissions, fs::perm_options::replace);
+                        }
+                        else if (sRecursivePermissionExceptions.contains(entry.path()))
+                        {
+                            fs::permissions(entry.path(), sRecursivePermissionExceptions[entry.path()], fs::perm_options::replace);
                         }
                         else
                         {
@@ -1086,6 +1097,11 @@ void Install(const fs::path &programPrefix, const std::string endpointAddress)
         {
             throw std::runtime_error("Failed to create pipedald service group.");
         }
+        // Apply the packaged /etc/udev/rules.d/70-pipedal-cpu-dma-latency.rules (group "audio",
+        // created above) to the existing /dev/cpu_dma_latency node now, rather than at next boot.
+        // Best effort: ignore failure (e.g. no udev in a container/chroot).
+        silentSysExec(UDEVADM_BIN " control --reload");
+        silentSysExec(UDEVADM_BIN " trigger --action=change --subsystem-match=misc --sysname-match=cpu_dma_latency");
         // defensively disable wifi p2p if some leftover config file left it enabled.
 #ifdef P2PD_DISABLED
         try

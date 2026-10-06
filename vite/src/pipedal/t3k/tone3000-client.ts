@@ -48,6 +48,7 @@
  */
 
 import { T3K_API } from './config';
+import type { Tone3000TokenProvider } from './tone3000-auth';
 import type {
     User, Tone, Model, PublicUser,
     PaginatedResponse, SearchTonesParams, ListUsersParams,
@@ -513,7 +514,7 @@ export async function handleOAuthCallback(
         return { ok: false, error: 'missing_code' };
     }
 
-    let tokenSearchParams = new URLSearchParams({
+    const tokenSearchParams = new URLSearchParams({
         grant_type: 'authorization_code',
         code,
         code_verifier: codeVerifier,
@@ -600,6 +601,12 @@ const STORAGE_KEY = 't3k_tokens';
  */
 export class T3KClient {
     private refreshPromise: Promise<T3KTokens> | null = null;
+    // When set, tokens come from the PiPedal server's TONE3000 session instead of sessionStorage.
+    private tokenProvider: Tone3000TokenProvider | null = null;
+
+    setTokenProvider(provider: Tone3000TokenProvider | null): void {
+        this.tokenProvider = provider;
+    }
 
     constructor(
         private readonly publishableKey: string,
@@ -624,6 +631,10 @@ export class T3KClient {
     }
 
     async getAccessToken(): Promise<string> {
+        if (this.tokenProvider) {
+            // The server refreshes 60 s before expiry.
+            return this.tokenProvider(false);
+        }
         const tokens = this.getTokens();
         if (!tokens) {
             this.onAuthRequired();
@@ -657,6 +668,13 @@ export class T3KClient {
         });
 
         // Retry once on 401 — handles expiry race conditions between refresh check and request
+        if (res.status === 401 && this.tokenProvider) {
+            const retryToken = await this.tokenProvider(true, token);
+            return globalThis.fetch(`${T3K_API}${path}`, {
+                ...init,
+                headers: { ...init?.headers, Authorization: `Bearer ${retryToken}` },
+            });
+        }
         if (res.status === 401) {
             const stored = this.getTokens();
             if (stored) {

@@ -23,6 +23,8 @@
 #include "sched.h"
 #include "ss.hpp"
 #include <stdexcept>
+#include <cerrno>
+#include <cstring>
 
 #include <unistd.h> // for nice().
 
@@ -102,6 +104,7 @@ static void SetPriority(int realtimePriority, const char *priorityName)
         param.sched_priority = realtimePriority;
 
         int result = sched_setscheduler(0, SCHED_RR, &param);
+        int savedErrno = errno;
         if (result == 0)
         {
             Lv2Log::debug(SS("Service thread priority successfully boosted. (" << priorityName << ")"));
@@ -109,7 +112,7 @@ static void SetPriority(int realtimePriority, const char *priorityName)
         }
         else
         {
-            Lv2Log::warning(SS("Failed to set RT thread priority for " << priorityName << " (" << strerror(result) << ")"));
+            Lv2Log::warning(SS("Failed to set RT thread priority for " << priorityName << " (" << strerror(savedErrno) << ")"));
         }
     }
 }

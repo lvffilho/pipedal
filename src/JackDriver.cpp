@@ -454,6 +454,9 @@ private:
 
     }
 
+    // No CpuUse read/write marks here: Jack does the PCM I/O itself and only calls process_fn
+    // with buffers ready, so there is no read/write split to time. jack_cpu_load() is the
+    // server's own DSP-load figure, and driver overhead isn't observable from the client.
     virtual float CpuOverhead() { return 0; }
     virtual float CpuUse()
     {

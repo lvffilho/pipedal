@@ -43,8 +43,11 @@
 #include "ChannelRouterSettings.hpp"
 #include <unordered_map>
 #include "Tone3000Downloader.hpp"
+#include "Tone3000Auth.hpp"
 #include "Uri.hpp"
 #include "Tone3000Tone.hpp"
+#include "PendingMidiAcks.hpp"
+#include "PedalboardEditRouting.hpp"
 
 namespace pipedal
 {
@@ -55,6 +58,9 @@ namespace pipedal
     class Updater;
     class AvahiService;
     class Lv2PluginState;
+    class PedalboardBuilder;
+    struct PedalboardBuildRequest;
+    struct PedalboardBuildResult;
 
     class IPiPedalModelSubscriber
     {
@@ -90,6 +96,7 @@ namespace pipedal
         virtual void OnGovernorSettingsChanged(const std::string &governor) = 0;
         virtual void OnFavoritesChanged(const std::map<std::string, bool> &favorites) = 0;
         virtual void OnShowStatusMonitorChanged(bool show) = 0;
+        virtual void OnSuspendBypassedPluginsChanged(bool value) = 0;
         virtual void OnSystemMidiBindingsChanged(const std::vector<MidiBinding> &bindings) = 0;
         virtual void OnNotifyPathPatchPropertyChanged(int64_t instanceId, const std::string &pathPatchPropertyString, const std::string &atomString) = 0;
 
@@ -100,6 +107,7 @@ namespace pipedal
         virtual void OnTone3000DownloadProgress(const Tone3000DownloadProgress &progress) = 0;
         virtual void OnTone3000DownloadComplete(int64_t handle, const std::string &resultPath) = 0;
         virtual void OnTone3000DownloadError(int64_t handle, const std::string &errorMessage) = 0;
+        virtual void OnTone3000AuthStatusChanged(const Tone3000AuthStatus &status) = 0;
         virtual void OnLv2PluginsChanging() = 0;
 
         virtual void OnNetworkChanging(bool hotspotConnected) = 0;
@@ -130,6 +138,8 @@ namespace pipedal
         virtual void OnTone3000DownloadError(int64_t handle, const std::string &errorMessage) override;
 
         std::shared_ptr<Tone3000Downloader> tone3000Downloader;
+        std::shared_ptr<Tone3000Auth> tone3000Auth; // TONE3000 account session (device-code sign-in).
+        void OnTone3000AuthStatusChanged(const Tone3000AuthStatus &status);
         void CancelAudioRetry();
         clock::time_point lastRestartTime = clock::time_point::min();
         int audioRestartRetries = 0;
@@ -212,6 +222,60 @@ namespace pipedal
         std::shared_ptr<Lv2Pedalboard> lv2Pedalboard;
         std::filesystem::path webRoot;
 
+        // Builds Lv2Pedalboards (plugin instantiation) on a dedicated thread, without holding `mutex`.
+        // See the threading notes above PiPedalModel::LoadCurrentPedalboard() in PiPedalModel.cpp.
+        std::unique_ptr<PedalboardBuilder> pedalboardBuilder;
+        // Held by the builder thread while it builds, and by callers of pluginHost.OnConfigurationChanged(),
+        // so that plugin instantiation never sees a half-updated sample rate/buffer size/channel selection.
+        // Lock order: `mutex` may be held when taking this lock; never take `mutex` while holding it.
+        std::mutex pluginHostConfigurationMutex;
+        uint64_t pluginHostConfigurationVersion = 0; // protected by pluginHostConfigurationMutex.
+        uint64_t audioEpoch = 0; // protected by mutex. Bumped when RestartAudio() tears down the running pedalboard.
+        bool audioRestarting = false; // protected by mutex. True while RestartAudio() runs, until it requests a fresh build.
+        // Protected by mutex. The instance-id lineage of the installed pedalboard (Lv2Pedalboard::GetInstanceIdLineage()):
+        // bumped by every installed full build, since its instance ids may name unrelated plugins of the previous one.
+        uint64_t instanceIdLineage = 0;
+        void RequestPedalboardBuild(bool reuseExistingEffects);
+        // The pedalboard of the latest build request, and its builder generation. Protected by mutex.
+        Pedalboard lastRequestedPedalboard;
+        uint64_t lastRequestedGeneration = 0;
+        bool lastRequestedPedalboardValid = false;
+        PedalboardBuildResult BuildPedalboard(PedalboardBuildRequest &request);
+        bool RunningInstanceIdsMatchPedalboard() const;
+        std::map<uint64_t, std::shared_ptr<IEffect>> FindReusableInstances(
+            const Pedalboard &pedalboard, Lv2Pedalboard &runningPedalboard, const std::string &uploadDirectory);
+        void InstallBuiltPedalboard(uint64_t generation, PedalboardBuildRequest &request, PedalboardBuildResult &result);
+        bool TryInstallBuiltPedalboard(uint64_t generation, PedalboardBuildRequest &request, PedalboardBuildResult &result);
+        void OnPedalboardBuildFailed(const std::string &message);
+        void ClosePedalboardBuilder();
+
+        // Acks of realtime MIDI program/snapshot requests held until the pedalboard built for them is running.
+        // Protected by mutex. See PendingMidiAckTracker.
+        PendingMidiAckTracker pendingMidiAcks;
+        void AckMidiRequest(PendingMidiAckTracker::Kind kind, int64_t requestId);
+        void SendMidiAcks(const std::vector<PendingMidiAckTracker::Ack> &acks);
+
+        // Patch property requests made while a full build is outstanding, sent to the new pedalboard once it is
+        // installed (FlushDeferredPatchRequests), or failed if it never is. Protected by mutex.
+        struct DeferredPatchRequest
+        {
+            int64_t clientId = 0;
+            json_variant value; // sets only.
+            std::function<void()> onSetSuccess;
+            std::function<void(const std::string &jsonResult)> onGetSuccess;
+            std::function<void(const std::string &error)> onError;
+        };
+        DeferredPatchRequests<DeferredPatchRequest> deferredPatchRequests;
+        void DeferPatchRequest(int64_t instanceId, const std::string &propertyUri, bool isSet, DeferredPatchRequest &&request);
+        void FlushDeferredPatchRequests();
+        void FailDeferredPatchRequests(const std::string &error);
+        void SendPatchSetRequest(
+            int64_t clientId, int64_t instanceId, const std::string &propertyUri, const json_variant &value,
+            std::function<void()> onSuccess, std::function<void(const std::string &error)> onError);
+        void SendPatchGetRequest(
+            int64_t clientId, int64_t instanceId, const std::string &propertyUri,
+            std::function<void(const std::string &jsonResult)> onSuccess, std::function<void(const std::string &error)> onError);
+
         using SubscriberList = std::vector<std::shared_ptr<IPiPedalModelSubscriber>>;
         SubscriberList subscribers;
         void SetPresetChanged(int64_t clientId, bool value, bool changeSnapshotSelect = true);
@@ -256,9 +320,9 @@ namespace pipedal
         virtual bool OnNotifyMaybeLv2StateChanged(uint64_t instanceId) override;
         virtual void OnNotifyVusSubscription(const std::vector<VuUpdateX> &updates) override;
         virtual void OnNotifyMonitorPort(const MonitorPortUpdate &update) override;
-        virtual void OnNotifyMidiValueChanged(int64_t instanceId, int portIndex, float value) override;
+        virtual void OnNotifyMidiValueChanged(int64_t instanceId, int portIndex, float value, IEffect *sourceEffect, Lv2Pedalboard *sourcePedalboard) override;
         virtual void OnNotifyMidiListen(uint8_t cc0, uint8_t cc1, uint8_t cc2) override;
-        virtual void OnPatchSetReply(uint64_t instanceId, LV2_URID patchSetProperty, const LV2_Atom *atomValue) override;
+        virtual void OnPatchSetReply(uint64_t instanceId, IEffect *sourceEffect, LV2_URID patchSetProperty, const LV2_Atom *atomValue) override;
         virtual void OnNotifyMidiRealtimeEvent(RealtimeMidiEventType eventType) override;
         virtual void OnNotifyMidiRealtimeSnapshotRequest(int32_t snapshotIndex, int64_t snapshotRequestId) override;
         virtual void OnAlsaDriverTerminatedAbnormally() override;
@@ -267,6 +331,7 @@ namespace pipedal
 
         void OnNotifyPathPatchPropertyReceived(
             int64_t instanceId,
+            const IEffect *sourceEffect,
             LV2_URID pathPatchProperty,
             LV2_Atom *pathProperty) override;
 
@@ -277,6 +342,12 @@ namespace pipedal
         virtual void OnNotifyLv2RealtimeError(int64_t instanceId, const std::string &error) override;
 
         PostHandle networkChangingDelayHandle = 0;
+
+        // Debounced autosave of the edited current preset (guarded by `mutex`).
+        PostHandle autosaveHandle = 0;
+        clock::time_point autosaveLastChange;
+        void ScheduleCurrentPresetAutosave();
+        void OnAutosaveTimer();
         void CancelNetworkChangingTimer();
 
         void OnNetworkChanging(bool ethernetConnected, bool hotspotConnected);
@@ -324,6 +395,8 @@ namespace pipedal
         void CancelTone3000Download(
             int64_t clientId,
             int64_t downloadHandle);
+        // Null until Init(). Shared with web clients (t3kAuth* messages) and the catalog browser.
+        std::shared_ptr<Tone3000Auth> GetTone3000Auth();
         void RequestShutdown(bool restart);
 
         virtual PostHandle Post(PostCallback &&fn);
@@ -443,6 +516,9 @@ namespace pipedal
 
         void SetShowStatusMonitor(bool show);
         bool GetShowStatusMonitor();
+
+        void SetSuspendBypassedPlugins(bool value);
+        bool GetSuspendBypassedPlugins();
 
         void SetWifiConfigSettings(const WifiConfigSettings &wifiConfigSettings);
         WifiConfigSettings GetWifiConfigSettings();

@@ -1571,11 +1571,14 @@ Lv2Pedalboard *PluginHost::UpdateLv2PedalboardStructure(Pedalboard &pedalboard, 
 
     if (existingPedalboard)
     {
-        for (auto &effect : existingPedalboard->GetSharedEffectList())
+        auto &effects = existingPedalboard->GetSharedEffectList();
+        for (size_t i = 0; i < effects.size(); ++i)
         {
+            auto &effect = effects[i];
             if (effect->IsLv2Effect())
             {
-                existingEffects[effect->GetInstanceId()] = effect;
+                // (the pedalboard's instance id: it may not have been swapped in on the audio thread yet.)
+                existingEffects[existingPedalboard->GetInstanceIdAt(i)] = effect;
             }
         }
     }
@@ -1587,6 +1590,23 @@ Lv2Pedalboard *PluginHost::UpdateLv2PedalboardStructure(Pedalboard &pedalboard, 
     }
     catch (const std::exception &e)
     {
+        // Safe: borrowing only stages changes in pPedalboard; the borrowed effects are untouched until the swap.
+        delete pPedalboard;
+        throw;
+    }
+}
+
+Lv2Pedalboard *PluginHost::CreateLv2PedalboardReusingInstances(Pedalboard &pedalboard, ExistingEffectMap &reusableEffects, Lv2PedalboardErrorList &errorList)
+{
+    Lv2Pedalboard *pPedalboard = new Lv2Pedalboard();
+    try
+    {
+        pPedalboard->Prepare(this, pedalboard, errorList, &reusableEffects, BorrowMode::ReusedForNewItem);
+        return pPedalboard;
+    }
+    catch (const std::exception &e)
+    {
+        // Safe: borrowing only stages changes in pPedalboard; the borrowed effects are untouched until the swap.
         delete pPedalboard;
         throw;
     }

@@ -21,13 +21,13 @@ export function Tone3000DownloadStaus(
     const [progress, setProgress] = useState<Tone3000DownloadProgress | null>(model.tone3000DownloadProgress.get());
 
     useEffect(() => {
-        let onDownloadingChanged = (value: boolean) => {
+        const onDownloadingChanged = (value: boolean) => {
 
             setDownloading(value);
         }
         model.tone3000Downloading.addOnChangedHandler(onDownloadingChanged);
 
-        let onProgressChanged = (value: Tone3000DownloadProgress | null) => {
+        const onProgressChanged = (value: Tone3000DownloadProgress | null) => {
             setProgress(value);
         }
         model.tone3000DownloadProgress.addOnChangedHandler(onProgressChanged);
@@ -52,6 +52,7 @@ export function Tone3000DownloadStaus(
         <Dialog
             open={open}
             onClose={() => { /* Do nothing */ }}
+            style={{ zIndex: props.zindex }}
         >
             <DialogContent style={{ marginBottom: 0, paddingBottom: 0 }}>
                 <div style={{ display: "flex", flexFlow: "column nowrap", alignItems: "stretch" }}>

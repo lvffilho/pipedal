@@ -138,6 +138,14 @@ public:
                 Lv2Log::error("WebServer: %s",msg.c_str());
                 break;
             case elevel::fatal:
+                // A malformed, oversized or too-slow HTTP request (e.g. the upload rate policy
+                // cutting off a slow client) is reported by websocketpp as fatal, but it only
+                // fails that one request; it is client behaviour, not a server fault.
+                if (msg.rfind("Fatal error reading request", 0) == 0)
+                {
+                    Lv2Log::debug("WebServer: %s",msg.c_str());
+                    break;
+                }
                 Lv2Log::error("WebServer fatal error: %s",msg.c_str());
                 break;
             default:

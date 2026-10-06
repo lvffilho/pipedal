@@ -30,6 +30,10 @@
 #include "json.hpp"
 #include "Uri.hpp"
 
+// PIPEDAL_T3K_PUBLISHABLE_KEY: the TONE3000 OAuth client id (publishable key), generated from the
+// CMake cache variable of the same name, which also feeds the web UI's VITE_T3K_PUBLISHABLE_KEY.
+#include "T3kConfig.h"
+
 namespace pipedal
 {
 

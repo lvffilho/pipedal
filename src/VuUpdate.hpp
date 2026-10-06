@@ -21,6 +21,8 @@
 
 #include "json.hpp"
 #include "Pedalboard.hpp"
+#include <atomic>
+#include <vector>
 
 namespace pipedal
 {
@@ -83,4 +85,34 @@ namespace pipedal
 
         DECLARE_JSON_MAP(VuUpdateX);
     };
+
+    // Flow control for VU batches sent to a single client. Safe to call from any thread.
+    class VuFlowControl
+    {
+    public:
+        // Returns true if the caller may send a batch (and must later call EndSend exactly once).
+        bool TryBeginSend()
+        {
+            int expected = 0;
+            return outstanding.compare_exchange_strong(expected, 1);
+        }
+        void EndSend() { outstanding.store(0); }
+        bool IsOutstanding() const { return outstanding.load() != 0; }
+
+    private:
+        std::atomic<int> outstanding{0};
+    };
+
+    // Copies the updates whose instanceId satisfies isInterested into a single batch.
+    template <typename PRED>
+    std::vector<VuUpdateX> FilterVuUpdates(const std::vector<VuUpdateX> &updates, PRED isInterested)
+    {
+        std::vector<VuUpdateX> result;
+        for (const auto &u : updates)
+        {
+            if (isInterested(u.instanceId_))
+                result.push_back(u);
+        }
+        return result;
+    }
 }
